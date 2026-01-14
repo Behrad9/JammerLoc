@@ -1,0 +1,44 @@
+{
+  "oracle": {
+    "mean": 4.686868603508459,
+    "std": 0.0,
+    "description": "Ground Truth RSSI",
+    "vs_oracle": 1.0
+  },
+  "noisy_2dB": {
+    "mean": 3.7622655499053925,
+    "std": 1.8610424865061908,
+    "description": "GT + 2dB noise",
+    "vs_oracle": 0.8027247760026952
+  },
+  "noisy_5dB": {
+    "mean": 4.733866004597928,
+    "std": 3.0804837315342724,
+    "description": "GT + 5dB noise",
+    "vs_oracle": 1.010027462910799
+  },
+  "noisy_10dB": {
+    "mean": 9.114211138773548,
+    "std": 6.308731522668731,
+    "description": "GT + 10dB noise",
+    "vs_oracle": 1.944626980144249
+  },
+  "shuffled": {
+    "mean": 22.24412168085742,
+    "std": 40.37220913528844,
+    "description": "Shuffled (Random Permutation)",
+    "vs_oracle": 4.746051908561314
+  },
+  "constant": {
+    "mean": 14.59711160748688,
+    "std": 0.0,
+    "description": "Constant (Mean RSSI)",
+    "vs_oracle": 3.1144699888876533
+  },
+  "predicted": {
+    "mean": 1.1774302794221982,
+    "std": 0.0,
+    "description": "Stage 1 Predictions",
+    "vs_oracle": 0.2512189649483254
+  }
+}

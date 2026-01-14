@@ -1,0 +1,22 @@
+# Jammer Localization Framework Requirements
+
+# Core ML
+torch>=2.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+
+# Visualization
+matplotlib>=3.4.0
+
+# Data processing
+scikit-learn>=1.0.0
+
+# Configuration
+PyYAML>=6.0
+
+# Progress bars (optional)
+tqdm>=4.62.0
+
+# Jupyter support (optional)
+ipykernel>=6.0.0
+jupyter>=1.0.0
