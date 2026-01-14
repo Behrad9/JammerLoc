@@ -312,8 +312,43 @@ def run_experiment(config: Config,
         from model import Net_augmented
         import numpy as np
         
-        # Default theta_init to origin (jammer position in ENU frame)
-        theta_init = physics_params.get('theta_init', np.array([0.0, 0.0], dtype=np.float32))
+        # Initialize theta to the *training receiver centroid* in ENU coordinates.
+        # This avoids any bias from assuming the origin corresponds to the jammer.
+        # (In a neutral ENU frame, (0,0) is not necessarily the jammer.)
+        def _train_centroid_enu(train_loader_obj) -> np.ndarray:
+            ds = getattr(train_loader_obj, "dataset", None)
+            if ds is None:
+                return np.array([0.0, 0.0], dtype=np.float32)
+
+            # Typical case: DataLoader over a Subset of JammerDataset
+            try:
+                from torch.utils.data import Subset as TorchSubset
+                if isinstance(ds, TorchSubset) and hasattr(ds.dataset, "positions"):
+                    pos = ds.dataset.positions
+                    pos_np = pos.detach().cpu().numpy() if hasattr(pos, "detach") else np.asarray(pos)
+                    idx = np.asarray(ds.indices, dtype=np.int64)
+                    if idx.size > 0:
+                        return pos_np[idx].mean(axis=0).astype(np.float32)
+                # If it's a full dataset with positions, just take its centroid
+                if hasattr(ds, "positions"):
+                    pos = ds.positions
+                    pos_np = pos.detach().cpu().numpy() if hasattr(pos, "detach") else np.asarray(pos)
+                    if len(pos_np) > 0:
+                        return pos_np.mean(axis=0).astype(np.float32)
+            except Exception:
+                pass
+
+            # Fallback: estimate from a few batches (slower but safe)
+            coords = []
+            for xb, _ in train_loader_obj:
+                coords.append(xb[:, :2].detach().cpu().numpy())
+                if len(coords) >= 10:  # cap work
+                    break
+            if coords:
+                return np.concatenate(coords, axis=0).mean(axis=0).astype(np.float32)
+            return np.array([0.0, 0.0], dtype=np.float32)
+
+        theta_init = _train_centroid_enu(train_loader)
         
         fl_results = run_federated_experiment(
             model_class=Net_augmented,
