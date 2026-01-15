@@ -15,6 +15,11 @@ UPDATED: Fixed embedding parameter selection (reviewer concern D.3)
 - Previous code: selected ALL params with 'weight' in name
 - Fixed code: properly identifies nn.Embedding parameters only
 
+FIXES APPLIED:
+- Consolidated detection functions here (removed duplicates from rssi_model.py)
+- Fixed type consistency in AGC orientation map (returns int, not float)
+- Added documentation for detection threshold method
+
 References:
 - Thesis document: "Jammer-Aware RSSI Estimation"
 - Original notebook: RSSIESTIMATION.ipynb
@@ -283,7 +288,14 @@ def time_indices(n: int, test_frac: float = 0.15, n_folds: int = 4) -> Tuple[np.
 
 
 # ============================================================
-# Jamming Detection
+# Jamming Detection (CONSOLIDATED - primary source)
+# ============================================================
+# NOTE: Detection functions are consolidated here. The versions in
+# rssi_model.py have been removed to avoid confusion.
+#
+# Threshold method: Percentile-based (more robust than mean+k*std)
+# T = percentile_95(S_clean) + 0.5
+# This is more robust to outliers than the μ + k*σ method.
 # ============================================================
 
 def compute_detection_params(df: pd.DataFrame, 
@@ -294,7 +306,22 @@ def compute_detection_params(df: pd.DataFrame,
     Learn detection threshold from clean (unjammed) samples.
     
     Uses Delta features to identify clean samples and compute
-    threshold T = μ_S + k * σ_S
+    threshold using percentile-based method (more robust than mean+k*std).
+    
+    Threshold method:
+        T = percentile_95(S_clean) + 0.5
+        
+    This is more robust to outliers than T = μ_S + k * σ_S.
+    The k_sigma parameter is used as a minimum threshold floor.
+    
+    Args:
+        df: DataFrame with Delta_CN0 and Delta_AGC columns
+        clean_cn0_max: Maximum |Delta_CN0| for clean samples
+        clean_agc_max: Maximum |Delta_AGC| for clean samples
+        k_sigma: Minimum threshold floor
+        
+    Returns:
+        Dict with T, sigma_cn0, sigma_agc
     """
     # Identify clean samples (small deltas)
     clean_mask = (df["Delta_CN0"].abs() <= clean_cn0_max) & (df["Delta_AGC"].abs() <= clean_agc_max)
@@ -321,7 +348,17 @@ def compute_detection_params(df: pd.DataFrame,
 
 
 def apply_detection(df: pd.DataFrame, det_params: Dict, use_rolling: bool = False) -> pd.DataFrame:
-    """Apply jamming detection to DataFrame."""
+    """
+    Apply jamming detection to DataFrame.
+    
+    Args:
+        df: DataFrame with Delta_CN0 and Delta_AGC columns
+        det_params: Detection parameters from compute_detection_params
+        use_rolling: If True, apply rolling window smoothing
+        
+    Returns:
+        DataFrame with jammed_pred and detection_score columns
+    """
     df = df.copy()
     
     sigma_cn0 = det_params["sigma_cn0"]
@@ -533,95 +570,109 @@ def compute_baseline_map_train_only(df: pd.DataFrame, train_idx: np.ndarray,
     return baseline_map
 
 
-def add_deltas_with_bases(df: pd.DataFrame, 
+def add_deltas_with_bases(df: pd.DataFrame,
                           baseline_map: Dict[Tuple[str, str], Tuple[float, float]]) -> pd.DataFrame:
-    """Add Delta features using baselines."""
+    """Add baseline columns and Delta features using a consistent convention.
+
+    Convention (matches rssi_model.apply_baselines and thesis):
+        Delta_CN0     = CN0_base - CN0
+        Delta_AGC_raw = AGC_base - AGC
+        Delta_AGC     = oriented version of Delta_AGC_raw (computed later)
+
+    Positive deltas should correspond to stronger jammer/interference effects (subject to orientation map).
+    """
     def get_bases(row):
         key = (row["device"], row["band"])
         band_key = ("__BAND__", row["band"])
         global_key = ("__GLOBAL__", "__GLOBAL__")
-        
+
         if key in baseline_map:
             return baseline_map[key]
-        elif band_key in baseline_map:
+        if band_key in baseline_map:
             return baseline_map[band_key]
-        else:
-            return baseline_map.get(global_key, (row["AGC"], row["CN0"]))
-    
+        return baseline_map.get(global_key, (row["AGC"], row["CN0"]))
+
     df = df.copy()
     bases = df.apply(get_bases, axis=1, result_type="expand")
-    df["AGC_base"] = bases[0]
-    df["CN0_base"] = bases[1]
-    df["Delta_AGC"] = df["AGC"] - df["AGC_base"]
-    df["Delta_CN0"] = df["CN0"] - df["CN0_base"]
-    
+    df["AGC_base"] = bases[0].astype(float)
+    df["CN0_base"] = bases[1].astype(float)
+
+    # Deltas: baseline - observed (thesis-consistent)
+    df["Delta_CN0"] = df["CN0_base"] - df["CN0"]
+    df["Delta_AGC_raw"] = df["AGC_base"] - df["AGC"]
+
+    # Clip to reasonable ranges (avoid extreme outliers)
+    df["Delta_CN0"] = np.clip(df["Delta_CN0"].astype(float), -5.0, 60.0)
+    df["Delta_AGC_raw"] = np.clip(df["Delta_AGC_raw"].astype(float), -60.0, 60.0)
+
+    # NaN safety
+    for col in ["AGC_base", "CN0_base", "Delta_CN0", "Delta_AGC_raw"]:
+        df[col] = np.nan_to_num(df[col], nan=0.0)
+
     return df
 
 
-def compute_agc_orientation_map_train_only(df: pd.DataFrame) -> Dict[Tuple[str, str], int]:
-    """
-    Compute AGC orientation signs from data that already has Delta_AGC.
-    
-    FIXED: Now computes per (device, band) for heterogeneous devices,
-    with fallback to band-level and global defaults.
-    
-    Args:
-        df: DataFrame with Delta_AGC column already computed
-    
+def compute_agc_orientation_map_train_only(df: pd.DataFrame, min_n: int = 20) -> Dict[Tuple[str, str], int]:
+    """Compute AGC orientation signs from TRAIN-only data.
+
+    This maps each (device, band) to a sign (+1/-1) applied to Delta_AGC_raw such that:
+        Delta_AGC = sign * Delta_AGC_raw
+    has non-negative covariance with RSSI on training data (fallbacks included).
+
+    FIXED: Return type is consistently int (not float from safe_cov_sign).
+
+    NOTE:
+      - Delta_AGC_raw must exist (produced by add_deltas_with_bases).
+      - Uses safe_cov_sign from rssi_model (robust to low variance).
+      
     Returns:
-        Dict mapping (device, band) -> sign (+1 or -1)
-        Also includes ("__BAND__", band) for band-level fallbacks
-        And ("__GLOBAL__", "__GLOBAL__") for global fallback
+        Dict mapping (device, band) tuples to int signs (+1 or -1)
     """
-    sgn_map = {}
-    
-    # Per (device, band) - most granular
-    for (dev, band), group in df.groupby(["device", "band"]):
-        if len(group) >= 10 and "RSSI" in group.columns and "Delta_AGC" in group.columns:
-            cov = np.cov(group["Delta_AGC"].values, group["RSSI"].values)[0, 1]
-            sgn_map[(dev, band)] = 1 if cov >= 0 else -1
-    
-    # Per band fallback
-    for band, group in df.groupby("band"):
-        if len(group) >= 10 and "RSSI" in group.columns and "Delta_AGC" in group.columns:
-            cov = np.cov(group["Delta_AGC"].values, group["RSSI"].values)[0, 1]
-            sgn_map[("__BAND__", band)] = 1 if cov >= 0 else -1
-    
+    sgn_map: Dict[Tuple[str, str], int] = {}
+
+    # Per (device, band)
+    for (dev, band), g in df.groupby(["device", "band"]):
+        if len(g) >= min_n and "RSSI" in g.columns and "Delta_AGC_raw" in g.columns:
+            s = safe_cov_sign(g["Delta_AGC_raw"].values, g["RSSI"].values)
+            # FIXED: Explicit conversion to int for type consistency
+            sgn_map[(dev, band)] = 1 if s >= 0 else -1
+
+    # Band fallback
+    for band, g in df.groupby("band"):
+        if len(g) >= min_n and "RSSI" in g.columns and "Delta_AGC_raw" in g.columns:
+            s = safe_cov_sign(g["Delta_AGC_raw"].values, g["RSSI"].values)
+            sgn_map[("__BAND__", band)] = 1 if s >= 0 else -1
+
     # Global fallback
-    if len(df) >= 10 and "RSSI" in df.columns and "Delta_AGC" in df.columns:
-        cov = np.cov(df["Delta_AGC"].values, df["RSSI"].values)[0, 1]
-        sgn_map[("__GLOBAL__", "__GLOBAL__")] = 1 if cov >= 0 else -1
+    if len(df) >= min_n and "RSSI" in df.columns and "Delta_AGC_raw" in df.columns:
+        s = safe_cov_sign(df["Delta_AGC_raw"].values, df["RSSI"].values)
+        sgn_map[("__GLOBAL__", "__GLOBAL__")] = 1 if s >= 0 else -1
     else:
-        sgn_map[("__GLOBAL__", "__GLOBAL__")] = 1  # Default positive
-    
+        sgn_map[("__GLOBAL__", "__GLOBAL__")] = 1
+
     return sgn_map
 
 
 def apply_agc_orientation_simple(df: pd.DataFrame, sgn_map: Dict[Tuple[str, str], int]) -> pd.DataFrame:
-    """
-    Apply AGC orientation using precomputed signs.
-    
-    FIXED: Now handles (device, band) keys with fallback hierarchy:
-    1. (device, band) specific
-    2. ("__BAND__", band) band-level
-    3. ("__GLOBAL__", "__GLOBAL__") global default
+    """Apply AGC orientation to produce Delta_AGC from Delta_AGC_raw.
+
+    Fallback hierarchy:
+      1) (device, band)
+      2) ("__BAND__", band)
+      3) ("__GLOBAL__", "__GLOBAL__")
     """
     df = df.copy()
-    
+
     def get_sign(row):
         key = (row["device"], row["band"])
         band_key = ("__BAND__", row["band"])
         global_key = ("__GLOBAL__", "__GLOBAL__")
-        
-        if key in sgn_map:
-            return sgn_map[key]
-        elif band_key in sgn_map:
-            return sgn_map[band_key]
-        else:
-            return sgn_map.get(global_key, 1)
-    
+        return int(sgn_map.get(key, sgn_map.get(band_key, sgn_map.get(global_key, 1))))
+
     df["AGC_sign"] = df.apply(get_sign, axis=1).astype(int)
-    df["Delta_AGC_oriented"] = df["Delta_AGC"] * df["AGC_sign"]
+    if "Delta_AGC_raw" not in df.columns:
+        raise KeyError("Delta_AGC_raw missing. Run add_deltas_with_bases() first.")
+    df["Delta_AGC"] = df["Delta_AGC_raw"] * df["AGC_sign"]
     return df
 
 
@@ -1127,7 +1178,7 @@ def run_rssi_inference(
         df[f"{col}_idx"] = df[col].astype(str).map(mapping).fillna(0).astype(int)
     
     # Build features
-    X_num, X_cat, _ = build_features(df)
+    X_num, X_cat, _ = build_features(df, require_y=False)
     
     # Predict
     df["RSSI_pred_raw"] = predict_rssi(model, X_num, X_cat)

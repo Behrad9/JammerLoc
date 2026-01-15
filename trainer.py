@@ -39,6 +39,30 @@ from config import Config, cfg
 
 
 # ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def _compute_theta_true_from_config(config, lat0_rad: float, lon0_rad: float):
+    """Compute true jammer position in ENU using config.jammer_lat/jammer_lon.
+
+    Returns None if jammer coords are not available.
+    """
+    from data_loader import latlon_to_enu
+    
+    jammer_lat = getattr(config, "jammer_lat", None)
+    jammer_lon = getattr(config, "jammer_lon", None)
+    if jammer_lat is None or jammer_lon is None:
+        return None
+    jx, jy = latlon_to_enu(
+        np.array([float(jammer_lat)], dtype=np.float64),
+        np.array([float(jammer_lon)], dtype=np.float64),
+        float(lat0_rad),
+        float(lon0_rad),
+    )
+    return np.array([float(jx[0]), float(jy[0])], dtype=np.float32)
+
+
+# ============================================================================
 # 1. NEW ROBUST LOSS FUNCTION
 # ============================================================================
 
@@ -280,12 +304,11 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
     if train_loader is None:
         if data_path is not None:
             from data_loader import load_data, create_dataloaders
-            df, lat0_rad, lon0_rad, loaded_theta_true = load_data(data_path, config, verbose=verbose)
+            df, lat0_rad, lon0_rad = load_data(data_path, config, verbose=verbose)
             train_loader, val_loader, test_loader, _ = create_dataloaders(df, config, verbose=verbose)
-            
-            # Use loaded theta_true if not explicitly provided
+            # If jammer coordinates are available, compute theta_true in ENU
             if theta_true is None:
-                theta_true = loaded_theta_true
+                theta_true = _compute_theta_true_from_config(config, lat0_rad, lon0_rad)
         else:
             raise ValueError("Either train_loader or data_path must be provided")
     
@@ -619,125 +642,94 @@ def train_client(model, train_loader, config, device, global_params=None, algori
     
     return get_model_params(model), len(train_loader.dataset)
 
-def train_federated(train_loader=None, val_loader=None, test_loader=None,
-                    theta_true=None,
-                    theta_init=None, config=None, verbose=True,
-                    data_path=None, model=None, epochs=None, rounds=None,
-                    true_jammer_pos=None,  # Backward compatibility
-                    **kwargs):
-    """Train using Federated Learning (Standard Logic)."""
-    # Handle backward compatibility
+
+def train_federated(
+    train_loader=None,
+    val_loader=None,
+    test_loader=None,
+    theta_true=None,
+    theta_init=None,
+    config=None,
+    verbose=True,
+    data_path=None,
+    true_jammer_pos=None,  # backward compatibility
+    algorithms=None,
+    early_stopping_config=None,
+    device_labels=None,
+):
+    """
+    Federated Learning entrypoint.
+
+    UPDATED:
+    - Canonical FL implementation is in server.py + client.py.
+    - This is a thin wrapper around server.run_federated_experiment() to avoid
+      duplicated/bug-prone federated logic (e.g., accidental test leakage).
+
+    Args:
+        train_loader/val_loader/test_loader: DataLoaders (preferred)
+        data_path: CSV path (used if loaders not provided)
+        theta_true: True jammer position in ENU (for localization error)
+        theta_init: Initial theta in ENU
+        algorithms: list[str] (defaults to config.fl_algorithms)
+        early_stopping_config: server.FLEarlyStoppingConfig (optional)
+        device_labels: labels for device partitioning (optional)
+    """
+    # Backward compatibility
     if theta_true is None and true_jammer_pos is not None:
         theta_true = true_jammer_pos
-    
-    if config is None: config = cfg
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
+
+    if config is None:
+        config = cfg
+
+    lat0_rad = lon0_rad = None
+
+    # Load data if loaders not provided
     if train_loader is None and data_path is not None:
         from data_loader import load_data, create_dataloaders
-        df, lat0_rad, lon0_rad, loaded_theta_true = load_data(data_path, config, verbose=verbose)
-        train_loader, val_loader, test_loader, full_dataset = create_dataloaders(df, config, verbose=verbose)
+        df, lat0_rad, lon0_rad = load_data(data_path, config, verbose=verbose)
+        train_loader, val_loader, test_loader, _ = create_dataloaders(df, config, verbose=verbose)
         if theta_true is None:
-            theta_true = loaded_theta_true
-    
-    if val_loader is None: val_loader = train_loader
-    if test_loader is None: test_loader = val_loader
-    
-    n_clients = getattr(config, 'num_clients', 5)
-    n_rounds = rounds if rounds is not None else getattr(config, 'global_rounds', 100)
-    algorithm = getattr(config, 'fl_algorithm', 'fedavg').lower()
-    theta_agg = getattr(config, 'theta_aggregation', 'geometric_median')
-    
-    # Partition logic
-    from data_loader import partition_for_clients, create_client_loaders
-    if hasattr(train_loader.dataset, 'dataset'):
-        full_dataset = train_loader.dataset.dataset
-    else:
-        full_dataset = train_loader.dataset
-    
-    partition_strategy = getattr(config, 'partition_strategy', 'geographic')
-    client_datasets = partition_for_clients(full_dataset, n_clients, strategy=partition_strategy)
-    client_loaders = create_client_loaders(client_datasets, batch_size=config.batch_size)
-    
-    if verbose:
-        print(f"\nFederated Learning: {algorithm.upper()}, Rounds: {n_rounds}")
-    
-    global_model = create_model(config, theta_init).to(device)
-    global_params = get_model_params(global_model)
-    
-    history = {'loc_error': [], 'val_loss': [], 'theta_x': [], 'theta_y': []}
-    best_val_loss = float('inf')
-    best_global_params = None
-    
-    for round_idx in range(n_rounds):
-        client_params_list = []
-        client_thetas = []
-        client_weights = []
-        
-        for client_idx, client_loader in enumerate(client_loaders):
-            client_model = create_model(config, theta_init).to(device)
-            set_model_params(client_model, global_params)
-            
-            params, n_samples = train_client(
-                client_model, client_loader, config, device,
-                global_params=global_params, algorithm=algorithm
-            )
-            client_params_list.append(params)
-            client_thetas.append(params['theta'])
-            client_weights.append(n_samples)
-        
-        # Aggregate (FedAvg + robust theta aggregation)
-        # NOTE: This is intentionally FedAvg followed by robust theta override
-        # See server.py documentation for details
-        if theta_agg == 'geometric_median':
-            aggregated_theta = aggregate_theta_geometric_median(client_thetas, client_weights)
-            global_params = aggregate_fedavg(client_params_list, client_weights)
-            global_params['theta'] = aggregated_theta
-        else:
-            global_params = aggregate_fedavg(client_params_list, client_weights)
-        
-        set_model_params(global_model, global_params)
-        
-        # Evaluate
-        loc_error, val_loss = evaluate(global_model, val_loader, device, theta_true=theta_true)
-        theta = global_model.get_theta().detach().cpu().numpy()
-        
-        history['loc_error'].append(loc_error)
-        history['val_loss'].append(val_loss)
-        history['theta_x'].append(float(theta[0]))
-        history['theta_y'].append(float(theta[1]))
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_global_params = copy.deepcopy(global_params)
-        
-        if verbose and (round_idx + 1) % 5 == 0:
-            loc_str = f"{loc_error:.2f}m" if theta_true is not None else "N/A"
-            print(f"  Round {round_idx+1}: Loc={loc_str}, θ=({theta[0]:.1f}, {theta[1]:.1f})")
-    
-    if best_global_params is not None:
-        set_model_params(global_model, best_global_params)
-    
-    final_loc_error, _ = evaluate(global_model, test_loader, device, theta_true=theta_true)
-    history['loc_error'].append(final_loc_error)
-    
-    if verbose:
-        theta = global_model.get_theta().detach().cpu().numpy()
-        loc_str = f"{final_loc_error:.2f} m" if theta_true is not None else "N/A"
-        print(f"\nFinal FL Results: Loc Error: {loc_str}")
-    
-    return global_model, history
+            theta_true = _compute_theta_true_from_config(config, lat0_rad, lon0_rad)
 
+    if train_loader is None:
+        raise ValueError("train_loader (or data_path) must be provided for federated training.")
+    if val_loader is None:
+        val_loader = train_loader
+    if test_loader is None:
+        test_loader = val_loader
 
-# ============================================================================
-# MAIN
-# ============================================================================
+    # IMPORTANT: Partition ONLY the training subset to avoid leakage.
+    train_dataset = train_loader.dataset
 
-if __name__ == "__main__":
-    print("Trainer module for Net_augmented jammer localization (Enhanced)")
-    print("\nAvailable functions:")
-    print("  - train_centralized(train_loader, val_loader, test_loader, theta_true, config)")
-    print("  - train_federated(train_loader, val_loader, test_loader, theta_true, config)")
-    print("  - evaluate(model, test_loader, device, theta_true)")
-    print("\nNOTE: theta_true is now REQUIRED for localization error computation.")
-    print("This prevents oracle bias from implicit (0,0) assumptions.")
+    # Default theta_init = centroid of training receivers in ENU
+    if theta_init is None:
+        try:
+            if hasattr(train_dataset, "dataset") and hasattr(train_dataset.dataset, "positions"):
+                pos = train_dataset.dataset.positions
+                pos_np = pos.detach().cpu().numpy() if hasattr(pos, "detach") else np.asarray(pos)
+                pts = pos_np[np.asarray(train_dataset.indices)]
+            elif hasattr(train_dataset, "positions"):
+                pos = train_dataset.positions
+                pts = pos.detach().cpu().numpy() if hasattr(pos, "detach") else np.asarray(pos)
+            else:
+                pts = np.array([train_dataset[i][0][:2].numpy() for i in range(len(train_dataset))], dtype=np.float32)
+            theta_init = pts.mean(axis=0).astype(np.float32)
+        except Exception:
+            theta_init = np.array([0.0, 0.0], dtype=np.float32)
+
+    from server import run_federated_experiment
+    from model import Net_augmented
+
+    return run_federated_experiment(
+        model_class=Net_augmented,
+        train_dataset=train_dataset,
+        val_loader=val_loader,
+        test_loader=test_loader,
+        algorithms=algorithms,
+        config=config,
+        theta_init=theta_init,
+        theta_true=theta_true,
+        verbose=verbose,
+        early_stopping_config=early_stopping_config,
+        device_labels=device_labels,
+    )

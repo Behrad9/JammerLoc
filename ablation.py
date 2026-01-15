@@ -193,10 +193,14 @@ def latlon_to_enu(lat, lon, lat0_rad, lon0_rad):
 
 
 def estimate_gamma_from_data(positions, rssi, theta_true=None):
-    """Estimate path-loss parameters from data."""
+    """Estimate path-loss parameters from data.
+
+    NOTE: theta_true must be provided in the *same ENU frame* as positions.
+    We do not default to (0,0) because ENU origin is receiver-centroid (neutral), not the jammer.
+    """
     if theta_true is None:
-        theta_true = np.array([0.0, 0.0])
-    
+        raise ValueError("theta_true is required (ENU coordinates of true jammer position).")
+
     distances = np.linalg.norm(positions - theta_true, axis=1)
     distances = np.maximum(distances, 1.0)
     log_d = np.log10(distances)
@@ -252,11 +256,19 @@ class PureNN(nn.Module):
     
     Unlike PurePathLoss, this model doesn't assume the path-loss equation.
     Instead, it learns the RSSI-distance relationship purely from data.
+    
+    NOTE: This model ONLY uses the first 2 input dimensions (x, y positions).
+    Extra features (building_density, etc.) are IGNORED by design - the pure NN
+    should learn localization from position alone to test if physics is needed.
+    The input_dim parameter is kept for API consistency but not used.
     """
     
     def __init__(self, input_dim, theta_init, hidden_dims=[64, 32]):
         super().__init__()
         self.theta = nn.Parameter(torch.tensor(theta_init, dtype=torch.float32))
+        
+        # NOTE: input_dim is ignored - we only use position-derived features
+        # This is intentional: Pure NN should learn from position alone
         
         # NN input: relative position (x-θ_x, y-θ_y) + distance + log_distance
         # This gives the NN all the information it needs to learn any distance relationship
@@ -432,13 +444,28 @@ def run_rssi_source_ablation(
     
     # Detect environment
     if env is None:
+        # 1) Try infer from filename
         input_lower = input_csv.lower()
-        for env_name in ['open_sky', 'suburban', 'urban', 'lab_wired']:
+        for env_name in ['open_sky', 'suburban', 'urban', 'lab_wired', 'mixed']:
             if env_name.replace('_', '') in input_lower.replace('_', ''):
                 env = env_name
                 break
+
+        # 2) Try infer from data column (most common value)
+        if env is None and 'env' in df.columns:
+            try:
+                env_mode = df['env'].dropna().astype(str).value_counts().idxmax()
+                if env_mode in ['open_sky', 'suburban', 'urban', 'lab_wired', 'mixed']:
+                    env = env_mode
+            except Exception:
+                env = None
+
+        # 3) Safe fallback: mixed (least-wrong), and warn in verbose mode
         if env is None:
-            env = 'open_sky'
+            env = 'mixed'
+            if verbose:
+                print("⚠ Could not infer environment from filename or df['env']; defaulting to 'mixed'. "
+                      "For exact results, pass env='open_sky'/'suburban'/'urban'/'lab_wired'.")
     
     if verbose:
         print(f"\n{'='*70}")
@@ -454,26 +481,33 @@ def run_rssi_source_ablation(
     # =================================================================
     # Origin = centroid of RECEIVERS (not jammer!)
     # This ensures the model must actually learn the jammer offset
+    # ENU reference frame will be computed after filtering jammed samples
     # =================================================================
-    
-    # Convert to ENU (origin = receiver centroid)
-    lat0 = df['lat'].mean()
-    lon0 = df['lon'].mean()
-    lat0_rad = np.radians(lat0)
-    lon0_rad = np.radians(lon0)
-    
-    df['x_enu'], df['y_enu'] = latlon_to_enu(df['lat'].values, df['lon'].values, lat0_rad, lon0_rad)
-    jammer_x, jammer_y = latlon_to_enu(np.array([jammer_loc['lat']]), np.array([jammer_loc['lon']]), lat0_rad, lon0_rad)
-    
-    # theta_true = jammer position in neutral frame (NOT (0,0)!)
-    theta_true = np.array([jammer_x[0], jammer_y[0]])
-    
-    # DO NOT re-center on jammer - keep neutral frame
-    # The model must discover theta_true through learning
     
     # Filter jammed samples
     if 'jammed' in df.columns:
         df = df[df['jammed'] == 1].copy()
+
+
+    # =================================================================
+    # Convert to ENU (origin = receiver centroid of *jammed* samples)
+    # =================================================================
+    lat0 = df['lat'].mean()
+    lon0 = df['lon'].mean()
+    lat0_rad = np.radians(lat0)
+    lon0_rad = np.radians(lon0)
+
+    df['x_enu'], df['y_enu'] = latlon_to_enu(df['lat'].values, df['lon'].values, lat0_rad, lon0_rad)
+
+    # True jammer in the SAME ENU frame (neutral origin; not (0,0))
+    jammer_x, jammer_y = latlon_to_enu(
+        np.array([jammer_loc['lat']]),
+        np.array([jammer_loc['lon']]),
+        lat0_rad,
+        lon0_rad
+    )
+    theta_true = np.array([jammer_x[0], jammer_y[0]], dtype=np.float32)
+
     
     if verbose:
         print(f"Jammed samples: {len(df)}")
@@ -487,7 +521,7 @@ def run_rssi_source_ablation(
     if not has_ground_truth:
         raise ValueError("Need ground truth RSSI column for ablation!")
     
-    pred_col = next((c for c in ['RSSI_pred', 'RSSI_pred_cal', 'RSSI_pred_final'] if c in df.columns), None)
+    pred_col = next((c for c in ['RSSI_pred_cal', 'RSSI_pred_final', 'RSSI_pred', 'RSSI'] if c in df.columns), None)
     
     # Get RSSI statistics
     rssi_true = df['RSSI'].values
@@ -543,7 +577,8 @@ def run_rssi_source_ablation(
                 noise_level = float(cond_name.split('_')[1].replace('dB', ''))
                 rssi = df['RSSI'].values + np.random.normal(0, noise_level, len(df))
             elif cond_name == 'shuffled':
-                rssi = np.random.permutation(df['RSSI'].values)
+                rssi_base = df[pred_col].values if (pred_col is not None and pred_col in df.columns) else df['RSSI'].values
+                rssi = np.random.permutation(rssi_base)
             elif cond_name == 'constant':
                 rssi = np.full(len(df), rssi_mean)
             else:
@@ -552,7 +587,7 @@ def run_rssi_source_ablation(
             # Run localization
             loc_err = _run_single_localization(
                 positions, rssi, gamma_est, P0_est, theta_true,
-                n_epochs=200, lr=0.5
+                n_epochs=200, lr=0.5, n_starts=5, seed=(42 + trial * 100)
             )
             errors.append(loc_err)
         
@@ -637,11 +672,54 @@ def run_rssi_source_ablation(
     
     # Generate plot
     _plot_rssi_ablation(results, output_dir, env, verbose)
+
+    # -----------------------------------------------------------------
+    # Additional analytical plots (Stage-1-like & Stage-2-like diagnostics)
+    # -----------------------------------------------------------------
+    try:
+        # Stage 1 diagnostics: predicted vs true + residual distribution (if available)
+        if pred_col:
+            _plot_stage1_rssi_quality(
+                rssi_true=df['RSSI'].values.astype(np.float32),
+                rssi_pred=df[pred_col].values.astype(np.float32),
+                output_dir=output_dir,
+                env=env,
+                pred_col_name=pred_col,
+                verbose=verbose
+            )
+
+        # Path-loss fit diagnostics (oracle + predicted if available)
+        _plot_pathloss_fit(
+            positions=positions.astype(np.float32),
+            rssi=df['RSSI'].values.astype(np.float32),
+            theta_true=theta_true.astype(np.float32),
+            output_dir=output_dir,
+            env=env,
+            label='oracle',
+            verbose=verbose
+        )
+        if pred_col:
+            _plot_pathloss_fit(
+                positions=positions.astype(np.float32),
+                rssi=df[pred_col].values.astype(np.float32),
+                theta_true=theta_true.astype(np.float32),
+                output_dir=output_dir,
+                env=env,
+                label='predicted',
+                verbose=verbose
+            )
+
+        # Stage 2 diagnostics: distributions + CDFs to show robustness (per condition)
+        _plot_rssi_ablation_detailed(results, output_dir, env, verbose)
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠ Plotting diagnostics failed (non-fatal): {e}")
+
     
     return results
 
 
-def _run_single_localization(positions, rssi, gamma, P0, theta_true, n_epochs=200, lr=0.5):
+def _run_single_localization(positions, rssi, gamma, P0, theta_true, n_epochs=200, lr=0.5, n_starts=5, seed=42):
     """Run single localization trial using scipy optimization.
     
     Args:
@@ -664,13 +742,26 @@ def _run_single_localization(positions, rssi, gamma, P0, theta_true, n_epochs=20
         J_pred = P0 - 10 * gamma * np.log10(d)
         return ((J_pred - J)**2).mean()
     
-    # Initialize at receiver centroid (which is ~(0,0) in neutral frame)
-    # This is NOT biased toward the true jammer position
-    theta0 = X.mean(axis=0)
-    result = minimize(loss_fn, theta0, method='L-BFGS-B', options={'maxiter': n_epochs})
-    
-    # Localization error = distance to TRUE jammer position
-    return np.linalg.norm(result.x - theta_true)
+    # Multi-start to reduce sensitivity to local minima / flat RSSI fields
+    rng = np.random.default_rng(seed)
+    base0 = X.mean(axis=0)  # neutral, not jammer-based
+    best_theta = None
+    best_loss = np.inf
+
+    for k in range(max(1, int(n_starts))):
+        if k == 0:
+            theta0 = base0
+        else:
+            # random start near receiver cloud (scale by position std)
+            scale = X.std(axis=0) + 1e-6
+            theta0 = base0 + rng.normal(0.0, 1.0, size=2) * scale
+
+        res = minimize(loss_fn, theta0, method='L-BFGS-B', options={'maxiter': n_epochs})
+        if res.fun < best_loss:
+            best_loss = float(res.fun)
+            best_theta = res.x
+
+    return float(np.linalg.norm(best_theta - theta_true))
 
 
 def _plot_rssi_ablation(results: Dict, output_dir: str, env: str, verbose: bool):
@@ -762,6 +853,7 @@ def run_model_architecture_ablation(
     environments: List[str] = None,
     n_trials: int = 5,
     n_inits: int = 3,  # Multiple random initializations per trial
+    use_predicted_rssi: bool = False,  # NEW: Use predicted RSSI instead of ground truth
     verbose: bool = True
 ) -> Dict:
     """
@@ -785,6 +877,16 @@ def run_model_architecture_ablation(
     - Multiple random initializations for robustness
     - Proper confidence interval reporting
     
+    Args:
+        input_csv: Path to input CSV file
+        output_dir: Output directory for results
+        environments: List of environments to test (default: open_sky, suburban, urban)
+        n_trials: Number of trials per model (default: 5)
+        n_inits: Random initializations per trial (default: 3)
+        use_predicted_rssi: If True, use predicted RSSI. If False (default), use
+                           ground truth RSSI for fair model comparison.
+        verbose: Print progress
+    
     Expected Results:
     - Open-sky: Pure PL ≈ APBM (simple physics works, γ≈2)
     - Urban: APBM < Pure PL (NN captures multipath/NLOS effects)
@@ -805,6 +907,7 @@ def run_model_architecture_ablation(
         print(f"Base samples: {len(df_base)}")
         print(f"Environments: {environments}")
         print(f"Trials per condition: {n_trials}")
+        print(f"RSSI source: {'PREDICTED' if use_predicted_rssi else 'GROUND TRUTH'}")
     
     # Results structure
     results = {env: {} for env in environments}
@@ -845,42 +948,78 @@ def run_model_architecture_ablation(
         # and doesn't get implicit oracle information from the frame
         # =================================================================
         
-        lat0 = df_env['lat'].mean()  # Receiver centroid
-        lon0 = df_env['lon'].mean()
+        # Filter jammed samples first (ensures neutral frame reflects the jammed set)
+        if 'jammed' in df_env.columns:
+            df_env = df_env[df_env['jammed'] == 1].copy()
+
+        # Neutral ENU frame: receiver centroid (NO oracle centering)
+        lat0 = float(df_env['lat'].median())
+        lon0 = float(df_env['lon'].median())
         lat0_rad = np.radians(lat0)
         lon0_rad = np.radians(lon0)
-        
+
         # Convert receivers to ENU (origin = receiver centroid)
         df_env['x_enu'], df_env['y_enu'] = latlon_to_enu(
             df_env['lat'].values, df_env['lon'].values, lat0_rad, lon0_rad
         )
-        
-        # Convert jammer to same ENU frame (jammer is NOT at origin!)
-        jammer_x, jammer_y = latlon_to_enu(
-            np.array([jammer_loc['lat']]), np.array([jammer_loc['lon']]), 
-            lat0_rad, lon0_rad
+
+        # True jammer position in the SAME ENU frame (explicit; no defaults)
+        jx, jy = latlon_to_enu(
+            np.array([jammer_loc['lat']], dtype=np.float64),
+            np.array([jammer_loc['lon']], dtype=np.float64),
+            lat0_rad,
+            lon0_rad
         )
-        
-        # theta_true = jammer position in neutral frame (NOT (0,0)!)
-        theta_true = np.array([jammer_x[0], jammer_y[0]], dtype=np.float32)
-        
-        # DO NOT re-center on jammer - keep neutral frame
-        # The model must discover theta_true through learning
-        
-        # Filter jammed
-        if 'jammed' in df_env.columns:
-            df_env = df_env[df_env['jammed'] == 1].copy()
-        
+        theta_true = np.array([float(jx[0]), float(jy[0])], dtype=np.float32)
+
         if verbose:
             print(f"  Samples: {len(df_env)}")
             print(f"  γ={gamma_env}, P0={P0_env} dBm")
             print(f"  Reference frame: receiver centroid (NEUTRAL)")
             print(f"  True jammer position: ({theta_true[0]:.1f}, {theta_true[1]:.1f}) m")
         
-        # Prepare data
-        rssi_col = next((c for c in ['RSSI_pred', 'RSSI', 'RSSI_pred_cal'] if c in df_env.columns), None)
+        # =================================================================
+        # RSSI COLUMN SELECTION (CRITICAL FOR R² ACCURACY)
+        # =================================================================
+        # For MODEL ARCHITECTURE ablation, we want to test localization 
+        # ability, so we should use GROUND TRUTH RSSI ('RSSI') by default.
+        # Using predicted RSSI conflates Stage 1 errors with Stage 2 model.
+        #
+        # Priority depends on use_predicted_rssi parameter:
+        # - False (default): Ground truth first, then predicted as fallback
+        # - True: Predicted first, then ground truth as fallback
+        # =================================================================
+        
+        # Check for ground truth RSSI first
+        gt_rssi_col = 'RSSI' if 'RSSI' in df_env.columns else None
+        pred_rssi_col = next((c for c in ['RSSI_pred_cal', 'RSSI_pred_final', 'RSSI_pred'] 
+                              if c in df_env.columns), None)
+        
+        # Select based on use_predicted_rssi parameter
+        if use_predicted_rssi:
+            # User wants predicted RSSI (for end-to-end evaluation)
+            rssi_col = pred_rssi_col if pred_rssi_col is not None else gt_rssi_col
+        else:
+            # Default: ground truth for model ablation (isolates Stage 2 performance)
+            rssi_col = gt_rssi_col if gt_rssi_col is not None else pred_rssi_col
+        
         if rssi_col is None:
+            if verbose:
+                print(f"  Skipping {env}: no RSSI column found")
             continue
+        
+        # Report which RSSI is being used and calculate R² for BOTH if available
+        is_using_ground_truth = (rssi_col == 'RSSI')
+        
+        if verbose:
+            if is_using_ground_truth:
+                print(f"  Using: GROUND TRUTH RSSI ('RSSI') - proper for model ablation")
+                if pred_rssi_col:
+                    print(f"         (Predicted RSSI also available: '{pred_rssi_col}')")
+            else:
+                print(f"  ⚠️  Using: PREDICTED RSSI ('{rssi_col}') - {'requested' if use_predicted_rssi else 'ground truth not available'}")
+                if not use_predicted_rssi:
+                    print(f"      R² will be lower due to Stage 1 prediction errors")
         
         positions = df_env[['x_enu', 'y_enu']].values.astype(np.float32)
         rssi = df_env[rssi_col].values.astype(np.float32)
@@ -888,13 +1027,24 @@ def run_model_architecture_ablation(
         # Estimate gamma from data (using true jammer position for distance calculation)
         P0_est, gamma_est, r2 = estimate_gamma_from_data(positions, rssi, theta_true=theta_true)
         
+        # Also compute R² for predicted RSSI if using ground truth (for comparison)
+        r2_predicted = None
+        if is_using_ground_truth and pred_rssi_col:
+            rssi_pred = df_env[pred_rssi_col].values.astype(np.float32)
+            _, _, r2_predicted = estimate_gamma_from_data(positions, rssi_pred, theta_true=theta_true)
+        
         # Store R² for later analysis
         results[env]['_r2'] = r2
+        results[env]['_r2_predicted'] = r2_predicted
+        results[env]['_rssi_col_used'] = rssi_col
         results[env]['_gamma_est'] = gamma_est
         results[env]['_P0_est'] = P0_est
         
         if verbose:
-            print(f"  Estimated: γ={gamma_est:.2f}, P0={P0_est:.1f} (R²={r2:.3f})")
+            print(f"  Estimated: γ={gamma_est:.2f}, P0={P0_est:.1f} dBm")
+            print(f"  Path-loss R² (ground truth): {r2:.3f}")
+            if r2_predicted is not None:
+                print(f"  Path-loss R² (predicted):    {r2_predicted:.3f}")
             
             # Warn about low R²
             if r2 < 0.3:
@@ -935,20 +1085,15 @@ def run_model_architecture_ablation(
         if verbose:
             print(f"  Features for NN: {X.shape[1]} (pos={2}, engineered={X.shape[1]-2})")
         
-        # Train/test split
+        # =================================================================
+        # TRAIN/TEST SPLIT STRATEGY
+        # =================================================================
+        # Use a BASE split that's consistent, but also test with different
+        # splits to get proper variance estimates. The split seed varies
+        # slightly per trial to capture data variance while maintaining
+        # reproducibility.
+        # =================================================================
         n = len(X)
-        rng = np.random.RandomState(12345)
-        idx = rng.permutation(n)
-        train_idx = idx[:int(0.7*n)]
-        val_idx = idx[int(0.7*n):int(0.85*n)]
-        test_idx = idx[int(0.85*n):]
-        
-        X_train, y_train = X[train_idx], rssi[train_idx]
-        X_val, y_val = X[val_idx], rssi[val_idx]
-        X_test, y_test = X[test_idx], rssi[test_idx]
-        
-        # Use position centroid for initialization (first 2 columns are x, y)
-        centroid = X_train[:, :2].mean(axis=0)
         
         # Test each model
         for model_key, model_name in models:
@@ -958,6 +1103,22 @@ def run_model_architecture_ablation(
             errors = []
             
             for trial in range(n_trials):
+                # Use different train/test split per trial for proper variance estimation
+                # This captures both model variance AND data split variance
+                split_seed = 12345 + trial * 17
+                rng = np.random.RandomState(split_seed)
+                idx = rng.permutation(n)
+                train_idx = idx[:int(0.7*n)]
+                val_idx = idx[int(0.7*n):int(0.85*n)]
+                test_idx = idx[int(0.85*n):]
+                
+                X_train, y_train = X[train_idx], rssi[train_idx]
+                X_val, y_val = X[val_idx], rssi[val_idx]
+                X_test, y_test = X[test_idx], rssi[test_idx]
+                
+                # Use position centroid for initialization (first 2 columns are x, y)
+                centroid = X_train[:, :2].mean(axis=0)
+                
                 set_seed(42 + trial * 100)
                 
                 # Multiple random initializations - keep the best one
@@ -1057,14 +1218,23 @@ def run_model_architecture_ablation(
             
             print(f"\n[{env.upper()}]")
             
-            # Report R²
+            # Report R² (ground truth and predicted if available)
             r2_env = results[env].get('_r2', 0)
+            r2_pred = results[env].get('_r2_predicted', None)
+            rssi_used = results[env].get('_rssi_col_used', 'unknown')
+            
+            print(f"  RSSI used: {rssi_used}")
             if r2_env < 0.3:
                 print(f"  ⚠️  R² = {r2_env:.3f} (POOR FIT - interpret with caution)")
             elif r2_env < 0.5:
                 print(f"  ⚠️  R² = {r2_env:.3f} (MODERATE FIT)")
             else:
                 print(f"  ✓ R² = {r2_env:.3f} (GOOD FIT)")
+            
+            if r2_pred is not None:
+                print(f"     R² (predicted RSSI): {r2_pred:.3f}")
+                if r2_pred < r2_env - 0.1:
+                    print(f"     Note: Predicted R² is lower due to Stage 1 errors")
             
             # Compare Pure NN vs Pure PL
             if 'pure_nn' in results[env] and 'pure_pl' in results[env]:
@@ -1191,6 +1361,17 @@ def run_model_architecture_ablation(
     
     # Generate plots
     _plot_model_ablation(results, environments, output_dir, verbose)
+
+    # -----------------------------------------------------------------
+    # Additional analytical plots (Stage-2-like diagnostics)
+    # -----------------------------------------------------------------
+    try:
+        _plot_model_ablation_detailed(results, environments, output_dir, verbose)
+        _plot_model_r2_diagnostics(results, environments, output_dir, verbose)
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠ Plotting diagnostics failed (non-fatal): {e}")
+
     
     return results
 
@@ -1519,6 +1700,346 @@ def _plot_model_ablation(results: Dict, environments: List[str], output_dir: str
             print("  (matplotlib not available, skipping plot)")
 
 
+
+# ============================================================================
+# DIAGNOSTIC / ANALYTICAL PLOTS (Stage-1-like & Stage-2-like)
+# ============================================================================
+
+def _plot_stage1_rssi_quality(
+    rssi_true: np.ndarray,
+    rssi_pred: np.ndarray,
+    output_dir: str,
+    env: str,
+    pred_col_name: str = "RSSI_pred",
+    verbose: bool = True
+):
+    """Stage-1-like diagnostics: prediction scatter + residual distribution.
+
+    Saves:
+      - stage1_pred_vs_true_<env>.png
+      - stage1_residual_hist_<env>.png
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # 1) Predicted vs True scatter (with y=x reference)
+        fig, ax = plt.subplots(figsize=(7.5, 6))
+        ax.scatter(rssi_true, rssi_pred, s=10, alpha=0.35, edgecolors='none')
+        lo = float(np.nanmin([rssi_true.min(), rssi_pred.min()]))
+        hi = float(np.nanmax([rssi_true.max(), rssi_pred.max()]))
+        ax.plot([lo, hi], [lo, hi], linestyle='--', linewidth=1.5)
+        ax.set_xlabel("True RSSI (dB)")
+        ax.set_ylabel(f"Predicted RSSI (dB) [{pred_col_name}]")
+        ax.set_title(f"Stage 1: Predicted vs True RSSI ({env})", fontweight='bold')
+        ax.grid(alpha=0.25)
+
+        # Metrics annotation
+        valid = np.isfinite(rssi_true) & np.isfinite(rssi_pred)
+        if valid.sum() > 3:
+            mae = float(np.mean(np.abs(rssi_true[valid] - rssi_pred[valid])))
+            rmse = float(np.sqrt(np.mean((rssi_true[valid] - rssi_pred[valid])**2)))
+            corr = float(np.corrcoef(rssi_true[valid], rssi_pred[valid])[0, 1])
+            ax.text(
+                0.02, 0.98,
+                f"MAE: {mae:.2f} dB\nRMSE: {rmse:.2f} dB\nCorr: {corr:.3f}\nN: {valid.sum()}",
+                transform=ax.transAxes, va='top', ha='left',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                fontsize=10
+            )
+
+        plt.tight_layout()
+        out1 = os.path.join(output_dir, f"stage1_pred_vs_true_{env}.png")
+        plt.savefig(out1, dpi=160, bbox_inches='tight')
+        plt.close()
+
+        # 2) Residual histogram
+        resid = (rssi_pred - rssi_true).astype(np.float32)
+        resid = resid[np.isfinite(resid)]
+        fig, ax = plt.subplots(figsize=(7.5, 5.5))
+        ax.hist(resid, bins=40, alpha=0.85)
+        ax.axvline(0.0, linestyle='--', linewidth=1.5)
+        ax.set_xlabel("Residual (Pred - True) [dB]")
+        ax.set_ylabel("Count")
+        ax.set_title(f"Stage 1: Residual Distribution ({env})", fontweight='bold')
+        ax.grid(alpha=0.25)
+        if len(resid) > 5:
+            ax.text(
+                0.02, 0.98,
+                f"Mean: {float(np.mean(resid)):+.2f} dB\nStd: {float(np.std(resid)):.2f} dB",
+                transform=ax.transAxes, va='top', ha='left',
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                fontsize=10
+            )
+        plt.tight_layout()
+        out2 = os.path.join(output_dir, f"stage1_residual_hist_{env}.png")
+        plt.savefig(out2, dpi=160, bbox_inches='tight')
+        plt.close()
+
+        if verbose:
+            print(f"✓ Stage 1 diagnostics saved: {os.path.basename(out1)}, {os.path.basename(out2)}")
+    except ImportError:
+        if verbose:
+            print("  (matplotlib not available, skipping Stage 1 diagnostics)")
+
+
+def _plot_pathloss_fit(
+    positions: np.ndarray,
+    rssi: np.ndarray,
+    theta_true: np.ndarray,
+    output_dir: str,
+    env: str,
+    label: str = "oracle",
+    verbose: bool = True
+):
+    """Plot RSSI vs log-distance with fitted line + R².
+
+    This makes it visually obvious *why* the ablation works:
+    - When RSSI-distance correlation is preserved (oracle/predicted) the fit is decent.
+    - When broken (shuffled/constant), a fit would be meaningless (see ablation plots).
+
+    Saves:
+      - pathloss_fit_<label>_<env>.png
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        pos = positions.astype(np.float32)
+        d = np.linalg.norm(pos - theta_true.reshape(1, 2), axis=1)
+        d = np.maximum(d, 1.0)
+        log_d = np.log10(d)
+
+        valid = np.isfinite(log_d) & np.isfinite(rssi)
+        if valid.sum() < 5:
+            return
+
+        slope, intercept, r_value, _, _ = stats.linregress(log_d[valid], rssi[valid])
+        r2 = float(r_value**2)
+
+        fig, ax = plt.subplots(figsize=(7.5, 6))
+        ax.scatter(log_d[valid], rssi[valid], s=10, alpha=0.35, edgecolors='none')
+        xline = np.linspace(float(log_d[valid].min()), float(log_d[valid].max()), 200)
+        yline = intercept + slope * xline
+        ax.plot(xline, yline, linewidth=2.0)
+
+        gamma_est = float(-slope / 10.0)
+        ax.set_xlabel("log10(distance to jammer)  [m]")
+        ax.set_ylabel("RSSI (dB)")
+        ax.set_title(f"Path-loss Fit ({label}) — {env}", fontweight='bold')
+        ax.grid(alpha=0.25)
+
+        ax.text(
+            0.02, 0.98,
+            f"R²: {r2:.3f}\nγ̂: {gamma_est:.2f}\nP0̂: {intercept:.1f} dBm",
+            transform=ax.transAxes, va='top', ha='left',
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+            fontsize=10
+        )
+
+        plt.tight_layout()
+        out = os.path.join(output_dir, f"pathloss_fit_{label}_{env}.png")
+        plt.savefig(out, dpi=160, bbox_inches='tight')
+        plt.close()
+
+        if verbose:
+            print(f"✓ Path-loss fit saved: {os.path.basename(out)}")
+    except ImportError:
+        if verbose:
+            print("  (matplotlib not available, skipping path-loss fit)")
+
+
+def _plot_rssi_ablation_detailed(results: Dict, output_dir: str, env: str, verbose: bool = True):
+    """More analytical RSSI ablation plots.
+
+    Adds two complementary views:
+      1) Boxplot-like view (via matplotlib boxplot) to show robustness across trials
+      2) CDF curves of localization error to compare *full distributions*
+
+    Saves:
+      - rssi_ablation_box_<env>.png
+      - rssi_ablation_cdf_<env>.png
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        # Keep a stable ordering if present
+        preferred = ['oracle', 'predicted', 'noisy_2dB', 'noisy_5dB', 'noisy_10dB', 'shuffled', 'constant']
+        conditions = [c for c in preferred if c in results]
+        if not conditions:
+            conditions = list(results.keys())
+
+        data = [results[c].get('errors', []) for c in conditions]
+
+        # 1) Boxplot of per-trial errors
+        fig, ax = plt.subplots(figsize=(11, 6))
+        bp = ax.boxplot(
+            data,
+            labels=[c.replace('_', '\n') for c in conditions],
+            showfliers=True
+        )
+        ax.set_ylabel("Localization Error (m)")
+        ax.set_title(f"RSSI Ablation: Error Distribution Across Trials ({env})", fontweight='bold')
+        ax.grid(axis='y', alpha=0.25)
+        plt.tight_layout()
+        out1 = os.path.join(output_dir, f"rssi_ablation_box_{env}.png")
+        plt.savefig(out1, dpi=160, bbox_inches='tight')
+        plt.close()
+
+        # 2) CDF curves
+        fig, ax = plt.subplots(figsize=(9.5, 6))
+        for c in conditions:
+            vals = np.array(results[c].get('errors', []), dtype=float)
+            vals = vals[np.isfinite(vals)]
+            if len(vals) == 0:
+                continue
+            xs = np.sort(vals)
+            ys = np.arange(1, len(xs) + 1) / len(xs)
+            ax.step(xs, ys, where='post', label=c)
+
+        ax.set_xlabel("Localization Error (m)")
+        ax.set_ylabel("CDF")
+        ax.set_title(f"RSSI Ablation: CDF of Localization Error ({env})", fontweight='bold')
+        ax.grid(alpha=0.25)
+        ax.legend()
+        plt.tight_layout()
+        out2 = os.path.join(output_dir, f"rssi_ablation_cdf_{env}.png")
+        plt.savefig(out2, dpi=160, bbox_inches='tight')
+        plt.close()
+
+        if verbose:
+            print(f"✓ RSSI diagnostic plots saved: {os.path.basename(out1)}, {os.path.basename(out2)}")
+    except ImportError:
+        if verbose:
+            print("  (matplotlib not available, skipping RSSI diagnostic plots)")
+
+
+def _plot_model_ablation_detailed(results: Dict, environments: List[str], output_dir: str, verbose: bool = True):
+    """More analytical model-ablation plots.
+
+    Adds:
+      - Per-environment boxplots across trials for each model
+
+    Saves:
+      - model_ablation_box_by_env.png
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        models = [('pure_nn', 'Pure NN'), ('pure_pl', 'Pure PL'), ('apbm', 'APBM')]
+        envs = [e for e in environments if e in results and results[e]]
+
+        if not envs:
+            return
+
+        # Build data in grouped layout: for each env, concatenate three boxplots
+        data = []
+        labels = []
+        positions = []
+        pos = 1
+        gap = 1.5
+        width = 0.8
+
+        for env in envs:
+            for mk, mn in models:
+                if mk in results[env] and 'errors' in results[env][mk]:
+                    data.append(results[env][mk]['errors'])
+                else:
+                    data.append([])
+                labels.append(f"{env}\n{mn}")
+                positions.append(pos)
+                pos += 1
+            pos += gap
+
+        fig, ax = plt.subplots(figsize=(13, 6.5))
+        ax.boxplot(data, positions=positions, widths=width, showfliers=True)
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, fontsize=9)
+        ax.set_ylabel("Localization Error (m)")
+        ax.set_title("Model Ablation: Error Distribution Across Trials", fontweight='bold')
+        ax.grid(axis='y', alpha=0.25)
+
+        # Light vertical separators between environments
+        cursor = 1
+        for _ in envs[:-1]:
+            cursor += 3
+            ax.axvline(cursor + 0.5, linestyle='--', alpha=0.25)
+            cursor += gap
+
+        plt.tight_layout()
+        out = os.path.join(output_dir, "model_ablation_box_by_env.png")
+        plt.savefig(out, dpi=160, bbox_inches='tight')
+        plt.close()
+
+        if verbose:
+            print(f"✓ Model diagnostic plot saved: {os.path.basename(out)}")
+    except ImportError:
+        if verbose:
+            print("  (matplotlib not available, skipping model diagnostic plots)")
+
+
+def _plot_model_r2_diagnostics(results: Dict, environments: List[str], output_dir: str, verbose: bool = True):
+    """Plot path-loss fit quality (R²) per environment alongside model errors.
+
+    Saves:
+      - model_r2_vs_error.png
+    """
+    try:
+        import matplotlib.pyplot as plt
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        envs = [e for e in environments if e in results and results[e]]
+        if not envs:
+            return
+
+        r2s = []
+        best_errs = []
+        best_model = []
+
+        for env in envs:
+            r2 = results[env].get('_r2', np.nan)
+            r2s.append(float(r2) if r2 is not None else np.nan)
+
+            env_model_results = {k: v['mean'] for k, v in results[env].items()
+                                 if isinstance(v, dict) and 'mean' in v and not k.startswith('_')}
+            if env_model_results:
+                bm = min(env_model_results, key=env_model_results.get)
+                best_model.append(bm)
+                best_errs.append(float(env_model_results[bm]))
+            else:
+                best_model.append("n/a")
+                best_errs.append(np.nan)
+
+        fig, ax = plt.subplots(figsize=(9.5, 6))
+        ax.scatter(r2s, best_errs, s=80, alpha=0.9)
+        for x, y, env, bm in zip(r2s, best_errs, envs, best_model):
+            ax.text(x, y, f"  {env}\n  ({bm})", va='center', fontsize=9)
+
+        ax.set_xlabel("Path-loss R² (fit quality)")
+        ax.set_ylabel("Best Localization Error (m)")
+        ax.set_title("When Physics Fits Better, Physics-Based Models Tend to Win", fontweight='bold')
+        ax.grid(alpha=0.25)
+
+        plt.tight_layout()
+        out = os.path.join(output_dir, "model_r2_vs_error.png")
+        plt.savefig(out, dpi=160, bbox_inches='tight')
+        plt.close()
+
+        if verbose:
+            print(f"✓ R² diagnostic plot saved: {os.path.basename(out)}")
+    except ImportError:
+        if verbose:
+            print("  (matplotlib not available, skipping R² diagnostic plot)")
+
+
 # ============================================================================
 # COMBINED ABLATION RUNNER
 # ============================================================================
@@ -1599,6 +2120,8 @@ if __name__ == "__main__":
     parser.add_argument("--n-inits", type=int, default=3, help="Random initializations per trial (for robustness)")
     parser.add_argument("--rssi-only", action="store_true", help="Run only RSSI ablation")
     parser.add_argument("--model-only", action="store_true", help="Run only model ablation")
+    parser.add_argument("--use-predicted-rssi", action="store_true", 
+                       help="Use predicted RSSI instead of ground truth (for end-to-end evaluation)")
     parser.add_argument("--env", default=None, help="Environment filter")
     
     args = parser.parse_args()
@@ -1617,7 +2140,8 @@ if __name__ == "__main__":
             args.output_dir,
             environments=envs,
             n_trials=args.n_trials,
-            n_inits=args.n_inits
+            n_inits=args.n_inits,
+            use_predicted_rssi=args.use_predicted_rssi
         )
     else:
         run_all_ablations(

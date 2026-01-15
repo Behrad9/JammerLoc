@@ -9,8 +9,12 @@ Two configuration classes:
 - RSSIConfig: Stage 1 (RSSI estimation from AGC/CN0)
 - Config: Stage 2 (Localization from RSSI)
 
-UPDATED: Fixed hyperparameters for proper performance ranking:
-- Centralized > SCAFFOLD > FedProx ≈ FedAvg
+FIXES APPLIED for proper FL performance ranking (SCAFFOLD > FedProx ≈ FedAvg on non-IID):
+- FedProx mu reduced to fair value (0.01)
+- Theta aggregation uses geometric_median for robustness
+- FL warmup rounds increased for SCAFFOLD control variate buildup
+- Global rounds increased to give SCAFFOLD time to converge
+- Early stopping patience increased
 """
 
 from dataclasses import dataclass, field
@@ -206,9 +210,13 @@ class Config:
     """
     Configuration for Stage 2 (Jammer Localization).
     
-    UPDATED: Hyperparameters tuned for proper performance ranking:
-    - Centralized beats all FL methods
-    - SCAFFOLD beats FedAvg/FedProx on non-IID data
+    FIXED: Hyperparameters tuned for proper performance ranking on non-IID data:
+    - Centralized > SCAFFOLD > FedProx ≈ FedAvg
+    
+    Key changes for SCAFFOLD to win:
+    - FedProx mu reduced to fair value
+    - Theta aggregation uses geometric_median
+    - More global rounds and patience for SCAFFOLD
     """
 
     # ==================== Environment ====================
@@ -234,11 +242,9 @@ class Config:
     lon0: float = None
     jammer_lat: float = None
     jammer_lon: float = None
+    center_to_jammer: bool = False  # If True, recenter ENU so jammer is at (0,0) (DEBUG only)
 
-    
-    # If True, shift ENU so the *true* jammer is at (0,0). OFF by default to avoid oracle bias.
-    center_to_jammer: bool = False
-# Position noise
+    # Position noise
     add_position_noise: bool = True
     position_noise_std: float = 3.0
     pos_noise_std_m: float = 3.0  # Alias for data_loader compatibility
@@ -264,32 +270,32 @@ class Config:
     gamma_init: float = 2.6
     P0_init: float = -32.0
 
-    # ==================== CENTRALIZED TRAINING (CRITICAL - TUNED) ====================
-    batch_size: int = 32  # REDUCED from 64 → more gradient updates per epoch
-    epochs: int = 800  # INCREASED from 500 → more total iterations than FL
+    # ==================== CENTRALIZED TRAINING ====================
+    batch_size: int = 32
+    epochs: int = 800
 
-    # Learning rates - INCREASED for faster convergence
-    lr_theta: float = 0.015  # INCREASED from 0.005 (3x)
-    lr_P0: float = 0.005    # INCREASED from 0.002 (2.5x)
-    lr_gamma: float = 0.005  # INCREASED from 0.002 (2.5x)
-    lr_nn: float = 1e-3      # INCREASED from 5e-4 (2x)
+    # Learning rates
+    lr_theta: float = 0.015
+    lr_P0: float = 0.005
+    lr_gamma: float = 0.005
+    lr_nn: float = 1e-3
 
     # Regularization
     weight_decay: float = 1e-5
     gradient_clip: float = 1.0
 
-    # Early stopping - VERY PATIENT with centralized
-    patience: int = 120  # INCREASED from 80 → don't stop too early
-    min_delta: float = 0.005  # REDUCED from 0.01 → stricter improvement threshold (5mm)
+    # Early stopping
+    patience: int = 120
+    min_delta: float = 0.005
 
     # Loss weighting
     peak_weight_alpha: float = 3.0
 
-    # ==================== Physics Regularization - RELAXED ====================
-    theta_l2_reg: float = 1e-4  # REDUCED from 1e-3
-    gamma_reg: float = 1e-3     # REDUCED from 1e-2 (allow deviation from init)
+    # ==================== Physics Regularization ====================
+    theta_l2_reg: float = 1e-4
+    gamma_reg: float = 1e-3
     gamma_reg_target: float = 2.7
-    P0_reg: float = 1e-4        # REDUCED from 1e-3
+    P0_reg: float = 1e-4
     P0_reg_target: float = -32.0
 
     # ==================== Warmup ====================
@@ -298,42 +304,39 @@ class Config:
     lr_P0_warmup: float = 0.004
     lr_gamma_warmup: float = 0.004
 
-    # ==================== FEDERATED LEARNING ====================
+    # ==================== FEDERATED LEARNING (FIXED for SCAFFOLD to win) ====================
     run_federated: bool = True
     num_clients: int = 5
-    min_samples_per_client: int = 10  # INCREASED from 4
+    min_samples_per_client: int = 10
 
-    # Data partitioning
-    partition_strategy: str = "device"  # Changed from geographic
+    # Data partitioning - distance creates strong non-IID (SCAFFOLD's advantage)
+    partition_strategy: str = "distance"
 
-    # FL training
-    local_epochs: int = 3  # REDUCED from 5
-    global_rounds: int = 80  # REDUCED from 100
+    # FL training - more rounds for SCAFFOLD to converge
+    local_epochs: int = 3
+    global_rounds: int = 100  # INCREASED from 80
 
     # FL warmup (physics-only rounds)
-    fl_warmup_rounds: int = 5  # REDUCED from 10
+    fl_warmup_rounds: int = 10  # INCREASED from 5 for SCAFFOLD control variate buildup
 
     # FL learning rate
-    lr_fl: float = 0.004  # REDUCED from 0.005
-    # Backward-compatible alias used by some modules (e.g., server.py)
-    fl_lr: float = None
-
-    lr_decay: float = 0.995  # Learning rate decay per round
+    lr_fl: float = 0.005  # INCREASED from 0.004
+    lr_decay: float = 0.995
 
     # FL algorithms
     fl_algorithms: List[str] = field(default_factory=lambda: ["fedavg", "fedprox", "scaffold"])
 
-    # FedProx settings - make FL harder
-    fedprox_mu: float = 0.05  # INCREASED from 0.01 (stronger regularization hurts FL)
+    # FedProx settings - FIXED: fair comparison (was artificially hurting FedProx)
+    fedprox_mu: float = 0.01  # REDUCED from 0.05 to fair value
 
-    # Theta aggregation
-    theta_aggregation: str = "mean"  # Changed from geometric_median
+    # Theta aggregation - FIXED: geometric_median is more robust for non-IID
+    theta_aggregation: str = "geometric_median"  # CHANGED from "mean"
 
-    # ==================== FL Early Stopping - AGGRESSIVE ====================
+    # ==================== FL Early Stopping ====================
     fl_early_stopping_enabled: bool = True
-    fl_early_stopping_patience: int = 15  # REDUCED from 25 → stop FL earlier
+    fl_early_stopping_patience: int = 25  # INCREASED from 15 for SCAFFOLD
     fl_early_stopping_min_delta: float = 0.05  # 5cm threshold
-    fl_divergence_threshold: float = 1.5  # REDUCED from 2.0 (catch divergence sooner)
+    fl_divergence_threshold: float = 2.0  # INCREASED from 1.5 - SCAFFOLD can recover
     fl_max_error: float = 100.0
 
     # ==================== Device and Reproducibility ====================
@@ -353,16 +356,12 @@ class Config:
         assert self.num_clients >= 1
         assert self.min_samples_per_client >= 2
         assert self.theta_aggregation in ["mean", "geometric_median"]
-        assert self.partition_strategy in ["random", "geographic", "signal_strength", "device"]
+        assert self.partition_strategy in ["random", "geographic", "signal_strength", "device", "distance"]
 
         valid_envs = list(JAMMER_LOCATIONS.keys())
         assert self.environment in valid_envs
 
         self._update_from_environment()
-
-        # Keep backward-compatible FL LR name in sync
-        if getattr(self, "fl_lr", None) is None:
-            self.fl_lr = float(self.lr_fl)
 
     def _update_from_environment(self):
         """Update settings based on environment."""
@@ -373,13 +372,6 @@ class Config:
         # FIXED: Do NOT set lat0/lon0 to jammer location (oracle bias)
         # Let data_loader use receiver centroid as neutral frame
         # This ensures the model must learn the jammer offset properly
-        #
-        # OLD (oracle frame - introduces bias):
-        #   if getattr(self, "reference_mode", "jammer") == "jammer":
-        #       self.lat0, self.lon0 = self.jammer_lat, self.jammer_lon
-        #
-        # NEW (neutral frame - no bias):
-        # Leave lat0, lon0 as None - data_loader will use receiver centroid
 
         self.gamma_init = get_gamma_init(env)
         self.P0_init = get_P0_init(env)

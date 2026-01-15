@@ -1,44 +1,44 @@
 {
   "oracle": {
-    "mean": 5.443384020810239,
-    "std": 0.0,
+    "mean": 5.426814171801608,
+    "std": 6.183855643520228e-06,
     "description": "Ground Truth RSSI",
     "vs_oracle": 1.0
   },
   "noisy_2dB": {
-    "mean": 5.275597616123427,
-    "std": 0.4993018673619218,
+    "mean": 5.295351204625876,
+    "std": 0.4928533307058067,
     "description": "GT + 2dB noise",
-    "vs_oracle": 0.969176085309183
+    "vs_oracle": 0.9757752959629926
   },
   "noisy_5dB": {
-    "mean": 5.057911616801912,
-    "std": 1.250030640482326,
+    "mean": 5.066396173973965,
+    "std": 1.2815254789948736,
     "description": "GT + 5dB noise",
-    "vs_oracle": 0.9291851534753651
+    "vs_oracle": 0.9335857122765657
   },
   "noisy_10dB": {
-    "mean": 5.076963749292524,
-    "std": 1.9793536368031301,
+    "mean": 6.071806671768853,
+    "std": 3.5137343193747186,
     "description": "GT + 10dB noise",
-    "vs_oracle": 0.9326852064603788
+    "vs_oracle": 1.1188528811837164
   },
   "shuffled": {
-    "mean": 11.89014900571468,
-    "std": 5.279023927375057,
+    "mean": 16.011451288265647,
+    "std": 18.598701809272757,
     "description": "Shuffled (Random Permutation)",
-    "vs_oracle": 2.184330365129163
+    "vs_oracle": 2.95043293935936
   },
   "constant": {
-    "mean": 4.373293760633778,
-    "std": 0.0,
+    "mean": 5.978875302026699,
+    "std": 1.3150704811350256,
     "description": "Constant (Mean RSSI)",
-    "vs_oracle": 0.8034145200695981
+    "vs_oracle": 1.101728401369199
   },
   "predicted": {
-    "mean": 1.653120109486288,
-    "std": 0.0,
+    "mean": 2.5986367302018913,
+    "std": 1.62471549344956e-05,
     "description": "Stage 1 Predictions",
-    "vs_oracle": 0.30369345671118453
+    "vs_oracle": 0.4788512464098599
   }
 }

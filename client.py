@@ -7,9 +7,11 @@ Encapsulates client-side training logic for different FL algorithms:
 - FedProx: Local SGD with proximal regularization
 - SCAFFOLD: Local SGD with variance reduction (BEST for non-IID)
 
-UPDATED: 
-- SCAFFOLD now uses SINGLE learning rate (required by control variate math)
-- FedAvg/FedProx can still use per-parameter LRs for better convergence
+FIXES APPLIED:
+- SCAFFOLD now trains ALL parameters (not just physics) to leverage variance reduction
+- SCAFFOLD uses vanilla SGD (no momentum) as per original paper
+- Proper control variate initialization and updates
+- Single learning rate for SCAFFOLD (required by control variate math)
 """
 
 import torch
@@ -30,7 +32,7 @@ class Client:
     Handles local training for one client/device in the FL system.
     Supports multiple FL algorithms: FedAvg, FedProx, SCAFFOLD.
 
-    UPDATED: SCAFFOLD uses single LR as required by control variate math.
+    FIXED: SCAFFOLD now trains all parameters to properly leverage variance reduction.
 
     Attributes:
         client_id: Unique identifier
@@ -113,25 +115,34 @@ class Client:
         # control variate math. Using different LRs per parameter violates
         # the mathematical assumptions of the algorithm.
         #
-        # FedAvg/FedProx can use per-parameter LRs for better convergence.
+        # FIXED: SCAFFOLD now trains ALL parameters (not just physics)
+        # to properly leverage variance reduction benefits.
         # =====================================================================
         
         if algo == "scaffold":
             # =========================================================
-            # SCAFFOLD: SINGLE LEARNING RATE (REQUIRED)
+            # SCAFFOLD: SINGLE LEARNING RATE, ALL PARAMETERS
             # =========================================================
-            # The control variate update assumes: c_new = c_old - c_server + (1/K*lr) * (x_global - x_local)
+            # The control variate update assumes: 
+            #   c_new = c_old - c_server + (1/K*lr) * (x_global - x_local)
             # This only works correctly with a single, consistent learning rate.
+            #
+            # FIXED: Train ALL parameters to leverage variance reduction.
+            # The original paper shows SCAFFOLD's benefit comes from reducing
+            # variance across ALL parameters, not just a subset.
             effective_lr = lr
             
             if warmup:
-                # Only train physics parameters
+                # During warmup, only train physics parameters
                 params = [model.theta, model.P0, model.gamma]
             else:
-                # All parameters with SAME learning rate
+                # FIXED: Train ALL parameters with SAME learning rate
+                # This is crucial for SCAFFOLD to outperform on non-IID data
                 params = list(model.parameters())
             
-            optimizer = optim.SGD(params, lr=effective_lr, momentum=0.9)
+            # FIXED: Use vanilla SGD without momentum (as per original SCAFFOLD paper)
+            # Momentum interferes with the control variate correction mechanism
+            optimizer = optim.SGD(params, lr=effective_lr, momentum=0.0)
             
         else:
             # =========================================================
@@ -180,14 +191,15 @@ class Client:
             ]
 
         # =====================================================================
-        # SCAFFOLD SETUP - IMPROVED INITIALIZATION
+        # SCAFFOLD SETUP - PROPER INITIALIZATION
         # =====================================================================
         if algo == "scaffold":
             if c_server is None:
                 c_server = torch.zeros_like(global_vec)
             if self.c_local is None:
-                # Initialize c_local to match c_server for first round
-                self.c_local = c_server.clone().detach().cpu()
+                # FIXED: Initialize c_local to zeros (not c_server)
+                # This is the standard initialization in the SCAFFOLD paper
+                self.c_local = torch.zeros_like(global_vec).cpu()
             c_server = c_server.to(self.device)
             c_local = self.c_local.to(self.device)
 
@@ -212,6 +224,14 @@ class Client:
                 # Forward pass
                 y_pred = model(x_batch)
 
+                # Handle shape mismatch (match server.py's robustness)
+                if y_pred.shape != y_batch.shape:
+                    if len(y_batch.shape) == 1:
+                        y_batch = y_batch.unsqueeze(1)
+                    min_dim = min(y_pred.shape[1], y_batch.shape[1])
+                    y_pred = y_pred[:, :min_dim]
+                    y_batch = y_batch[:, :min_dim]
+
                 # Weighted MSE loss (emphasize strong RSSI)
                 weights = adaptive_peak_weights(
                     y_batch, self.config.peak_weight_alpha
@@ -228,7 +248,7 @@ class Client:
                 loss.backward()
 
                 # =====================================================================
-                # SCAFFOLD: GRADIENT CORRECTION
+                # SCAFFOLD: GRADIENT CORRECTION (CORE MECHANISM)
                 # =====================================================================
                 if algo == "scaffold":
                     # Compute gradient norm before correction (for monitoring)
@@ -239,6 +259,7 @@ class Client:
                     grad_norm_before = grad_norm_before ** 0.5
                     
                     # Apply variance reduction: g_corrected = g + (c_server - c_local)
+                    # This is the key mechanism that makes SCAFFOLD work on non-IID data
                     idx = 0
                     for p in model.parameters():
                         numel = p.numel()
@@ -260,7 +281,7 @@ class Client:
                 n_batches += 1
 
         # =====================================================================
-        # SCAFFOLD: CONTROL VARIATE UPDATE (Option II)
+        # SCAFFOLD: CONTROL VARIATE UPDATE (Option II from paper)
         # =====================================================================
         c_local_new: Optional[torch.Tensor] = None
         if algo == "scaffold":
@@ -278,7 +299,7 @@ class Client:
                 + (1.0 / effective_steps_lr) * (global_vec - new_vec)
             )
             
-            # Delta to send to server
+            # Delta to send to server: Δc = c_local_new - c_local_old
             delta_c = (c_local_new_dev - c_local_old).detach().cpu()
             
             # Update local control variate

@@ -4,9 +4,12 @@ Model Wrapper Module
 
 Provides wrapper and patches for Jaramillo's Net_augmented model.
 Handles edge cases like:
-- Batch size 1 (BatchNorm failure)
+- Batch size 1 (dropout stability)
 - Near-field path loss singularities
 - Safe forward methods
+
+NOTE: The original BatchNorm concerns are outdated - model.py now uses LayerNorm
+which works fine with any batch size. We still handle dropout for batch=1.
 """
 
 import torch
@@ -52,8 +55,12 @@ def safe_forward_NN(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """
     Safe neural network forward that handles batch size 1.
     
-    The original model creates new BatchNorm layers on each forward pass,
-    which fails with batch size 1. This version handles that case.
+    NOTE: The original BatchNorm concern is outdated - model.py now uses LayerNorm
+    which works fine with batch size 1. However, we still disable dropout for
+    batch size 1 to avoid training instability.
+    
+    IMPORTANT: This function must mirror model.py's forward_NN exactly,
+    including the LayerNorm layers, to ensure consistent behavior.
     
     Args:
         model: Net_augmented model
@@ -64,26 +71,21 @@ def safe_forward_NN(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
     """
     training_mode = model.training
     
-    # If batch size is 1 and training, temporarily switch to eval
-    # to avoid BatchNorm issues
-    if x.size(0) == 1 and training_mode:
-        model.eval()
+    # Input normalization (must match model.py's forward_NN)
+    out = model.normalization(x)
     
-    # Forward through layers (without creating new BatchNorm each time)
-    out = x
-    for i, fc_layer in enumerate(model.fc_layers[:-1]):
+    # Forward through layers with hidden LayerNorms (matching model.py)
+    for fc_layer, norm in zip(model.fc_layers[:-1], model.hidden_norms):
+        out = norm(out)  # Hidden LayerNorm - CRITICAL: was missing before
         out = model.nonlinearity(fc_layer(out))
         
-        # Only apply dropout if batch > 1 and training
+        # Disable dropout for batch size 1 to avoid training instability
+        # (single sample dropout can cause high variance)
         if x.size(0) > 1 and training_mode:
             out = model.dropout(out)
     
     # Output layer
     result = model.fc_layers[-1](out)
-    
-    # Restore training mode
-    if training_mode and not model.training:
-        model.train()
     
     return result
 
@@ -124,11 +126,18 @@ def patch_model(model: nn.Module):
     
     Args:
         model: Net_augmented model to patch
+    
+    Returns:
+        The patched model (for chaining)
     """
-    # Store original methods (for debugging if needed)
-    model._original_forward_PL = model.forward_PL
-    model._original_forward_NN = model.forward_NN
-    model._original_forward = model.forward
+    # Store original methods only if they exist (for debugging if needed)
+    # This allows patching different model types without crashing
+    if hasattr(model, 'forward_PL'):
+        model._original_forward_PL = model.forward_PL
+    if hasattr(model, 'forward_NN'):
+        model._original_forward_NN = model.forward_NN
+    if hasattr(model, 'forward'):
+        model._original_forward = model.forward
     
     # Patch with safe methods
     model.forward_PL = lambda x: safe_forward_PL(model, x)

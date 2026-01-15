@@ -332,19 +332,39 @@ class EarlyStopping:
 # ==================== Metrics ====================
 
 def compute_localization_error(theta_hat: np.ndarray, 
-                                theta_true: np.ndarray = None) -> float:
+                                theta_true: np.ndarray) -> float:
     """
     Compute localization error in meters.
     
+    NOTE: A similar function exists in trainer.py. For consistency within the
+    training pipeline, prefer using trainer.compute_localization_error().
+    This version is maintained for backward compatibility with standalone utilities.
+    
+    IMPORTANT: theta_true is REQUIRED. There is no default because:
+    - In our neutral frame, ENU origin is receiver centroid, NOT jammer
+    - Defaulting to [0,0] would silently report "error to centroid" instead
+      of "error to jammer", which is a serious oracle frame leak risk.
+    
     Args:
-        theta_hat: Estimated jammer position [2]
-        theta_true: True jammer position [2] (default: origin)
+        theta_hat: Estimated jammer position [2] in ENU coordinates
+        theta_true: True jammer position [2] in ENU coordinates (REQUIRED)
     
     Returns:
         Euclidean distance in meters
+    
+    Raises:
+        ValueError: If theta_true is None
     """
     if theta_true is None:
-        theta_true = np.array([0.0, 0.0])
+        raise ValueError(
+            "theta_true must be provided explicitly. "
+            "In our neutral frame (ENU origin = receiver centroid), "
+            "the jammer is NOT at origin. Defaulting to [0,0] would "
+            "incorrectly compute error relative to the data centroid."
+        )
+    
+    theta_hat = np.asarray(theta_hat)
+    theta_true = np.asarray(theta_true)
     
     return float(np.linalg.norm(theta_hat - theta_true))
 

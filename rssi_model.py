@@ -13,6 +13,12 @@ Model Architecture (from thesis document):
 References:
 - Thesis document: "Jammer-Aware RSSI Estimation"
 - Original notebook: RSSIESTIMATION.ipynb
+
+FIXES APPLIED:
+- Renamed gate parameter 'c' to 'g_c' to avoid shadowing physics constant
+- Removed duplicate detection functions (consolidated in rssi_trainer.py)
+- Added numerical guards to inv_softplus calls in initialize_from_data
+- Documented unused rssi_mean/rssi_std (kept for API compatibility)
 """
 
 import math
@@ -85,7 +91,7 @@ class ExactHybrid(nn.Module):
     Physics:
     - J_CN0 = θ + s * log10(max(expm1(c*ΔCN0), floor))
     - J_AGC = α * ΔAGC + β
-    - w = σ(a + b*ΔCN0 + c*ΔAGC)
+    - w = σ(g_a + g_b*ΔCN0 + g_c*ΔAGC)
     - J = w * J_CN0 + (1-w) * J_AGC
     """
     
@@ -95,7 +101,9 @@ class ExactHybrid(nn.Module):
         self.n_bands = n_bands
         self.n_pairs = n_devices * n_bands
         
-        # Store for compatibility (not used in original model)
+        # NOTE: rssi_mean/rssi_std are stored for API compatibility with older code
+        # that may pass these parameters, but they are not used in the forward pass.
+        # The model operates in the original dBm scale without normalization.
         self.rssi_mean = rssi_mean
         self.rssi_std = rssi_std
 
@@ -107,7 +115,7 @@ class ExactHybrid(nn.Module):
         self.alpha_raw = nn.Embedding(self.n_pairs, 1)  # Slope (softplus applied)
         self.beta = nn.Embedding(self.n_pairs, 1)       # Intercept
         
-        # Per-band gate parameters
+        # Per-band gate parameters (renamed from a,b,c to g_a,g_b,g_c for clarity)
         self.g_a_band = nn.Embedding(n_bands, 1)  # Gate bias
         self.g_b_band = nn.Embedding(n_bands, 1)  # Gate CN0 coefficient
         self.g_c_band = nn.Embedding(n_bands, 1)  # Gate AGC coefficient
@@ -139,9 +147,10 @@ class ExactHybrid(nn.Module):
         Compute φ = log10(expm1(c*ΔCN0)) with numerical stability.
         
         This is the physics-based CN0→J mapping from the thesis.
+        The constant c = ln(10)/10 converts dB to natural log scale.
         """
-        c = math.log(10.0) / 10.0
-        raw = torch.expm1(c * delta)
+        PHI_CONST = math.log(10.0) / 10.0  # Renamed from 'c' for clarity
+        raw = torch.expm1(PHI_CONST * delta)
         floor = torch.relu(self.eps_phi) + 1e-6
         raw = torch.clamp(raw, min=floor)
         phi = torch.log10(raw)
@@ -182,11 +191,12 @@ class ExactHybrid(nn.Module):
         beta = self.beta(pair_idx)
         J_agc = alpha * d_agc + beta
 
-        # Fusion gate: w = σ(a + b*ΔCN0 + c*ΔAGC)
-        a = self.g_a_band(band_idx)
-        b = self.g_b_band(band_idx)
-        c = self.g_c_band(band_idx)
-        w = torch.sigmoid(a + b * d_cn0 + c * d_agc)
+        # Fusion gate: w = σ(g_a + g_b*ΔCN0 + g_c*ΔAGC)
+        # FIXED: Renamed variables from a,b,c to g_a,g_b,g_c to avoid shadowing
+        g_a = self.g_a_band(band_idx)
+        g_b = self.g_b_band(band_idx)
+        g_c = self.g_c_band(band_idx)
+        w = torch.sigmoid(g_a + g_b * d_cn0 + g_c * d_agc)
 
         # Final prediction: J = w * J_CN0 + (1-w) * J_AGC
         y_pred = w * J_cn0 + (1.0 - w) * J_agc
@@ -253,11 +263,26 @@ def monotonic_penalty(model: ExactHybrid, x_num: torch.Tensor, x_cat: torch.Tens
 # Helper Functions
 # ============================================================
 
-def build_features(df_part: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract features for model training."""
+def build_features(df_part: pd.DataFrame, require_y: bool = True) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Extract features for model training or inference.
+
+    Args:
+        df_part: DataFrame containing at least Delta_AGC, Delta_CN0, device_idx, band_idx.
+        require_y: If True, requires an RSSI column and returns y. If False, returns y=None when missing.
+
+    Returns:
+        X_num: float32 array [N,2] with [Delta_AGC, Delta_CN0]
+        X_cat: int64 array [N,2] with [device_idx, band_idx]
+        y: float32 array [N] if available/required, else None
+    """
     X_num = df_part[["Delta_AGC", "Delta_CN0"]].values.astype(np.float32)
     X_cat = df_part[["device_idx", "band_idx"]].values.astype(np.int64)
-    y = df_part["RSSI"].values.astype(np.float32)
+    if "RSSI" in df_part.columns:
+        y = df_part["RSSI"].values.astype(np.float32)
+    else:
+        if require_y:
+            raise KeyError("RSSI column not found but require_y=True")
+        y = None
     return X_num, X_cat, y
 
 
@@ -278,9 +303,23 @@ def predict_rssi(model: ExactHybrid, X_num: np.ndarray, X_cat: np.ndarray,
     return np.clip(predictions, clamp[0], clamp[1])
 
 
-def inv_softplus(y: float) -> float:
-    """Inverse of softplus for initialization."""
-    return math.log(max(math.expm1(max(y, 1e-4)), 1e-8))
+def inv_softplus(y: float, min_output: float = -20.0) -> float:
+    """
+    Inverse of softplus for initialization.
+    
+    FIXED: Added numerical guard to prevent extreme negative values.
+    
+    Args:
+        y: Target positive value (output of softplus)
+        min_output: Minimum return value to prevent numerical issues
+        
+    Returns:
+        x such that softplus(x) ≈ y
+    """
+    # Guard against very small or negative inputs
+    y_safe = max(y, 1e-6)
+    result = math.log(max(math.expm1(y_safe), 1e-8))
+    return max(result, min_output)
 
 
 def initialize_from_data(model: ExactHybrid, df_tr: pd.DataFrame, n_bands: int):
@@ -289,9 +328,15 @@ def initialize_from_data(model: ExactHybrid, df_tr: pd.DataFrame, n_bands: int):
     
     - θ_{d,b} ← median(RSSI) for the pair
     - α_{d,b}, β_{d,b} ← least-squares fit on weak-jam samples
+    
+    FIXED: Added numerical guards to inv_softplus calls to prevent
+    extreme values when a_hat is very small.
     """
     band_fallback = {}
     y_global = float(np.median(df_tr["RSSI"])) if len(df_tr) > 0 else -110.0
+    
+    # Minimum alpha value to ensure numerical stability
+    ALPHA_MIN = 0.01
     
     with np.errstate(all='ignore'):
         # Compute band-level fallbacks
@@ -303,7 +348,7 @@ def initialize_from_data(model: ExactHybrid, df_tr: pd.DataFrame, n_bands: int):
                 A = np.hstack([x, np.ones_like(x)])
                 coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
                 a_hat, b_hat = float(coef[0, 0]), float(coef[1, 0])
-                a_hat = max(a_hat, 1e-3)
+                a_hat = max(a_hat, ALPHA_MIN)  # FIXED: Ensure minimum alpha
             else:
                 a_hat = 1.0
                 b_hat = float(np.median(y)) if y.size > 0 else (y_global - 10.0)
@@ -325,7 +370,7 @@ def initialize_from_data(model: ExactHybrid, df_tr: pd.DataFrame, n_bands: int):
                 A = np.hstack([x, np.ones_like(x)])
                 coef, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
                 a_hat, b_hat = float(coef[0, 0]), float(coef[1, 0])
-                a_hat = max(a_hat, 1e-3)
+                a_hat = max(a_hat, ALPHA_MIN)  # FIXED: Ensure minimum alpha
             else:
                 _, a_hat, b_hat = band_fallback.get(int(band), (default_theta, default_alpha, default_beta))
             
@@ -333,7 +378,8 @@ def initialize_from_data(model: ExactHybrid, df_tr: pd.DataFrame, n_bands: int):
             
             model.theta_dbm.weight[pair_idx, 0] = theta0
             model.beta.weight[pair_idx, 0] = b_hat
-            model.alpha_raw.weight[pair_idx, 0] = inv_softplus(a_hat - 1e-3)
+            # FIXED: Ensure a_hat is large enough before inv_softplus
+            model.alpha_raw.weight[pair_idx, 0] = inv_softplus(max(a_hat, ALPHA_MIN))
             updated.add((int(dev), int(band)))
         
         # Fill unvisited pairs with band fallbacks
@@ -344,7 +390,8 @@ def initialize_from_data(model: ExactHybrid, df_tr: pd.DataFrame, n_bands: int):
                     theta_b, a_b, b_b = band_fallback.get(band, (default_theta, default_alpha, default_beta))
                     model.theta_dbm.weight[pair_idx, 0] = theta_b
                     model.beta.weight[pair_idx, 0] = b_b
-                    model.alpha_raw.weight[pair_idx, 0] = inv_softplus(a_b - 1e-3)
+                    # FIXED: Ensure a_b is large enough before inv_softplus
+                    model.alpha_raw.weight[pair_idx, 0] = inv_softplus(max(a_b, ALPHA_MIN))
                     model.s_raw.weight[pair_idx, 0] = inv_softplus(3.0)
 
 
@@ -480,51 +527,6 @@ def apply_agc_orientation(df: pd.DataFrame, sgn_map: Dict[Tuple[str, str], float
     
     df = df.copy()
     df["Delta_AGC"] = df.apply(orient, axis=1)
-    return df
-
-
-# ============================================================
-# Detection (jammed vs clean classification)
-# ============================================================
-
-def compute_detection_params(df: pd.DataFrame, clean_cn0_max: float = 2.0, 
-                            clean_agc_max: float = 3.0, k_sigma: float = 3.0) -> Dict:
-    """Learn detection threshold from clean samples."""
-    clean_mask = (df["Delta_CN0"].abs() <= clean_cn0_max) & (df["Delta_AGC"].abs() <= clean_agc_max)
-    clean = df[clean_mask] if clean_mask.sum() >= 100 else df
-    
-    d_cn0 = clean["Delta_CN0"].values
-    d_agc = clean["Delta_AGC"].values
-    sigma_cn0 = max(np.std(d_cn0), 1e-6)
-    sigma_agc = max(np.std(d_agc), 1e-6)
-    
-    S_clean = np.sqrt((d_cn0/sigma_cn0)**2 + (d_agc/sigma_agc)**2)
-    
-    return {
-        "sigma_cn0": sigma_cn0, 
-        "sigma_agc": sigma_agc,
-        "mu_S": float(np.mean(S_clean)), 
-        "std_S": float(np.std(S_clean)),
-        "T": float(np.mean(S_clean) + k_sigma * np.std(S_clean))
-    }
-
-
-def apply_detection(df: pd.DataFrame, det_params: Dict, window_size: int = 5) -> pd.DataFrame:
-    """Apply rolling window detection."""
-    df = df.copy()
-    d_cn0 = df["Delta_CN0"].values
-    d_agc = df["Delta_AGC"].values
-    
-    df["S_det"] = np.sqrt((d_cn0/det_params["sigma_cn0"])**2 + (d_agc/det_params["sigma_agc"])**2)
-    
-    if "timestamp" in df.columns:
-        df = df.sort_values(["device", "timestamp"])
-    
-    df["S_rolling"] = df.groupby("device")["S_det"].transform(
-        lambda x: x.rolling(window=window_size, min_periods=1, center=False).mean()
-    )
-    df["jammed_pred"] = (df["S_rolling"] > det_params["T"]).astype(int)
-    
     return df
 
 
