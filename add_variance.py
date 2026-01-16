@@ -250,13 +250,13 @@ if __name__ == "__main__":
         if 'jammed' in df.columns:
             analyze_variance_by_group(df, group_col='jammed', signal_col='CN0')
         
-        print("\n✅ Processing completed successfully!")
+        print("\n Processing completed successfully!")
         print("   Row order preserved, 'jammed' column unchanged.")
         
     except FileNotFoundError:
-        print(f"\n⚠️  File not found: {INPUT_FILE}")
+        print(f"\n File not found: {INPUT_FILE}")
         
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n Error: {e}")
         import traceback
         traceback.print_exc()

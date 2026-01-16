@@ -36,7 +36,6 @@ from torch.utils.data import DataLoader
 from typing import Dict, List, Tuple, Optional, Any
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from tqdm import tqdm
 
 # Import model and helpers from rssi_model.py
 from rssi_model import (

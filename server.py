@@ -9,11 +9,19 @@ Orchestrates federated learning process:
 - Tracks training progress
 - Implements early stopping for FL algorithms
 
-FIXES APPLIED:
-- SCAFFOLD learning rate multiplier increased (variance reduction allows larger steps)
-- SCAFFOLD warmup extended for proper control variate buildup
-- Theta aggregation uses geometric_median for robustness on non-IID
-- FedProx mu reduced to fair value
+CRITICAL FIX APPLIED (January 2026):
+=====================================
+SCAFFOLD was showing MSE↓ but loc_error constant. Root cause: single learning
+rate caused NN to learn faster than θ, making θ effectively frozen.
+
+FIX: Client now uses hybrid SCAFFOLD:
+- θ: Separate optimizer with HIGHER LR, NO control variates  
+- NN: SCAFFOLD with control variates
+
+Server changes:
+- Control variates now only cover NN params
+- Added θ movement logging for debugging
+- Updated algorithm configs
 
 AGGREGATION METHODOLOGY:
 ========================
@@ -24,7 +32,6 @@ The FL aggregation uses a TWO-STEP approach:
 This is intentional because:
 - FedAvg works well for NN parameters
 - Theta benefits from robust aggregation (outlier resistance)
-- This is NOT pure FedAvg - it's "FedAvg with robust theta aggregation"
 """
 
 import numpy as np
@@ -54,38 +61,23 @@ from client import ClientManager
 class FLEarlyStoppingConfig:
     """Configuration for FL early stopping."""
     
-    # Patience-based stopping
-    patience: int = 15  # Rounds without improvement before stopping
-    min_delta: float = 0.1  # Minimum improvement to count as "better" (meters)
-    
-    # Divergence detection (critical for SCAFFOLD)
-    divergence_threshold: float = 1.5  # Stop if error > best * threshold (50% worse)
-    max_error: float = 50.0  # Absolute maximum error (meters)
-    
-    # Warm-up period (don't stop too early)
-    warmup_rounds: int = 10  # Minimum rounds before early stopping can trigger
-    
-    # What metric to monitor
-    monitor: str = 'loc_error'  # 'loc_error' or 'val_mse'
-    
-    # Enable/disable
+    patience: int = 15
+    min_delta: float = 0.1
+    divergence_threshold: float = 1.5
+    max_error: float = 50.0
+    warmup_rounds: int = 10
+    monitor: str = 'val_loss'  # Use val_loss to avoid oracle bias (not loc_error)
     enabled: bool = True
 
 
 class FLEarlyStopping:
-    """
-    Early stopping handler for Federated Learning.
-    
-    Addresses the observed issue where SCAFFOLD can diverge
-    when data quality is poor or training continues too long.
-    """
+    """Early stopping handler for Federated Learning."""
     
     def __init__(self, config: Optional[FLEarlyStoppingConfig] = None):
         self.config = config or FLEarlyStoppingConfig()
         self.reset()
     
     def reset(self):
-        """Reset state for new training run."""
         self.best_error = float('inf')
         self.best_loss = float('inf')
         self.best_round = 0
@@ -94,28 +86,19 @@ class FLEarlyStopping:
         self.stopped = False
         self.stop_reason = ""
     
-    def check(self, 
-              round: int, 
-              loc_error: float, 
-              val_loss: float = None) -> Tuple[bool, str]:
-        """
-        Check if training should stop.
-        """
+    def check(self, round: int, loc_error: float, val_loss: float = None) -> Tuple[bool, str]:
         if not self.config.enabled:
-            # Still track best even if early stopping disabled
             if loc_error < self.best_error:
                 self.best_error = loc_error
                 self.best_round = round
             return False, ""
         
-        # Record history
         self.history.append({
             'round': round,
             'loc_error': loc_error,
             'val_loss': val_loss
         })
         
-        # Determine which metric to use
         if self.config.monitor == 'loc_error':
             current = loc_error
             best = self.best_error
@@ -123,18 +106,15 @@ class FLEarlyStopping:
             current = val_loss if val_loss is not None else loc_error
             best = self.best_loss if val_loss is not None else self.best_error
 
-        # 1. Warm-up period: don't stop too early.
-        # IMPORTANT: during warmup we intentionally do NOT update "best" or patience counters.
-        # This prevents algorithms like SCAFFOLD from getting "locked" to an early (often noisy) round.
+        # Warmup period
         if round < self.config.warmup_rounds:
-            # Still enforce an absolute safety bound during warmup
             if loc_error > self.config.max_error:
                 self.stopped = True
                 self.stop_reason = f"Max error exceeded: {loc_error:.2f}m > {self.config.max_error}m"
                 return True, self.stop_reason
             return False, ""
 
-        # Check for improvement (after warmup)
+        # Check for improvement
         if best == float('inf'):
             improved = True
         else:
@@ -149,19 +129,19 @@ class FLEarlyStopping:
         else:
             self.rounds_without_improvement += 1
 
-        # 2. Divergence detection: error way worse than best
+        # Divergence detection
         if self.best_error > 0 and loc_error > self.best_error * self.config.divergence_threshold:
             self.stopped = True
             self.stop_reason = f"Divergence: {loc_error:.2f}m > {self.best_error:.2f}m × {self.config.divergence_threshold}"
             return True, self.stop_reason
         
-        # 3. Absolute maximum error
+        # Max error
         if loc_error > self.config.max_error:
             self.stopped = True
             self.stop_reason = f"Max error exceeded: {loc_error:.2f}m > {self.config.max_error}m"
             return True, self.stop_reason
         
-        # 4. Patience exhausted
+        # Patience exhausted
         if self.rounds_without_improvement >= self.config.patience:
             self.stopped = True
             self.stop_reason = f"No improvement for {self.config.patience} rounds (best: {self.best_error:.2f}m at round {self.best_round + 1})"
@@ -170,11 +150,9 @@ class FLEarlyStopping:
         return False, ""
     
     def get_best(self) -> Tuple[int, float]:
-        """Get best round and error."""
         return self.best_round, self.best_error
     
     def get_summary(self) -> dict:
-        """Get summary statistics."""
         if not self.history:
             return {}
         
@@ -201,10 +179,7 @@ class Server:
 
     Orchestrates the FL process: client coordination, aggregation, evaluation.
 
-    FIXES APPLIED: 
-    - SCAFFOLD uses higher LR multiplier (variance reduction allows larger steps)
-    - Extended warmup for SCAFFOLD to build control variates
-    - Algorithm-specific tuning for expected ranking: SCAFFOLD > FedProx ≈ FedAvg
+    CRITICAL FIX: Now supports hybrid SCAFFOLD where θ is trained separately.
     """
 
     def __init__(
@@ -216,22 +191,8 @@ class Server:
         config: Config = None,
         device: torch.device = None,
         early_stopping_config: FLEarlyStoppingConfig = None,
-        theta_true: np.ndarray = None,  # REQUIRED for localization evaluation
+        theta_true: np.ndarray = None,
     ):
-        """
-        Initialize FL server.
-        
-        Args:
-            global_model: Initial global model
-            client_manager: Manager for FL clients
-            val_loader: Validation DataLoader
-            test_loader: Test DataLoader
-            config: Configuration object
-            device: Compute device
-            early_stopping_config: Early stopping settings
-            theta_true: True jammer position in ENU frame (REQUIRED)
-                       If None, localization error will be reported as inf
-        """
         self.config = config if config else cfg
         self.device = device if device else cfg.get_device()
 
@@ -240,10 +201,10 @@ class Server:
         self.val_loader = val_loader
         self.test_loader = test_loader
 
-        # SCAFFOLD server control variate
+        # SCAFFOLD server control variate (for NN params only now)
         self.c_server: Optional[torch.Tensor] = None
 
-        # Early stopping configuration
+        # Early stopping
         if early_stopping_config is None:
             early_stopping_config = FLEarlyStoppingConfig(
                 patience=getattr(self.config, 'fl_early_stopping_patience', 15),
@@ -264,18 +225,23 @@ class Server:
             "test_mse": [],
             "loc_error": [],
             "theta_trajectory": [],
+            "theta_movement": [],  # NEW: track θ movement per round
             "round_stats": [],
         }
 
-        # Best model tracking
+        # Best model tracking (by val_mse - honest, no oracle)
         self.best_loc_error: float = float("inf")
         self.best_val_mse: float = float("inf")
         self.best_model_state: Optional[Dict[str, torch.Tensor]] = None
         self.best_round: int = 0
         self.best_theta: Optional[np.ndarray] = None
+        
+        # Oracle-best tracking (by loc_error - for reference only, not used for selection)
+        self.oracle_best_loc_error: float = float("inf")
+        self.oracle_best_round: int = 0
+        self.oracle_best_theta: Optional[np.ndarray] = None
 
-        # True theta for evaluation
-        # UPDATED: No default to (0,0) - must be provided explicitly
+        # True theta
         if theta_true is not None:
             self.theta_true = np.array(theta_true, dtype=np.float32)
         else:
@@ -284,7 +250,6 @@ class Server:
             print("⚠️  WARNING: theta_true not provided to Server")
             print("="*60)
             print("Localization error will be reported as 'inf'.")
-            print("To compute localization error, pass theta_true to Server.__init__()")
             print("="*60)
 
     def aggregate_models(
@@ -293,25 +258,7 @@ class Server:
         client_thetas: List[np.ndarray],
         method: str = "geometric_median",
     ):
-        """
-        Aggregate client models into global model.
-
-        METHODOLOGY (DOCUMENTED):
-        =========================
-        This uses a TWO-STEP aggregation approach:
-        
-        1. FedAvg on ALL parameters (including theta):
-           - Simple weighted average based on client data sizes
-           - Works well for NN parameters
-        
-        2. REPLACE theta with robust aggregation:
-           - Geometric median for outlier resistance
-           - Prevents malicious/poor clients from corrupting theta
-        
-        This is NOT pure FedAvg - it's "FedAvg with robust theta aggregation".
-        This design choice is intentional to improve theta estimation while
-        maintaining standard aggregation for other parameters.
-        """
+        """Aggregate client models into global model."""
         weights = self.client_manager.client_weights
 
         with torch.no_grad():
@@ -337,18 +284,19 @@ class Server:
         """
         Update SCAFFOLD server control variate.
         
-        IMPROVED: Proper averaging of control variate updates.
+        NOTE: Now only covers NN parameters (θ excluded from control variates).
         """
-        if self.c_server is None:
-            self.c_server = torch.zeros_like(get_param_vector(self.global_model))
-
-        # Count non-None deltas
+        # Get NN param vector size from first valid delta
         valid_deltas = [dc for dc in client_delta_c if dc is not None]
         
         if not valid_deltas:
             return
         
-        # Average the deltas (not sum)
+        # Initialize c_server if needed
+        if self.c_server is None:
+            self.c_server = torch.zeros_like(valid_deltas[0])
+        
+        # Average the deltas
         delta_c_avg = torch.zeros_like(self.c_server)
         for dc in valid_deltas:
             delta_c_avg += dc.to(self.c_server.device)
@@ -358,9 +306,7 @@ class Server:
         self.c_server = self.c_server + delta_c_avg
 
     def evaluate(self, loader: DataLoader) -> float:
-        """
-        Evaluate model on a dataset.
-        """
+        """Evaluate model on a dataset."""
         self.global_model.eval()
         total_loss = 0.0
         n_samples = 0
@@ -372,7 +318,6 @@ class Server:
 
                 y_pred = self.global_model(x_batch)
 
-                # Handle dimension mismatch
                 if y_pred.shape != y_batch.shape:
                     if len(y_batch.shape) == 1:
                         y_batch = y_batch.unsqueeze(1)
@@ -387,17 +332,13 @@ class Server:
         return total_loss / n_samples if n_samples > 0 else float("inf")
 
     def get_current_theta(self) -> np.ndarray:
-        """Get current theta estimate"""
         return self.global_model.get_theta().detach().cpu().numpy()
 
     def _get_algorithm_config(self, algo: str) -> dict:
         """
         Get algorithm-specific configuration.
         
-        FIXED: SCAFFOLD tuning to ensure it outperforms on non-IID data:
-        - Higher learning rate (variance reduction allows larger steps)
-        - More warmup rounds for control variate buildup
-        - More patience (SCAFFOLD improves gradually)
+        FIXED: SCAFFOLD now works properly with hybrid θ training.
         """
         configs = {
             "fedavg": {
@@ -415,24 +356,20 @@ class Server:
                 "warmup_rounds": 5,
             },
             "scaffold": {
-                # FIXED: Higher LR because variance reduction allows larger steps
-                # This is a key advantage of SCAFFOLD - it can use larger LRs safely
-                "lr_multiplier": 1.0,  # INCREASED from 1.0
-                "local_epochs_multiplier": 1.0,
-                "patience": 50,  # INCREASED - SCAFFOLD improves gradually
-                "divergence_threshold": 3.0,  # More lenient - SCAFFOLD can recover
-                "warmup_rounds": 20,  # INCREASED - need time for control variates
+                # Conservative settings for consistent results
+                "lr_multiplier": 1.0,
+                "local_epochs_multiplier": 1.0,  # Same as FedAvg/FedProx for fair comparison
+                "patience": 30,
+                "divergence_threshold": 2.0,  # Same as others
+                "warmup_rounds": 10,
             },
         }
         return configs.get(algo, configs["fedavg"])
 
     def _get_algorithm_early_stopping_config(self, algo: str) -> FLEarlyStoppingConfig:
-        """
-        Get algorithm-specific early stopping configuration.
-        """
         algo_config = self._get_algorithm_config(algo)
         
-        config = FLEarlyStoppingConfig(
+        return FLEarlyStoppingConfig(
             patience=algo_config["patience"],
             min_delta=self.early_stopping_config.min_delta,
             divergence_threshold=algo_config["divergence_threshold"],
@@ -440,8 +377,6 @@ class Server:
             max_error=self.early_stopping_config.max_error,
             enabled=self.early_stopping_config.enabled,
         )
-        
-        return config
 
     def train(
         self,
@@ -451,15 +386,9 @@ class Server:
         warmup_rounds: int = 10,
         verbose: bool = True,
     ) -> Dict[str, Any]:
-        """
-        Execute full federated training with early stopping.
-
-        FIXED: Algorithm-specific tuning for performance ranking:
-        SCAFFOLD > FedProx ≈ FedAvg (on non-IID data)
-        """
+        """Execute full federated training with early stopping."""
         algo_config = self._get_algorithm_config(algo)
         
-        # Use algorithm-specific warmup
         effective_warmup = max(warmup_rounds, algo_config.get("warmup_rounds", 5))
         
         if verbose:
@@ -474,24 +403,32 @@ class Server:
             if self.theta_true is not None:
                 print(f"True jammer position: ({self.theta_true[0]:.1f}, {self.theta_true[1]:.1f}) m")
             else:
-                print("True jammer position: NOT PROVIDED (loc_error will be inf)")
+                print("True jammer position: NOT PROVIDED")
+            
+            # NEW: Note about hybrid SCAFFOLD
+            if algo == "scaffold":
+                theta_lr_mult = getattr(self.config, 'scaffold_theta_lr_mult', 2.0)
+                eff_local_epochs = int(local_epochs * algo_config.get('local_epochs_multiplier', 1.0))
+                print(f"SCAFFOLD mode: Hybrid (θ LR = {theta_lr_mult}× base)")
+                print(f"SCAFFOLD local epochs: {eff_local_epochs} (base={local_epochs}, mult={algo_config.get('local_epochs_multiplier', 1.0)})")
+            
+            print(f"Early stopping: patience={algo_config['patience']}, warmup={effective_warmup}")
 
-        # Initialize early stopping with algorithm-specific config
+        # Initialize early stopping
         es_config = self._get_algorithm_early_stopping_config(algo)
         self.early_stopper = FLEarlyStopping(es_config)
-        
-        if verbose and es_config.enabled:
-            print(f"Early stopping: patience={es_config.patience}, "
-                  f"warmup={es_config.warmup_rounds}")
 
-        # Get base learning rate and apply algorithm multiplier
+        # Get base learning rate
         base_lr = getattr(self.config, "lr_fl", getattr(self.config, "fl_lr", 0.01))
         lr = base_lr * algo_config["lr_multiplier"]
+        
+        # Apply local epochs multiplier (SCAFFOLD benefits from more local training)
+        effective_local_epochs = int(local_epochs * algo_config.get("local_epochs_multiplier", 1.0))
 
-        # Proximal weight for FedProx
         mu = getattr(self.config, "fedprox_mu", 0.01)
 
         actual_rounds = 0
+        prev_theta = self.get_current_theta()
 
         for rnd in range(global_rounds):
             actual_rounds = rnd + 1
@@ -502,7 +439,7 @@ class Server:
                 self.client_manager.train_round(
                     self.global_model,
                     algo=algo,
-                    local_epochs=local_epochs,
+                    local_epochs=effective_local_epochs,
                     lr=lr,
                     mu=mu,
                     c_server=self.c_server if algo == "scaffold" else None,
@@ -526,29 +463,33 @@ class Server:
             test_mse = self.evaluate(self.test_loader)
             theta_hat = self.get_current_theta()
             
-            # Compute localization error (will be inf if theta_true is None)
+            # Compute localization error
             if self.theta_true is not None:
                 loc_err = compute_localization_error(theta_hat, self.theta_true)
             else:
                 loc_err = float('inf')
 
-            # ---- Track best model ----
-            # We only start selecting a "best" checkpoint AFTER warmup.
-            # During warmup (especially for SCAFFOLD) metrics can be noisy.
-            if not is_warmup:
-                if algo == "scaffold":
-                    # For SCAFFOLD we care primarily about localization error
-                    is_best = loc_err < self.best_loc_error - 0.05  # 5cm threshold
-                else:
-                    # For other algorithms, select by validation MSE (as before)
-                    is_best = val_mse < self.best_val_mse
+            # Compute theta movement this round
+            theta_movement = float(np.linalg.norm(theta_hat - prev_theta))
+            prev_theta = theta_hat.copy()
 
-                if is_best:
+            # ---- Track best model (by val_mse to avoid oracle bias) ----
+            if not is_warmup:
+                # Primary: Use val_mse for model selection (honest - no oracle)
+                is_best_mse = val_mse < self.best_val_mse
+
+                if is_best_mse:
                     self.best_val_mse = val_mse
-                    self.best_loc_error = loc_err
+                    self.best_loc_error = loc_err  # loc_error at best MSE round
                     self.best_model_state = deepcopy(self.global_model.state_dict())
                     self.best_round = rnd
                     self.best_theta = theta_hat.copy()
+                
+                # Secondary: Track oracle-best localization (for reporting only)
+                if loc_err < self.oracle_best_loc_error:
+                    self.oracle_best_loc_error = loc_err
+                    self.oracle_best_round = rnd
+                    self.oracle_best_theta = theta_hat.copy()
 
             # ---- Update history ----
             train_loss = round_stats.get("avg_loss", float("nan"))
@@ -559,15 +500,17 @@ class Server:
             self.history["test_mse"].append(test_mse)
             self.history["loc_error"].append(loc_err)
             self.history["theta_trajectory"].append(theta_hat.copy())
+            self.history["theta_movement"].append(theta_movement)
             self.history["round_stats"].append(round_stats)
 
             # ---- Progress logging ----
             if verbose and (rnd + 1) % 10 == 0:
                 loc_str = f"{loc_err:.2f}m" if self.theta_true is not None else "N/A"
+                avg_client_theta_move = round_stats.get("avg_theta_movement", 0.0)
                 print(
                     f"[{algo.upper()}] Round {rnd+1}/{global_rounds}: "
                     f"val_mse={val_mse:.4f}, test_mse={test_mse:.4f}, "
-                    f"loc_err={loc_str}"
+                    f"loc_err={loc_str}, θ_move={theta_movement:.3f}m"
                 )
 
             # ---- Early Stopping Check ----
@@ -582,7 +525,7 @@ class Server:
                     print(f"\n[{algo.upper()}] Early stopping at round {rnd+1}: {reason}")
                 break
 
-        # Restore best model (by val MSE)
+        # Restore best model
         if self.best_model_state is not None:
             self.global_model.load_state_dict(self.best_model_state)
 
@@ -592,29 +535,35 @@ class Server:
         else:
             final_loc_err = float('inf')
 
-        # Get early stopping summary
         es_summary = self.early_stopper.get_summary() if self.early_stopper else {}
 
         if verbose:
             print(f"\n{algo.upper()} Final Results:")
+            # Report the model selected by val_mse (honest)
             loc_str = f"{self.best_loc_error:.2f} m" if self.theta_true is not None else "N/A"
-            print(f"  Best Localization Error: {loc_str} (round {self.best_round + 1})")
-            print(
-                f"  Final Position: "
-                f"[{final_theta[0]:.2f}, {final_theta[1]:.2f}]"
-            )
+            print(f"  Best by val_mse: {loc_str} (round {self.best_round + 1}, mse={self.best_val_mse:.2f})")
+            
+            # Also report oracle-best for transparency
+            if self.theta_true is not None and self.oracle_best_loc_error < float("inf"):
+                if self.oracle_best_loc_error < self.best_loc_error - 0.1:  # Only show if meaningfully different
+                    print(f"  (Oracle-best: {self.oracle_best_loc_error:.2f} m at round {self.oracle_best_round + 1} - not used)")
+            
+            print(f"  Final Position: [{final_theta[0]:.2f}, {final_theta[1]:.2f}]")
             if self.theta_true is not None:
                 print(f"  True Position: [{self.theta_true[0]:.2f}, {self.theta_true[1]:.2f}]")
             print(f"  Rounds completed: {actual_rounds}/{global_rounds}")
+            
+            # Report total θ movement
+            total_theta_movement = sum(self.history["theta_movement"])
+            print(f"  Total θ movement: {total_theta_movement:.2f}m over {actual_rounds} rounds")
+            
             if es_summary.get('early_stopped'):
                 print(f"  Early stopped: {es_summary.get('stop_reason', 'Unknown')}")
-                saved_rounds = global_rounds - actual_rounds
-                print(f"  Rounds saved: {saved_rounds} ({100*saved_rounds/global_rounds:.1f}%)")
 
         return {
             "theta_hat": final_theta,
-            "theta_true": self.theta_true,  # Include for reference
-            "best_loc_error": self.best_loc_error,
+            "theta_true": self.theta_true,
+            "best_loc_error": self.best_loc_error,  # Selected by val_mse (honest)
             "final_loc_error": final_loc_err,
             "best_val_mse": self.best_val_mse,
             "history": self.history,
@@ -622,12 +571,14 @@ class Server:
             "actual_rounds": actual_rounds,
             "early_stopped": es_summary.get('early_stopped', False),
             "early_stopping_summary": es_summary,
+            "total_theta_movement": sum(self.history["theta_movement"]),
+            # Oracle-best (for reference only)
+            "oracle_best_loc_error": self.oracle_best_loc_error,
+            "oracle_best_round": self.oracle_best_round,
         }
 
     def reset(self, global_model: nn.Module = None):
-        """
-        Reset server state for new experiment.
-        """
+        """Reset server state for new experiment."""
         if global_model is not None:
             self.global_model = global_model.to(self.device)
 
@@ -641,6 +592,7 @@ class Server:
             "test_mse": [],
             "loc_error": [],
             "theta_trajectory": [],
+            "theta_movement": [],
             "round_stats": [],
         }
 
@@ -650,7 +602,11 @@ class Server:
         self.best_round = 0
         self.best_theta = None
         
-        # Reset early stopper
+        # Reset oracle-best tracking
+        self.oracle_best_loc_error = float("inf")
+        self.oracle_best_round = 0
+        self.oracle_best_theta = None
+        
         if self.early_stopper:
             self.early_stopper.reset()
 
@@ -663,30 +619,12 @@ def run_federated_experiment(
     algorithms: List[str] = None,
     config: Config = None,
     theta_init: np.ndarray = None,
-    theta_true: np.ndarray = None,  # REQUIRED for localization evaluation
+    theta_true: np.ndarray = None,
     verbose: bool = True,
     early_stopping_config: FLEarlyStoppingConfig = None,
     device_labels: np.ndarray = None,
 ) -> Dict[str, Dict]:
-    """
-    Run federated learning experiments with multiple algorithms.
-    
-    Args:
-        model_class: Model class to instantiate
-        train_dataset: Training dataset
-        val_loader: Validation DataLoader
-        test_loader: Test DataLoader
-        algorithms: List of algorithms to run
-        config: Configuration object
-        theta_init: Initial theta estimate
-        theta_true: True jammer position (REQUIRED for localization)
-        verbose: Print progress
-        early_stopping_config: Early stopping settings
-        device_labels: Device labels for partitioning
-    
-    Returns:
-        Dict mapping algorithm name to results
-    """
+    """Run federated learning experiments with multiple algorithms."""
     from data_loader import partition_for_clients, create_client_loaders, get_device_labels_from_subset
 
     if config is None:
@@ -698,7 +636,6 @@ def run_federated_experiment(
 
     device = config.get_device()
 
-    # Warn if theta_true not provided
     if theta_true is None:
         print("="*60)
         print("⚠️  WARNING: theta_true not provided to run_federated_experiment")
@@ -715,7 +652,7 @@ def run_federated_experiment(
                 print("  WARNING: No device labels found. Falling back to geographic partitioning.")
             config.partition_strategy = "geographic"
 
-    # Partition data into client datasets
+    # Partition data
     client_datasets = partition_for_clients(
         train_dataset,
         config.num_clients,
@@ -741,7 +678,7 @@ def run_federated_experiment(
             print(f"FEDERATED LEARNING: {algo.upper()}")
             print("=" * 60)
 
-        # Fresh global model each time
+        # Fresh global model
         global_model = model_class(
             input_dim=config.input_dim,
             layer_wid=config.hidden_layers,
@@ -750,12 +687,10 @@ def run_federated_experiment(
             theta0=theta_init,
         )
 
-        # Patch model forward / get_theta
         from model_wrapper import patch_model
-
         patch_model(global_model)
 
-        # Create server with early stopping
+        # Create server
         server = Server(
             global_model=global_model,
             client_manager=client_manager,
@@ -764,7 +699,7 @@ def run_federated_experiment(
             config=config,
             device=device,
             early_stopping_config=early_stopping_config,
-            theta_true=theta_true,  # Pass theta_true
+            theta_true=theta_true,
         )
 
         # Train
@@ -778,7 +713,7 @@ def run_federated_experiment(
 
         results[algo] = result
 
-        # Reset SCAFFOLD control state before next algorithm
+        # Reset control state
         client_manager.reset_control_variates()
 
     return results

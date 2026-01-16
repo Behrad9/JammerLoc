@@ -2,7 +2,7 @@
 Comprehensive Ablation Studies for Thesis
 ==========================================
 
-This module provides thesis-critical ablation studies that prove:
+This module provides ablation studies that prove:
 
 1. RSSI QUALITY MATTERS (run_rssi_source_ablation):
    - Oracle RSSI → Best localization
@@ -61,7 +61,7 @@ Table 2: Model Architecture by Environment
 | APBM     | X.XX m   | X.XX m*  | X.XX m*  |
 (* = best for that environment)
 
-Author: Thesis Research
+Author: Behrad Shayegan
 """
 
 import os
@@ -97,6 +97,86 @@ from typing import Dict, List, Tuple, Optional, Any
 from dataclasses import dataclass
 from scipy import stats
 from scipy.optimize import minimize
+
+# ============================================================================
+# THESIS-QUALITY PLOTTING CONFIGURATION
+# ============================================================================
+
+
+PLOT_COLORS = {
+    'blue': '#648FFF',
+    'purple': '#785EF0', 
+    'magenta': '#DC267F',
+    'orange': '#FE6100',
+    'yellow': '#FFB000',
+    'green': '#2E8B57',
+    'gray': '#6B7280',
+    'dark': '#1F2937',
+}
+
+MODEL_COLORS = {
+    'pure_nn': '#DC267F',   
+    'pure_pl': '#648FFF',   
+    'apbm': '#2E8B57',      
+}
+
+RSSI_COLORS = {
+    'oracle': '#2E8B57',
+    'predicted': '#648FFF',
+    'noisy_2dB': '#FFB000',
+    'noisy_5dB': '#FE6100',
+    'noisy_10dB': '#DC267F',
+    'shuffled': '#785EF0',
+    'constant': '#6B7280',
+}
+
+
+def _setup_thesis_style():
+    """Configure matplotlib for figures."""
+    try:
+        import matplotlib.pyplot as plt
+        plt.rcParams.update({
+            'figure.figsize': (8, 5),
+            'figure.dpi': 150,
+            'figure.facecolor': 'white',
+            'font.family': 'serif',
+            'font.serif': ['Times New Roman', 'DejaVu Serif', 'Computer Modern Roman'],
+            'font.size': 11,
+            'axes.titlesize': 13,
+            'axes.labelsize': 11,
+            'xtick.labelsize': 10,
+            'ytick.labelsize': 10,
+            'legend.fontsize': 10,
+            'axes.linewidth': 1.0,
+            'axes.spines.top': False,
+            'axes.spines.right': False,
+            'axes.grid': True,
+            'axes.axisbelow': True,
+            'grid.alpha': 0.3,
+            'grid.linestyle': '-',
+            'grid.linewidth': 0.5,
+            'legend.frameon': True,
+            'legend.framealpha': 0.95,
+            'legend.edgecolor': '0.8',
+            'savefig.dpi': 300,
+            'savefig.bbox': 'tight',
+            'savefig.facecolor': 'white',
+        })
+    except ImportError:
+        pass
+
+
+def _save_figure(fig, output_dir: str, name: str, formats: List[str] = None):
+    """Save figure in multiple formats (PNG + PDF for thesis)."""
+    import matplotlib.pyplot as plt
+    if formats is None:
+        formats = ['png', 'pdf']
+    os.makedirs(output_dir, exist_ok=True)
+    for fmt in formats:
+        path = os.path.join(output_dir, f"{name}.{fmt}")
+        fig.savefig(path, format=fmt, dpi=300 if fmt == 'png' else None,
+                   bbox_inches='tight', facecolor='white', edgecolor='none')
+    plt.close(fig)
 
 # ============================================================================
 # CONFIGURATION
@@ -159,7 +239,7 @@ def get_jammer_location(df: pd.DataFrame, env: str, verbose: bool = True) -> Dic
     lon_col = next((c for c in lon_cols if c in df.columns), None)
     
     if lat_col and lon_col:
-        # Get unique jammer location (should be same for all rows)
+        # Get unique jammer location
         jammer_lat = df[lat_col].iloc[0]
         jammer_lon = df[lon_col].iloc[0]
         
@@ -499,7 +579,7 @@ def run_rssi_source_ablation(
 
     df['x_enu'], df['y_enu'] = latlon_to_enu(df['lat'].values, df['lon'].values, lat0_rad, lon0_rad)
 
-    # True jammer in the SAME ENU frame (neutral origin; not (0,0))
+    # True jammer in the SAME ENU frame 
     jammer_x, jammer_y = latlon_to_enu(
         np.array([jammer_loc['lat']]),
         np.array([jammer_loc['lon']]),
@@ -1713,72 +1793,123 @@ def _plot_stage1_rssi_quality(
     pred_col_name: str = "RSSI_pred",
     verbose: bool = True
 ):
-    """Stage-1-like diagnostics: prediction scatter + residual distribution.
-
-    Saves:
-      - stage1_pred_vs_true_<env>.png
-      - stage1_residual_hist_<env>.png
+    """
+    Publication-quality Stage 1 diagnostics.
+    
+    Creates:
+    1. Predicted vs True scatter with regression line and metrics
+    2. Residual distribution histogram with normal fit
+    
+    Saves: stage1_pred_vs_true_<env>.{png,pdf}, stage1_residual_hist_<env>.{png,pdf}
     """
     try:
         import matplotlib.pyplot as plt
-
+        from matplotlib.patches import Patch
+        
+        _setup_thesis_style()
         os.makedirs(output_dir, exist_ok=True)
-
-        # 1) Predicted vs True scatter (with y=x reference)
-        fig, ax = plt.subplots(figsize=(7.5, 6))
-        ax.scatter(rssi_true, rssi_pred, s=10, alpha=0.35, edgecolors='none')
-        lo = float(np.nanmin([rssi_true.min(), rssi_pred.min()]))
-        hi = float(np.nanmax([rssi_true.max(), rssi_pred.max()]))
-        ax.plot([lo, hi], [lo, hi], linestyle='--', linewidth=1.5)
-        ax.set_xlabel("True RSSI (dB)")
-        ax.set_ylabel(f"Predicted RSSI (dB) [{pred_col_name}]")
-        ax.set_title(f"Stage 1: Predicted vs True RSSI ({env})", fontweight='bold')
-        ax.grid(alpha=0.25)
-
-        # Metrics annotation
+        
+        # Filter valid data
         valid = np.isfinite(rssi_true) & np.isfinite(rssi_pred)
-        if valid.sum() > 3:
-            mae = float(np.mean(np.abs(rssi_true[valid] - rssi_pred[valid])))
-            rmse = float(np.sqrt(np.mean((rssi_true[valid] - rssi_pred[valid])**2)))
-            corr = float(np.corrcoef(rssi_true[valid], rssi_pred[valid])[0, 1])
-            ax.text(
-                0.02, 0.98,
-                f"MAE: {mae:.2f} dB\nRMSE: {rmse:.2f} dB\nCorr: {corr:.3f}\nN: {valid.sum()}",
-                transform=ax.transAxes, va='top', ha='left',
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-                fontsize=10
-            )
-
-        plt.tight_layout()
-        out1 = os.path.join(output_dir, f"stage1_pred_vs_true_{env}.png")
-        plt.savefig(out1, dpi=160, bbox_inches='tight')
-        plt.close()
-
-        # 2) Residual histogram
-        resid = (rssi_pred - rssi_true).astype(np.float32)
-        resid = resid[np.isfinite(resid)]
-        fig, ax = plt.subplots(figsize=(7.5, 5.5))
-        ax.hist(resid, bins=40, alpha=0.85)
-        ax.axvline(0.0, linestyle='--', linewidth=1.5)
-        ax.set_xlabel("Residual (Pred - True) [dB]")
-        ax.set_ylabel("Count")
-        ax.set_title(f"Stage 1: Residual Distribution ({env})", fontweight='bold')
-        ax.grid(alpha=0.25)
-        if len(resid) > 5:
-            ax.text(
-                0.02, 0.98,
-                f"Mean: {float(np.mean(resid)):+.2f} dB\nStd: {float(np.std(resid)):.2f} dB",
-                transform=ax.transAxes, va='top', ha='left',
-                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-                fontsize=10
-            )
-        plt.tight_layout()
-        out2 = os.path.join(output_dir, f"stage1_residual_hist_{env}.png")
-        plt.savefig(out2, dpi=160, bbox_inches='tight')
-        plt.close()
-
+        if valid.sum() < 10:
+            if verbose:
+                print("  (insufficient valid data for Stage 1 plots)")
+            return
+        
+        true_valid = rssi_true[valid]
+        pred_valid = rssi_pred[valid]
+        residuals = pred_valid - true_valid
+        
+        # Compute metrics
+        mae = float(np.mean(np.abs(residuals)))
+        rmse = float(np.sqrt(np.mean(residuals**2)))
+        bias = float(np.mean(residuals))
+        corr = float(np.corrcoef(true_valid, pred_valid)[0, 1])
+        r2 = corr ** 2
+        
+        # =====================================================================
+        # PLOT 1: Predicted vs True Scatter
+        # =====================================================================
+        fig, ax = plt.subplots(figsize=(7, 6))
+        
+        # Scatter with color
+        ax.scatter(true_valid, pred_valid, s=15, alpha=0.4, c=PLOT_COLORS['blue'],
+                   edgecolors='none', rasterized=True)
+        
+        # Perfect prediction line
+        lo = min(true_valid.min(), pred_valid.min()) - 2
+        hi = max(true_valid.max(), pred_valid.max()) + 2
+        ax.plot([lo, hi], [lo, hi], 'k--', linewidth=1.5, label='y = x', alpha=0.7)
+        
+        # Regression line
+        slope, intercept = np.polyfit(true_valid, pred_valid, 1)
+        x_fit = np.array([lo, hi])
+        ax.plot(x_fit, slope * x_fit + intercept, '-', color=PLOT_COLORS['orange'],
+                linewidth=2, label=f'Fit: y = {slope:.2f}x + {intercept:.1f}')
+        
+        ax.set_xlabel('True RSSI (dBm)')
+        ax.set_ylabel('Predicted RSSI (dBm)')
+        env_title = env.replace('_', ' ').title()
+        ax.set_title(f'Stage 1: RSSI Prediction Quality ({env_title})', fontweight='bold')
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_aspect('equal', adjustable='box')
+        ax.legend(loc='lower right')
+        
+        # Metrics annotation box
+        metrics_text = (f'MAE = {mae:.2f} dB\n'
+                       f'RMSE = {rmse:.2f} dB\n'
+                       f'R² = {r2:.3f}\n'
+                       f'N = {len(true_valid):,}')
+        ax.text(0.03, 0.97, metrics_text, transform=ax.transAxes,
+                verticalalignment='top', fontsize=10,
+                bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                         edgecolor='0.7', alpha=0.95))
+        
+        _save_figure(fig, output_dir, f'stage1_pred_vs_true_{env}')
+        
+        # =====================================================================
+        # PLOT 2: Residual Distribution
+        # =====================================================================
+        fig, ax = plt.subplots(figsize=(7, 5))
+        
+        n_bins = min(50, len(residuals) // 20)
+        n, bins, patches = ax.hist(residuals, bins=n_bins, density=True,
+                                   alpha=0.7, color=PLOT_COLORS['blue'],
+                                   edgecolor='white', linewidth=0.5)
+        
+        # Normal distribution fit
+        mu, std = float(np.mean(residuals)), float(np.std(residuals))
+        x_norm = np.linspace(residuals.min(), residuals.max(), 200)
+        ax.plot(x_norm, stats.norm.pdf(x_norm, mu, std), '-',
+                color=PLOT_COLORS['magenta'], linewidth=2.5,
+                label=f'Normal: μ={mu:.2f}, σ={std:.2f}')
+        
+        # Zero reference line
+        ax.axvline(0, color=PLOT_COLORS['dark'], linestyle='--', linewidth=1.5, alpha=0.7)
+        
+        # Bias indicator
+        if abs(bias) > 0.5:
+            ax.axvline(bias, color=PLOT_COLORS['orange'], linestyle='-', linewidth=2,
+                      label=f'Bias = {bias:+.2f} dB')
+        
+        ax.set_xlabel('Residual (Predicted − True) [dB]')
+        ax.set_ylabel('Density')
+        ax.set_title(f'Stage 1: Residual Distribution ({env_title})', fontweight='bold')
+        ax.legend(loc='upper right')
+        
+        # Stats annotation
+        skewness = float(stats.skew(residuals))
+        stats_text = f'Mean: {mu:+.2f} dB\nStd: {std:.2f} dB\nSkew: {skewness:.2f}'
+        ax.text(0.03, 0.97, stats_text, transform=ax.transAxes,
+                verticalalignment='top', fontsize=10,
+                bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                         edgecolor='0.7', alpha=0.95))
+        
+        _save_figure(fig, output_dir, f'stage1_residual_hist_{env}')
+        
         if verbose:
-            print(f"✓ Stage 1 diagnostics saved: {os.path.basename(out1)}, {os.path.basename(out2)}")
+            print(f"✓ Stage 1 diagnostics: stage1_pred_vs_true_{env}.png, stage1_residual_hist_{env}.png")
     except ImportError:
         if verbose:
             print("  (matplotlib not available, skipping Stage 1 diagnostics)")
@@ -1793,248 +1924,470 @@ def _plot_pathloss_fit(
     label: str = "oracle",
     verbose: bool = True
 ):
-    """Plot RSSI vs log-distance with fitted line + R².
-
-    This makes it visually obvious *why* the ablation works:
-    - When RSSI-distance correlation is preserved (oracle/predicted) the fit is decent.
-    - When broken (shuffled/constant), a fit would be meaningless (see ablation plots).
-
-    Saves:
-      - pathloss_fit_<label>_<env>.png
+    """
+    Publication-quality path-loss fit visualization.
+    
+    Shows RSSI vs log-distance with fitted line, confidence bands, and R².
+    Visually explains why ablation works.
+    
+    Saves: pathloss_fit_<label>_<env>.{png,pdf}
     """
     try:
         import matplotlib.pyplot as plt
-
+        
+        _setup_thesis_style()
         os.makedirs(output_dir, exist_ok=True)
-
-        pos = positions.astype(np.float32)
-        d = np.linalg.norm(pos - theta_true.reshape(1, 2), axis=1)
-        d = np.maximum(d, 1.0)
-        log_d = np.log10(d)
-
+        
+        # Compute distances
+        pos = positions.astype(np.float64)
+        distances = np.linalg.norm(pos - theta_true.reshape(1, 2), axis=1)
+        distances = np.maximum(distances, 1.0)
+        log_d = np.log10(distances)
+        
         valid = np.isfinite(log_d) & np.isfinite(rssi)
-        if valid.sum() < 5:
+        if valid.sum() < 10:
+            if verbose:
+                print("  (insufficient data for path-loss fit)")
             return
-
-        slope, intercept, r_value, _, _ = stats.linregress(log_d[valid], rssi[valid])
-        r2 = float(r_value**2)
-
-        fig, ax = plt.subplots(figsize=(7.5, 6))
-        ax.scatter(log_d[valid], rssi[valid], s=10, alpha=0.35, edgecolors='none')
-        xline = np.linspace(float(log_d[valid].min()), float(log_d[valid].max()), 200)
-        yline = intercept + slope * xline
-        ax.plot(xline, yline, linewidth=2.0)
-
+        
+        log_d_valid = log_d[valid]
+        rssi_valid = rssi[valid]
+        
+        # Linear regression
+        slope, intercept, r_value, _, std_err = stats.linregress(log_d_valid, rssi_valid)
+        r2 = float(r_value ** 2)
         gamma_est = float(-slope / 10.0)
-        ax.set_xlabel("log10(distance to jammer)  [m]")
-        ax.set_ylabel("RSSI (dB)")
-        ax.set_title(f"Path-loss Fit ({label}) — {env}", fontweight='bold')
-        ax.grid(alpha=0.25)
-
-        ax.text(
-            0.02, 0.98,
-            f"R²: {r2:.3f}\nγ̂: {gamma_est:.2f}\nP0̂: {intercept:.1f} dBm",
-            transform=ax.transAxes, va='top', ha='left',
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-            fontsize=10
-        )
-
-        plt.tight_layout()
-        out = os.path.join(output_dir, f"pathloss_fit_{label}_{env}.png")
-        plt.savefig(out, dpi=160, bbox_inches='tight')
-        plt.close()
-
+        P0_est = float(intercept)
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(8, 6))
+        
+        # Scatter plot
+        ax.scatter(log_d_valid, rssi_valid, s=12, alpha=0.4, c=PLOT_COLORS['blue'],
+                   edgecolors='none', rasterized=True, label='Data')
+        
+        # Fit line
+        x_fit = np.linspace(log_d_valid.min(), log_d_valid.max(), 200)
+        y_fit = intercept + slope * x_fit
+        ax.plot(x_fit, y_fit, '-', color=PLOT_COLORS['magenta'], linewidth=2.5,
+                label=f'Fit: RSSI = {P0_est:.1f} − {10*gamma_est:.1f}·log₁₀(d)')
+        
+        # Confidence band (±2σ)
+        residuals = rssi_valid - (intercept + slope * log_d_valid)
+        resid_std = float(np.std(residuals))
+        ax.fill_between(x_fit, y_fit - 2*resid_std, y_fit + 2*resid_std,
+                        alpha=0.15, color=PLOT_COLORS['magenta'], label='±2σ band')
+        
+        ax.set_xlabel('log₁₀(distance to jammer) [m]')
+        ax.set_ylabel('RSSI (dBm)')
+        
+        # Title with R² quality indicator
+        r2_quality = "GOOD" if r2 >= 0.5 else ("MODERATE" if r2 >= 0.3 else "POOR")
+        env_title = env.replace('_', ' ').title()
+        ax.set_title(f'Path-Loss Model Fit ({label.title()}) — {env_title}', fontweight='bold')
+        ax.legend(loc='upper right')
+        
+        # Metrics box with color-coded border
+        metrics_text = (f'R² = {r2:.3f} ({r2_quality})\n'
+                       f'γ̂ = {gamma_est:.2f}\n'
+                       f'P₀̂ = {P0_est:.1f} dBm\n'
+                       f'σ_resid = {resid_std:.1f} dB')
+        
+        border_color = PLOT_COLORS['green'] if r2 >= 0.5 else (
+            PLOT_COLORS['yellow'] if r2 >= 0.3 else PLOT_COLORS['magenta'])
+        ax.text(0.03, 0.03, metrics_text, transform=ax.transAxes,
+                verticalalignment='bottom', fontsize=10,
+                bbox=dict(boxstyle='round,pad=0.4', facecolor='white',
+                         edgecolor=border_color, alpha=0.95, linewidth=2))
+        
+        _save_figure(fig, output_dir, f'pathloss_fit_{label}_{env}')
+        
         if verbose:
-            print(f"✓ Path-loss fit saved: {os.path.basename(out)}")
+            print(f"✓ Path-loss fit: pathloss_fit_{label}_{env}.png (R²={r2:.3f})")
+        
+        return {'r2': r2, 'gamma': gamma_est, 'P0': P0_est}
     except ImportError:
         if verbose:
             print("  (matplotlib not available, skipping path-loss fit)")
 
 
 def _plot_rssi_ablation_detailed(results: Dict, output_dir: str, env: str, verbose: bool = True):
-    """More analytical RSSI ablation plots.
-
-    Adds two complementary views:
-      1) Boxplot-like view (via matplotlib boxplot) to show robustness across trials
-      2) CDF curves of localization error to compare *full distributions*
-
-    Saves:
-      - rssi_ablation_box_<env>.png
-      - rssi_ablation_cdf_<env>.png
+    """
+    Publication-quality RSSI ablation analysis plots.
+    
+    Creates:
+    1. Box plot showing distribution across trials (colored by condition)
+    2. CDF comparison with significance markers
+    3. Bar chart with statistical significance annotations
+    
+    Saves: rssi_ablation_{box,cdf,bar}_<env>.{png,pdf}
     """
     try:
         import matplotlib.pyplot as plt
-
+        from matplotlib.lines import Line2D
+        
+        _setup_thesis_style()
         os.makedirs(output_dir, exist_ok=True)
-
-        # Keep a stable ordering if present
-        preferred = ['oracle', 'predicted', 'noisy_2dB', 'noisy_5dB', 'noisy_10dB', 'shuffled', 'constant']
-        conditions = [c for c in preferred if c in results]
+        
+        # Preferred ordering
+        preferred_order = ['oracle', 'predicted', 'noisy_2dB', 'noisy_5dB', 
+                           'noisy_10dB', 'shuffled', 'constant']
+        conditions = [c for c in preferred_order if c in results]
         if not conditions:
-            conditions = list(results.keys())
-
+            conditions = [k for k in results.keys() if not k.startswith('_')]
+        
+        if len(conditions) < 2:
+            if verbose:
+                print("  (insufficient conditions for RSSI detailed plots)")
+            return
+        
+        env_title = env.replace('_', ' ').title()
+        
+        # =====================================================================
+        # PLOT 1: Box Plot (colored by condition)
+        # =====================================================================
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
         data = [results[c].get('errors', []) for c in conditions]
-
-        # 1) Boxplot of per-trial errors
-        fig, ax = plt.subplots(figsize=(11, 6))
-        bp = ax.boxplot(
-            data,
-            labels=[c.replace('_', '\n') for c in conditions],
-            showfliers=True
-        )
-        ax.set_ylabel("Localization Error (m)")
-        ax.set_title(f"RSSI Ablation: Error Distribution Across Trials ({env})", fontweight='bold')
-        ax.grid(axis='y', alpha=0.25)
-        plt.tight_layout()
-        out1 = os.path.join(output_dir, f"rssi_ablation_box_{env}.png")
-        plt.savefig(out1, dpi=160, bbox_inches='tight')
-        plt.close()
-
-        # 2) CDF curves
-        fig, ax = plt.subplots(figsize=(9.5, 6))
+        colors = [RSSI_COLORS.get(c, PLOT_COLORS['gray']) for c in conditions]
+        
+        bp = ax.boxplot(data, patch_artist=True, showfliers=True,
+                        flierprops={'marker': 'o', 'markersize': 4, 'alpha': 0.5})
+        
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        
+        for median in bp['medians']:
+            median.set_color('black')
+            median.set_linewidth(2)
+        
+        labels = [c.replace('_', '\n').replace('noisy\n', 'Noisy\n') for c in conditions]
+        ax.set_xticklabels(labels)
+        ax.set_ylabel('Localization Error (m)')
+        ax.set_title(f'RSSI Ablation: Error Distribution ({env_title})', fontweight='bold')
+        
+        # Oracle reference line
+        if 'oracle' in results:
+            oracle_mean = results['oracle']['mean']
+            ax.axhline(oracle_mean, color=PLOT_COLORS['green'], linestyle='--', 
+                      linewidth=1.5, alpha=0.7, label=f'Oracle mean: {oracle_mean:.1f}m')
+            ax.legend(loc='upper right')
+        
+        _save_figure(fig, output_dir, f'rssi_ablation_box_{env}')
+        
+        # =====================================================================
+        # PLOT 2: CDF Comparison
+        # =====================================================================
+        fig, ax = plt.subplots(figsize=(9, 6))
+        
         for c in conditions:
-            vals = np.array(results[c].get('errors', []), dtype=float)
-            vals = vals[np.isfinite(vals)]
-            if len(vals) == 0:
+            errors = np.array(results[c].get('errors', []), dtype=float)
+            errors = errors[np.isfinite(errors)]
+            if len(errors) == 0:
                 continue
-            xs = np.sort(vals)
+            
+            xs = np.sort(errors)
             ys = np.arange(1, len(xs) + 1) / len(xs)
-            ax.step(xs, ys, where='post', label=c)
-
-        ax.set_xlabel("Localization Error (m)")
-        ax.set_ylabel("CDF")
-        ax.set_title(f"RSSI Ablation: CDF of Localization Error ({env})", fontweight='bold')
-        ax.grid(alpha=0.25)
-        ax.legend()
-        plt.tight_layout()
-        out2 = os.path.join(output_dir, f"rssi_ablation_cdf_{env}.png")
-        plt.savefig(out2, dpi=160, bbox_inches='tight')
-        plt.close()
-
+            
+            color = RSSI_COLORS.get(c, PLOT_COLORS['gray'])
+            linewidth = 2.5 if c in ['oracle', 'predicted'] else 1.5
+            linestyle = '-' if c in ['oracle', 'predicted'] else '--'
+            
+            ax.step(xs, ys, where='post', label=c.replace('_', ' ').title(),
+                   color=color, linewidth=linewidth, linestyle=linestyle)
+        
+        ax.set_xlabel('Localization Error (m)')
+        ax.set_ylabel('Cumulative Probability')
+        ax.set_title(f'RSSI Ablation: Error CDF ({env_title})', fontweight='bold')
+        ax.legend(loc='lower right', ncol=2)
+        ax.set_xlim(left=0)
+        ax.set_ylim(0, 1.02)
+        
+        # Percentile reference lines
+        ax.axhline(0.5, color='gray', linestyle=':', alpha=0.5)
+        ax.axhline(0.9, color='gray', linestyle=':', alpha=0.5)
+        ax.text(ax.get_xlim()[1] * 0.98, 0.51, '50th %ile', ha='right', fontsize=9, alpha=0.7)
+        ax.text(ax.get_xlim()[1] * 0.98, 0.91, '90th %ile', ha='right', fontsize=9, alpha=0.7)
+        
+        _save_figure(fig, output_dir, f'rssi_ablation_cdf_{env}')
+        
+        # =====================================================================
+        # PLOT 3: Bar Chart with Significance
+        # =====================================================================
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        x = np.arange(len(conditions))
+        means = [results[c]['mean'] for c in conditions]
+        stds = [results[c]['std'] for c in conditions]
+        colors_list = [RSSI_COLORS.get(c, PLOT_COLORS['gray']) for c in conditions]
+        
+        bars = ax.bar(x, means, yerr=stds, capsize=5, color=colors_list,
+                     edgecolor='black', linewidth=0.8, alpha=0.85)
+        
+        # Value labels
+        for i, (bar, mean, std) in enumerate(zip(bars, means, stds)):
+            height = bar.get_height()
+            ax.text(bar.get_x() + bar.get_width()/2, height + std + 0.5,
+                   f'{mean:.1f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        
+        # Significance markers (vs oracle)
+        if 'oracle' in results:
+            oracle_errors = results['oracle']['errors']
+            for i, c in enumerate(conditions):
+                if c == 'oracle':
+                    continue
+                c_errors = results[c].get('errors', [])
+                if len(c_errors) == len(oracle_errors) and len(c_errors) >= 3:
+                    _, p = stats.ttest_rel(oracle_errors, c_errors)
+                    if p < 0.001:
+                        marker = '***'
+                    elif p < 0.01:
+                        marker = '**'
+                    elif p < 0.05:
+                        marker = '*'
+                    else:
+                        marker = 'ns'
+                    
+                    y_pos = means[i] + stds[i] + 2
+                    ax.text(i, y_pos, marker, ha='center', fontsize=10, fontweight='bold')
+        
+        ax.set_xticks(x)
+        ax.set_xticklabels([c.replace('_', '\n') for c in conditions])
+        ax.set_ylabel('Localization Error (m)')
+        ax.set_title(f'RSSI Source Impact on Localization ({env_title})', fontweight='bold')
+        
+        # Legend for significance
+        legend_elements = [
+            Line2D([0], [0], marker='', color='w', label='*** p<0.001'),
+            Line2D([0], [0], marker='', color='w', label='**  p<0.01'),
+            Line2D([0], [0], marker='', color='w', label='*   p<0.05'),
+            Line2D([0], [0], marker='', color='w', label='ns  not sig.'),
+        ]
+        ax.legend(handles=legend_elements, loc='upper left', fontsize=9,
+                 title='vs Oracle', title_fontsize=9)
+        
+        _save_figure(fig, output_dir, f'rssi_ablation_bar_{env}')
+        
         if verbose:
-            print(f"✓ RSSI diagnostic plots saved: {os.path.basename(out1)}, {os.path.basename(out2)}")
+            print(f"✓ RSSI detailed plots: rssi_ablation_{{box,cdf,bar}}_{env}.png")
     except ImportError:
         if verbose:
             print("  (matplotlib not available, skipping RSSI diagnostic plots)")
 
 
 def _plot_model_ablation_detailed(results: Dict, environments: List[str], output_dir: str, verbose: bool = True):
-    """More analytical model-ablation plots.
-
-    Adds:
-      - Per-environment boxplots across trials for each model
-
-    Saves:
-      - model_ablation_box_by_env.png
+    """
+    Publication-quality model architecture ablation plots.
+    
+    Creates:
+    1. Grouped box plots by environment with model coloring
+    2. Best model markers (★)
+    
+    Saves: model_ablation_box_by_env.{png,pdf}
     """
     try:
         import matplotlib.pyplot as plt
-
+        from matplotlib.patches import Patch
+        from matplotlib.lines import Line2D
+        
+        _setup_thesis_style()
         os.makedirs(output_dir, exist_ok=True)
-
+        
         models = [('pure_nn', 'Pure NN'), ('pure_pl', 'Pure PL'), ('apbm', 'APBM')]
         envs = [e for e in environments if e in results and results[e]]
-
+        
         if not envs:
+            if verbose:
+                print("  (no valid environments for model detailed plots)")
             return
-
-        # Build data in grouped layout: for each env, concatenate three boxplots
-        data = []
-        labels = []
+        
+        # Build data structure
+        n_models = len(models)
         positions = []
+        data = []
+        colors = []
+        
         pos = 1
         gap = 1.5
-        width = 0.8
-
+        env_centers = []
+        
         for env in envs:
-            for mk, mn in models:
-                if mk in results[env] and 'errors' in results[env][mk]:
-                    data.append(results[env][mk]['errors'])
+            env_start = pos
+            for model_key, model_name in models:
+                if model_key in results[env] and 'errors' in results[env][model_key]:
+                    data.append(results[env][model_key]['errors'])
                 else:
                     data.append([])
-                labels.append(f"{env}\n{mn}")
                 positions.append(pos)
+                colors.append(MODEL_COLORS.get(model_key, PLOT_COLORS['gray']))
                 pos += 1
+            env_centers.append((env_start + pos - 1) / 2)
             pos += gap
-
-        fig, ax = plt.subplots(figsize=(13, 6.5))
-        ax.boxplot(data, positions=positions, widths=width, showfliers=True)
-
-        ax.set_xticks(positions)
-        ax.set_xticklabels(labels, fontsize=9)
-        ax.set_ylabel("Localization Error (m)")
-        ax.set_title("Model Ablation: Error Distribution Across Trials", fontweight='bold')
-        ax.grid(axis='y', alpha=0.25)
-
-        # Light vertical separators between environments
-        cursor = 1
-        for _ in envs[:-1]:
-            cursor += 3
-            ax.axvline(cursor + 0.5, linestyle='--', alpha=0.25)
-            cursor += gap
-
-        plt.tight_layout()
-        out = os.path.join(output_dir, "model_ablation_box_by_env.png")
-        plt.savefig(out, dpi=160, bbox_inches='tight')
-        plt.close()
-
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(max(10, len(envs) * 3.5), 6))
+        
+        bp = ax.boxplot(data, positions=positions, widths=0.7, patch_artist=True,
+                        showfliers=True, flierprops={'marker': 'o', 'markersize': 3, 'alpha': 0.5})
+        
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.7)
+        
+        for median in bp['medians']:
+            median.set_color('black')
+            median.set_linewidth(2)
+        
+        # Mark best model per environment with star
+        box_idx = 0
+        for j, env in enumerate(envs):
+            env_results = {k: v['mean'] for k, v in results[env].items() 
+                          if not k.startswith('_') and isinstance(v, dict) and 'mean' in v}
+            if env_results:
+                best_model = min(env_results, key=env_results.get)
+                for i, (mk, _) in enumerate(models):
+                    if mk == best_model:
+                        pos_star = positions[box_idx + i]
+                        # Place star below the axis
+                        ax.plot(pos_star, ax.get_ylim()[0] - 1, marker='*', markersize=18, 
+                               color=MODEL_COLORS[mk], clip_on=False, zorder=10)
+            box_idx += n_models
+        
+        # Environment labels
+        ax.set_xticks(env_centers)
+        ax.set_xticklabels([e.replace('_', ' ').title() for e in envs], fontsize=11)
+        ax.set_ylabel('Localization Error (m)')
+        ax.set_title('Model Performance Distribution by Environment', fontweight='bold')
+        
+        # Vertical separators
+        for i in range(len(envs) - 1):
+            sep_pos = positions[(i + 1) * n_models - 1] + gap / 2 + 0.5
+            ax.axvline(sep_pos, color='gray', linestyle='--', alpha=0.3)
+        
+        # Legend
+        legend_elements = [Patch(facecolor=MODEL_COLORS[mk], edgecolor='black', 
+                                label=mn, alpha=0.7) for mk, mn in models]
+        legend_elements.append(Line2D([0], [0], marker='*', color='w', 
+                                      markerfacecolor='gray', markersize=15, label='Best model'))
+        ax.legend(handles=legend_elements, loc='upper right')
+        
+        _save_figure(fig, output_dir, 'model_ablation_box_by_env')
+        
         if verbose:
-            print(f"✓ Model diagnostic plot saved: {os.path.basename(out)}")
+            print(f"✓ Model diagnostic: model_ablation_box_by_env.png")
     except ImportError:
         if verbose:
             print("  (matplotlib not available, skipping model diagnostic plots)")
 
 
 def _plot_model_r2_diagnostics(results: Dict, environments: List[str], output_dir: str, verbose: bool = True):
-    """Plot path-loss fit quality (R²) per environment alongside model errors.
-
-    Saves:
-      - model_r2_vs_error.png
+    """
+    Publication-quality R² vs Error diagnostic plot.
+    
+    Shows relationship between path-loss fit quality and best localization performance.
+    Helps explain when physics-based models win.
+    
+    Saves: model_r2_vs_error.{png,pdf}
     """
     try:
         import matplotlib.pyplot as plt
-
+        from matplotlib.patches import Patch
+        from matplotlib.lines import Line2D
+        
+        _setup_thesis_style()
         os.makedirs(output_dir, exist_ok=True)
-
+        
         envs = [e for e in environments if e in results and results[e]]
         if not envs:
+            if verbose:
+                print("  (no environments for R² diagnostic)")
             return
-
-        r2s = []
-        best_errs = []
-        best_model = []
-
+        
+        # Collect data
+        r2_values = []
+        best_errors = []
+        best_models = []
+        env_labels = []
+        
         for env in envs:
-            r2 = results[env].get('_r2', np.nan)
-            r2s.append(float(r2) if r2 is not None else np.nan)
-
-            env_model_results = {k: v['mean'] for k, v in results[env].items()
-                                 if isinstance(v, dict) and 'mean' in v and not k.startswith('_')}
-            if env_model_results:
-                bm = min(env_model_results, key=env_model_results.get)
-                best_model.append(bm)
-                best_errs.append(float(env_model_results[bm]))
-            else:
-                best_model.append("n/a")
-                best_errs.append(np.nan)
-
-        fig, ax = plt.subplots(figsize=(9.5, 6))
-        ax.scatter(r2s, best_errs, s=80, alpha=0.9)
-        for x, y, env, bm in zip(r2s, best_errs, envs, best_model):
-            ax.text(x, y, f"  {env}\n  ({bm})", va='center', fontsize=9)
-
-        ax.set_xlabel("Path-loss R² (fit quality)")
-        ax.set_ylabel("Best Localization Error (m)")
-        ax.set_title("When Physics Fits Better, Physics-Based Models Tend to Win", fontweight='bold')
-        ax.grid(alpha=0.25)
-
-        plt.tight_layout()
-        out = os.path.join(output_dir, "model_r2_vs_error.png")
-        plt.savefig(out, dpi=160, bbox_inches='tight')
-        plt.close()
-
+            r2 = results[env].get('_r2', None)
+            
+            # Skip if no R² value
+            if r2 is None or (isinstance(r2, float) and not np.isfinite(r2)):
+                if verbose:
+                    print(f"  (no R² value for {env})")
+                continue
+            
+            env_results = {k: v['mean'] for k, v in results[env].items() 
+                          if isinstance(v, dict) and 'mean' in v and not k.startswith('_')}
+            if not env_results:
+                continue
+            
+            best_model = min(env_results, key=env_results.get)
+            
+            r2_values.append(float(r2))
+            best_errors.append(float(env_results[best_model]))
+            best_models.append(best_model)
+            env_labels.append(env)
+        
+        if len(r2_values) < 1:
+            if verbose:
+                print("  (no valid R² data points for diagnostic)")
+            return
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(9, 6))
+        
+        # Add interpretation zones
+        ax.axvspan(0, 0.3, alpha=0.08, color=PLOT_COLORS['magenta'], zorder=0)
+        ax.axvspan(0.3, 0.5, alpha=0.08, color=PLOT_COLORS['yellow'], zorder=0)
+        ax.axvspan(0.5, 1.0, alpha=0.08, color=PLOT_COLORS['green'], zorder=0)
+        
+        # Scatter with model-based colors
+        for r2, err, model, env in zip(r2_values, best_errors, best_models, env_labels):
+            color = MODEL_COLORS.get(model, PLOT_COLORS['gray'])
+            ax.scatter(r2, err, s=180, c=color, edgecolors='black', linewidth=1.5, zorder=3)
+            
+            # Label
+            model_short = {'pure_nn': 'NN', 'pure_pl': 'PL', 'apbm': 'APBM'}.get(model, model)
+            ax.annotate(f'{env.replace("_", " ").title()}\n({model_short})',
+                       (r2, err), textcoords='offset points', xytext=(10, 0),
+                       fontsize=10, va='center')
+        
+        # Trend line only if enough points
+        if len(r2_values) >= 3:
+            z = np.polyfit(r2_values, best_errors, 1)
+            p = np.poly1d(z)
+            x_trend = np.linspace(min(r2_values) - 0.05, max(r2_values) + 0.05, 100)
+            ax.plot(x_trend, p(x_trend), '--', color=PLOT_COLORS['gray'], 
+                   alpha=0.5, linewidth=1.5, zorder=1)
+        
+        ax.set_xlabel('Path-Loss Model R² (Fit Quality)')
+        ax.set_ylabel('Best Localization Error (m)')
+        ax.set_title('Model Selection Depends on Physics Fit Quality', fontweight='bold')
+        
+        # Zone labels at top
+        y_max = max(best_errors) * 1.2 if best_errors else 20
+        ax.text(0.15, y_max * 0.95, 'Poor fit', ha='center', va='top', fontsize=9, alpha=0.6)
+        ax.text(0.40, y_max * 0.95, 'Moderate', ha='center', va='top', fontsize=9, alpha=0.6)
+        ax.text(0.75, y_max * 0.95, 'Good fit', ha='center', va='top', fontsize=9, alpha=0.6)
+        
+        # Legend
+        legend_elements = [
+            Patch(facecolor=MODEL_COLORS['pure_nn'], edgecolor='black', label='Pure NN wins'),
+            Patch(facecolor=MODEL_COLORS['pure_pl'], edgecolor='black', label='Pure PL wins'),
+            Patch(facecolor=MODEL_COLORS['apbm'], edgecolor='black', label='APBM wins'),
+        ]
+        ax.legend(handles=legend_elements, loc='upper left', title='Best Model')
+        
+        ax.set_xlim(0, 1)
+        ax.set_ylim(bottom=0, top=y_max)
+        
+        _save_figure(fig, output_dir, 'model_r2_vs_error')
+        
         if verbose:
-            print(f"✓ R² diagnostic plot saved: {os.path.basename(out)}")
+            print(f"✓ R² diagnostic: model_r2_vs_error.png ({len(r2_values)} environment(s))")
     except ImportError:
         if verbose:
             print("  (matplotlib not available, skipping R² diagnostic plot)")

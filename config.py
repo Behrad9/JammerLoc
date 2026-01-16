@@ -15,6 +15,11 @@ FIXES APPLIED for proper FL performance ranking (SCAFFOLD > FedProx ≈ FedAvg o
 - FL warmup rounds increased for SCAFFOLD control variate buildup
 - Global rounds increased to give SCAFFOLD time to converge
 - Early stopping patience increased
+
+CRITICAL FIX (January 2026):
+- SCAFFOLD was showing MSE↓ but loc_error constant (θ frozen)
+- Root cause: Single LR caused NN to learn faster than θ
+- Fix: Hybrid SCAFFOLD with separate θ optimizer (5x LR, no control variates)
 """
 
 from dataclasses import dataclass, field
@@ -316,8 +321,8 @@ class Config:
     local_epochs: int = 3
     global_rounds: int = 100  # INCREASED from 80
 
-    # FL warmup (physics-only rounds)
-    fl_warmup_rounds: int = 10  # INCREASED from 5 for SCAFFOLD control variate buildup
+    # FL warmup (physics-only rounds) - REDUCED: θ now moves from round 1 with hybrid SCAFFOLD
+    fl_warmup_rounds: int = 5
 
     # FL learning rate
     lr_fl: float = 0.005  # INCREASED from 0.004
@@ -329,8 +334,8 @@ class Config:
     # FedProx settings - FIXED: fair comparison (was artificially hurting FedProx)
     fedprox_mu: float = 0.01  # REDUCED from 0.05 to fair value
 
-    # Theta aggregation - FIXED: geometric_median is more robust for non-IID
-    theta_aggregation: str = "geometric_median"  # CHANGED from "mean"
+    # Theta aggregation 
+    theta_aggregation: str = "mean"  # CHANGED from "geometric_median"
 
     # ==================== FL Early Stopping ====================
     fl_early_stopping_enabled: bool = True
@@ -338,6 +343,12 @@ class Config:
     fl_early_stopping_min_delta: float = 0.05  # 5cm threshold
     fl_divergence_threshold: float = 2.0  # INCREASED from 1.5 - SCAFFOLD can recover
     fl_max_error: float = 100.0
+    
+    # ==================== SCAFFOLD Tuning Parameters ====================
+    # These control the hybrid SCAFFOLD behavior
+    scaffold_theta_lr_mult: float = 2.0   # θ LR = base_lr × this (conservative)
+    scaffold_physics_lr_mult: float = 1.0  # P0/γ LR = base_lr × this (same as base)
+    # Note: local_epochs_multiplier is set in server.py _get_algorithm_config()
 
     # ==================== Device and Reproducibility ====================
     seed: int = 42

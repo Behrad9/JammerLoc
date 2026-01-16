@@ -240,9 +240,9 @@ if __name__ == "__main__":
            radius=50
         )
         
-        print("\n✅ Processing completed successfully!")
+        print("\n Processing completed successfully!")
         
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n Error: {e}")
         import traceback
         traceback.print_exc()
