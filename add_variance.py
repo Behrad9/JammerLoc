@@ -1,19 +1,5 @@
 """
-Local Signal Variance Calculator (FIXED VERSION)
-=================================================
-
-This script calculates local signal variance from GNSS signal quality metrics.
-
-IMPORTANT FIX: Preserves original row order so other columns (like 'jammed') 
-               are not affected by the sorting required for rolling variance.
-
-Local signal variance captures the temporal instability of the signal at each
-receiver location, which is useful for:
-
-1. Detecting signal degradation patterns
-2. Identifying multipath-rich environments
-3. Characterizing jamming effects
-4. Feature engineering for ML-based localization
+Calculate local signal variance for GNSS data and add as a new column.
 """
 
 import pandas as pd
@@ -24,38 +10,7 @@ import matplotlib.pyplot as plt
 def compute_local_signal_variance(df, signal_col='CN0', device_col='device', 
                                   time_col='timestamp', window_size=5, 
                                   min_periods=1):
-    """
-    Calculate local signal variance using a rolling window approach.
-    
-    FIXED: Preserves original row order - only adds 'local_signal_variance' column
-           without changing any other data or row ordering.
-    
-    **Parameters:**
-    ---------------
-    df : pd.DataFrame
-        Input dataframe with GNSS measurements
-        
-    signal_col : str, default='CN0'
-        Column name containing signal quality metric
-        
-    device_col : str, default='device'
-        Column identifying unique receivers/devices
-        
-    time_col : str, default='timestamp'
-        Column with temporal ordering
-        
-    window_size : int, default=5
-        Number of consecutive measurements in rolling window
-        
-    min_periods : int, default=1
-        Minimum number of observations required for valid variance
-    
-    **Returns:**
-    ------------
-    pd.DataFrame
-        Original dataframe with added 'local_signal_variance' column
-        ROW ORDER IS PRESERVED - no other columns are modified
-    """
+   
     
     print(f"Calculating local signal variance from '{signal_col}'...")
     
@@ -71,7 +26,7 @@ def compute_local_signal_variance(df, signal_col='CN0', device_col='device',
     # Check for missing values in signal column
     n_missing = df[signal_col].isna().sum()
     if n_missing > 0:
-        print(f"⚠️  Warning: {n_missing} missing values in '{signal_col}' column")
+        print(f" Warning: {n_missing} missing values in '{signal_col}' column")
     
     # === FIX: Preserve original index ===
     # Store original index to restore order later
@@ -102,7 +57,7 @@ def compute_local_signal_variance(df, signal_col='CN0', device_col='device',
     # Fill NaN values with 0
     n_nan = df_sorted['local_signal_variance'].isna().sum()
     if n_nan > 0:
-        print(f"⚠️  {n_nan} NaN values in variance - filling with 0.0")
+        print(f"  {n_nan} NaN values in variance - filling with 0.0")
         df_sorted['local_signal_variance'] = df_sorted['local_signal_variance'].fillna(0.0)
     
     # === FIX: Restore original order ===
@@ -119,7 +74,7 @@ def compute_local_signal_variance(df, signal_col='CN0', device_col='device',
         if np.array_equal(original_jammed, new_jammed):
             print(f"✓ Verified: 'jammed' column unchanged")
         else:
-            print(f"⚠️  WARNING: 'jammed' column may have been affected!")
+            print(f"  WARNING: 'jammed' column may have been affected!")
     
     # Print statistics
     print(f"\n{'='*60}")
@@ -151,11 +106,11 @@ def analyze_variance_by_group(df, group_col='jammed', signal_col='CN0'):
     """
     
     if 'local_signal_variance' not in df.columns:
-        print("⚠️  Run compute_local_signal_variance() first!")
+        print(" Run compute_local_signal_variance() first!")
         return
     
     if group_col not in df.columns:
-        print(f"⚠️  Column '{group_col}' not found in dataframe")
+        print(f"  Column '{group_col}' not found in dataframe")
         return
     
     print(f"\n{'='*60}")
@@ -180,11 +135,7 @@ def analyze_variance_by_group(df, group_col='jammed', signal_col='CN0'):
 def add_signal_variance_to_csv(input_csv, output_csv, signal_col='CN0', 
                                device_col='device', time_col='timestamp',
                                window_size=5):
-    """
-    Convenience function to add local signal variance to a CSV file.
     
-    PRESERVES original row order and all other columns unchanged.
-    """
     
     print(f"Loading data from: {input_csv}")
     df = pd.read_csv(input_csv)

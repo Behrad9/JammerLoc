@@ -1,22 +1,3 @@
-"""
-Stage 2 Plotting Module for Jammer Localization (Thesis-Quality)
-=================================================================
-
-Publication-ready plots for Stage 2 (Jammer Localization from RSSI).
-
-Key Improvements:
-- LaTeX-compatible typography
-- Colorblind-friendly palette
-- Error ellipses for uncertainty visualization
-- Trajectory gradient coloring
-- Scale bars on spatial plots
-- Multi-format export (PNG + PDF)
-- Better FL algorithm comparison
-- Professional convergence plots
-
-Author: Thesis Research
-"""
-
 import os
 import numpy as np
 import pandas as pd
@@ -43,8 +24,6 @@ except ImportError:
     HAS_SCIPY = False
 
 
-# ============================================================================
-# THESIS STYLE CONFIGURATION
 # ============================================================================
 
 def setup_thesis_style():
@@ -86,7 +65,6 @@ def setup_thesis_style():
     })
 
 
-# Colorblind-friendly palette
 COLORS = {
     'primary': '#4477AA',
     'secondary': '#EE6677',
@@ -98,7 +76,7 @@ COLORS = {
     'light_gray': '#BBBBBB',
 }
 
-# Algorithm-specific colors (consistent across all plots)
+
 ALGO_COLORS = {
     'centralized': '#4477AA',  # Blue
     'fedavg': '#228833',       # Green

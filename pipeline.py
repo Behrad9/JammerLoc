@@ -1,13 +1,6 @@
 """
 Unified Jammer Localization Pipeline
 =====================================
-
-End-to-end pipeline combining:
-- Stage 1: RSSI Estimation from AGC/CN0 observables
-- Stage 2: Jammer Localization from estimated RSSI
-
-MODIFIED: Added device-based FL partitioning support
-FIXED: Physics-aware log-distance enforcement plumbing + parsing/indent issues
 """
 
 import os
@@ -15,6 +8,7 @@ import json
 import tempfile
 import numpy as np
 import pandas as pd
+import torch
 from typing import Dict, Any, Optional, Tuple, List
 
 # Stage 1 plotting module
@@ -23,7 +17,7 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
     def generate_stage1_plots(*args, **kwargs):
-        print("⚠ stage1_plots module not available, skipping plots")
+        print("stage1_plots module not available, skipping plots")
         return {}
 
 # Stage 2 plotting module
@@ -33,7 +27,7 @@ try:
 except ImportError:
     HAS_STAGE2_PLOTS = False
     def generate_stage2_plots(*args, **kwargs):
-        print("⚠ stage2_plots module not available, skipping plots")
+        print("stage2_plots module not available, skipping plots")
         return {}
 
 from config import (
@@ -59,17 +53,10 @@ def get_rssi_config_for_environment(env: str):
     # Use the proper factory function from config.py
     cfg = create_rssi_config_for_environment(env)
     
-    # FIXED: Disable physics-aware loss - not needed with SimpleLinearRSSI
-    # The overfitting was caused by DistanceAwareHybrid, not by missing physics loss
+
     cfg.use_distance_aware_loss = False
     cfg.validate_distance_every = 0
 
-    # Note: The following tuning is NOT USED anymore since SimpleLinearRSSI
-    # doesn't have these parameters. Kept for reference.
-    # if env == 'open_sky':
-    #     cfg.distance_corr_weight = 0.5
-    #     cfg.distance_corr_target = -0.3
-    # ...
 
     return cfg
 
@@ -133,14 +120,7 @@ def run_stage1_rssi_estimation(
     verbose: bool = True,
     generate_plots: bool = True
 ) -> Dict[str, Any]:
-    """
-    Run Stage 1: RSSI Estimation.
-
-    Estimates jammer RSSI from smartphone observables (AGC, C/N0).
-
-    NOTE: Physics-aware distance loss is controlled inside RSSIConfig and rssi_trainer.
-    It requires lat/lon in the CSV + jammer_lat/jammer_lon set in config.
-    """
+    
     from rssi_trainer import train_rssi_pipeline, run_rssi_inference
     from rssi_trainer import load_rssi_data, build_category_indices
 
@@ -301,9 +281,6 @@ def run_stage2_localization(
 
     print_environment_info(config, verbose)
 
-    # --- FIXED: Always use data centroid as ENU reference (neutral frame) ---
-    # This prevents "jammer-at-origin" oracle leakage.
-    # Previously defaulted to "jammer" mode which centered coordinates on jammer location.
     _df_ref = pd.read_csv(input_csv)
 
     # Filter by environment if configured
@@ -363,9 +340,7 @@ def run_stage2_localization(
     train_loader, val_loader, test_loader, dataset_full = create_dataloaders(df, config, verbose)
     train_dataset = train_loader.dataset
 
-    # FIXED: Initialize theta from DataFrame ENU positions directly
-    # Previously: sliced feature tensors which is fragile and may not be actual positions
-    # Now: use x_enu, y_enu columns from the DataFrame which are guaranteed to be positions
+  
     if 'x_enu' in df.columns and 'y_enu' in df.columns:
         # Get positions from training subset
         train_indices = train_dataset.indices if hasattr(train_dataset, 'indices') else range(len(train_dataset))
@@ -382,17 +357,14 @@ def run_stage2_localization(
             train_df['y_enu'].mean()
         ], dtype=np.float32)
     else:
-        # Fallback: use feature tensor (first 2 elements assumed to be x, y)
-        # This is less reliable but maintains backward compatibility
+        
         all_positions = np.array([train_dataset[i][0][:2].numpy() for i in range(len(train_dataset))])
         data_centroid = all_positions.mean(axis=0).astype(np.float32)
     
     theta_init = data_centroid
 
     # True jammer position in ENU (NEUTRAL FRAME)
-    # FIXED: We now use data centroid as ENU origin (set above), NOT jammer location.
-    # This means true_theta is the jammer's position relative to the data centroid.
-    # Previously, the code assumed jammer was at (0,0) which was oracle leakage.
+    
     
     jammer_lat = getattr(config, 'jammer_lat', None)
     jammer_lon = getattr(config, 'jammer_lon', None)
@@ -420,10 +392,11 @@ def run_stage2_localization(
 
     results = {'centralized': None, 'federated': {}, 'df': df}
 
-    # Centralized training - pass theta_true for localization tracking
+    # Centralized training (oracle-free: uses val_loss for model selection)
+    # theta_true is passed for REPORTING ONLY (loc_error tracking)
     model, history = train_centralized(
         train_loader, val_loader, test_loader,
-        theta_true=true_theta,  # Pass true jammer position
+        theta_true=true_theta,  # For reporting only, not used for model selection
         theta_init=theta_init,
         config=config,
         verbose=verbose
@@ -487,14 +460,18 @@ def run_stage2_localization(
 
         device_labels = None
         if config.partition_strategy == "device":
-            if hasattr(dataset_full, 'device_labels') and dataset_full.device_labels is not None:
+            # FIXED: Check for 'device_idx' attribute (not 'device_labels')
+            if hasattr(dataset_full, 'device_idx') and dataset_full.device_idx is not None:
                 device_labels = get_device_labels_from_subset(train_dataset)
-                if device_labels is not None and verbose:
+                if device_labels is not None and len(np.unique(device_labels)) > 1:
                     n_devices = len(np.unique(device_labels))
-                    print(f"  Using device-based partitioning ({n_devices} devices)")
+                    if verbose:
+                        print(f"  Using device-based partitioning ({n_devices} devices)")
+                else:
+                    device_labels = None  # Reset if all zeros or single device
 
             if device_labels is None:
-                print("  WARNING: No device column found. Falling back to geographic partitioning.")
+                print("  WARNING: No device_idx found in dataset. Falling back to geographic partitioning.")
                 config.partition_strategy = "geographic"
 
         client_datasets = partition_for_clients(
@@ -523,10 +500,22 @@ def run_stage2_localization(
                 layer_wid=config.hidden_layers,
                 nonlinearity=config.nonlinearity,
                 gamma=config.gamma_init,
-                theta0=theta_init
+                theta0=theta_init,
+                P0_init=getattr(config, 'P0_init', None),
             )
             patch_model(global_model)
 
+            # Initialize fusion logits so w_PL / w_NN = physics_bias (via log-ratio)
+            try:
+                physics_bias = float(getattr(config, 'physics_bias', 1.0) or 1.0)
+            except Exception:
+                physics_bias = 1.0
+            if hasattr(global_model, 'w') and physics_bias > 0:
+                with torch.no_grad():
+                    global_model.w.data = torch.tensor([float(np.log(physics_bias)), 0.0], dtype=torch.float32)
+
+            # NOTE: theta_true is passed for REPORTING ONLY (loc_error tracking).
+            # Model selection uses val_loss exclusively (oracle-free).
             server = Server(
                 global_model=global_model,
                 client_manager=client_manager,
@@ -534,7 +523,7 @@ def run_stage2_localization(
                 test_loader=test_loader,
                 config=config,
                 device=device,
-                theta_true=true_theta  # Pass true jammer position
+                theta_true=true_theta  # For reporting only, not used for model selection
             )
 
             fl_result = server.train(
@@ -577,9 +566,14 @@ def run_stage2_localization(
 
 
 def print_results_table(centralized: Dict, federated: Dict):
-    """Print formatted results table"""
+    """
+    Print formatted results table.
+    
+    NOTE: Loc Error reported is the error at the model selected by BEST VAL_LOSS.
+    Model selection is oracle-free (does not use loc_error for selection).
+    """
     print("\n" + "="*70)
-    print("RESULTS COMPARISON")
+    print("RESULTS COMPARISON (model selected by val_loss, oracle-free)")
     print("="*70)
     print(f"{'Method':<15} {'Loc Error [m]':>15} {'Test MSE':>15} {'Position (ENU)':<20}")
     print("-"*70)
@@ -611,12 +605,7 @@ def augment_stage2_dataset(
     config: Config = None,
     verbose: bool = True
 ) -> str:
-    """
-    Augment Stage 2 dataset with synthetic spatial samples.
     
-    Note: Synthetic samples are generated around the ENU origin (data centroid),
-    NOT around the jammer location (which is unknown to the model).
-    """
     if config is None:
         config = cfg
 
@@ -699,8 +688,7 @@ def augment_stage2_dataset(
     rssi_synth = P0 - 10 * gamma * np.log10(distances) + shadowing
     rssi_synth = np.clip(rssi_synth, rssi_min - 5, rssi_max + 5)
 
-    # FIXED: Renamed to 'distance_to_origin' since this is distance from ENU origin
-    # (data centroid), NOT distance to the actual jammer (which is unknown to model)
+  
     df_synth = pd.DataFrame({
         'lat': lat_synth,
         'lon': lon_synth,
@@ -935,7 +923,7 @@ def run_all_environments(
             )
             all_results[env] = result
         except Exception as e:
-            print(f"\n❌ Error processing {env}: {e}")
+            print(f"\n Error processing {env}: {e}")
             all_results[env] = {'error': str(e)}
 
     # summary

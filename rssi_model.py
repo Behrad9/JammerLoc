@@ -1,24 +1,7 @@
 """
-RSSI Model (Stage 1) - Original ExactHybrid from Approved Thesis
+RSSI Model (Stage 1) - Original ExactHybrid 
 ================================================================
-
 Physics-informed hybrid model for jammer RSSI estimation.
-
-Model Architecture (from thesis document):
-- CN0 channel: J_CN0 = θ_{d,b} + s * φ(ΔCN0) where φ = log10(expm1(c*ΔCN0))
-- AGC channel: J_AGC = α_{d,b} * ΔAGC + β_{d,b}  
-- Fusion gate: w = σ(a_b + b_b*ΔCN0 + c_b*ΔAGC)
-- Final: J = w * J_CN0 + (1-w) * J_AGC
-
-References:
-- Thesis document: "Jammer-Aware RSSI Estimation"
-- Original notebook: RSSIESTIMATION.ipynb
-
-FIXES APPLIED:
-- Renamed gate parameter 'c' to 'g_c' to avoid shadowing physics constant
-- Removed duplicate detection functions (consolidated in rssi_trainer.py)
-- Added numerical guards to inv_softplus calls in initialize_from_data
-- Documented unused rssi_mean/rssi_std (kept for API compatibility)
 """
 
 import math
@@ -161,21 +144,7 @@ class ExactHybrid(nn.Module):
         return torch.nn.functional.softplus(t) + 1e-3
 
     def forward(self, x_num, x_cat, y=None):
-        """
-        Forward pass.
         
-        Args:
-            x_num: [B, 2] tensor with [Delta_AGC, Delta_CN0]
-            x_cat: [B, 2] tensor with [device_idx, band_idx]
-            y: Optional [B, 1] tensor with true RSSI
-            
-        Returns:
-            y_pred: Predicted RSSI
-            loss: Huber loss if y provided
-            J_cn0: CN0 channel prediction
-            J_agc: AGC channel prediction
-            w: Gate weight
-        """
         d_agc, d_cn0 = x_num[:, 0:1], x_num[:, 1:2]
         dev_idx, band_idx = x_cat[:, 0], x_cat[:, 1]
         pair_idx = self._pair_index(dev_idx, band_idx)
@@ -210,12 +179,7 @@ class ExactHybrid(nn.Module):
 # ============================================================
 
 class DistanceAwareHybrid(ExactHybrid):
-    """
-    Backward-compatible wrapper around ExactHybrid.
     
-    The distance-aware features were found to cause overfitting.
-    This class uses ExactHybrid internally for stability.
-    """
     
     def __init__(self, n_devices: int, n_bands: int, P0_init: float = -40.0,
                  gamma_init: float = 2.5, rssi_mean: float = -85.0, rssi_std: float = 15.0):
@@ -231,12 +195,7 @@ class DistanceAwareHybrid(ExactHybrid):
 
 def monotonic_penalty(model: ExactHybrid, x_num: torch.Tensor, x_cat: torch.Tensor, 
                      w_mono: float, eps: float = MONO_EPS) -> torch.Tensor:
-    """
-    Compute monotonic penalty to enforce physics constraints.
     
-    Physics requirement: ∂J/∂ΔAGC ≥ 0 and ∂J/∂ΔCN0 ≥ 0
-    (More interference should not decrease estimated power)
-    """
     if w_mono <= 0.0:
         return torch.tensor(0.0, device=x_num.device)
 
@@ -264,17 +223,7 @@ def monotonic_penalty(model: ExactHybrid, x_num: torch.Tensor, x_cat: torch.Tens
 # ============================================================
 
 def build_features(df_part: pd.DataFrame, require_y: bool = True) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
-    """Extract features for model training or inference.
-
-    Args:
-        df_part: DataFrame containing at least Delta_AGC, Delta_CN0, device_idx, band_idx.
-        require_y: If True, requires an RSSI column and returns y. If False, returns y=None when missing.
-
-    Returns:
-        X_num: float32 array [N,2] with [Delta_AGC, Delta_CN0]
-        X_cat: int64 array [N,2] with [device_idx, band_idx]
-        y: float32 array [N] if available/required, else None
-    """
+    
     X_num = df_part[["Delta_AGC", "Delta_CN0"]].values.astype(np.float32)
     X_cat = df_part[["device_idx", "band_idx"]].values.astype(np.int64)
     if "RSSI" in df_part.columns:
@@ -304,18 +253,7 @@ def predict_rssi(model: ExactHybrid, X_num: np.ndarray, X_cat: np.ndarray,
 
 
 def inv_softplus(y: float, min_output: float = -20.0) -> float:
-    """
-    Inverse of softplus for initialization.
-    
-    FIXED: Added numerical guard to prevent extreme negative values.
-    
-    Args:
-        y: Target positive value (output of softplus)
-        min_output: Minimum return value to prevent numerical issues
-        
-    Returns:
-        x such that softplus(x) ≈ y
-    """
+   
     # Guard against very small or negative inputs
     y_safe = max(y, 1e-6)
     result = math.log(max(math.expm1(y_safe), 1e-8))
@@ -323,15 +261,7 @@ def inv_softplus(y: float, min_output: float = -20.0) -> float:
 
 
 def initialize_from_data(model: ExactHybrid, df_tr: pd.DataFrame, n_bands: int):
-    """
-    Data-driven initialization of model parameters.
     
-    - θ_{d,b} ← median(RSSI) for the pair
-    - α_{d,b}, β_{d,b} ← least-squares fit on weak-jam samples
-    
-    FIXED: Added numerical guards to inv_softplus calls to prevent
-    extreme values when a_hat is very small.
-    """
     band_fallback = {}
     y_global = float(np.median(df_tr["RSSI"])) if len(df_tr) > 0 else -110.0
     
@@ -401,11 +331,7 @@ def initialize_from_data(model: ExactHybrid, df_tr: pd.DataFrame, n_bands: int):
 
 def compute_baseline_map(df: pd.DataFrame, train_idx: np.ndarray, top_q: float = 0.8,
                         elev_bins: List[float] = None) -> Dict[Tuple, Tuple[float, float]]:
-    """
-    Compute AGC/CN0 baselines per (device, band) using train data only.
     
-    Uses top-quantile CN0 selection to identify clean (unjammed) samples.
-    """
     if elev_bins is None:
         elev_bins = [0, 15, 45, 90]
     

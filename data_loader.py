@@ -1,18 +1,6 @@
 """
 Data Loader Module for Jammer Localization
 =========================================
-
-Handles:
-- CSV data loading and validation
-- Coordinate conversion (lat/lon to ENU)
-- Feature engineering
-- Dataset creation
-- Client partitioning for federated learning
-
-Key design choice (IMPORTANT):
-- This loader uses a *neutral* ENU frame by default (origin is lat0/lon0, typically the median receiver position).
-- It does NOT re-center coordinates to the true jammer location.
-  (We still compute distance-to-jammer in ENU if jammer_lat/jammer_lon are provided, to support distance partitioning.)
 """
 
 from __future__ import annotations
@@ -35,20 +23,7 @@ def latlon_to_enu(
     lon0_rad: float,
     R: float | None = None
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Convert latitude/longitude to East-North-Up (ENU) coordinates.
-
-    Args:
-        lat_deg: Latitude in degrees
-        lon_deg: Longitude in degrees
-        lat0_rad: Reference latitude in radians
-        lon0_rad: Reference longitude in radians
-        R: Earth radius in meters
-
-    Returns:
-        x_enu: East coordinate (meters)
-        y_enu: North coordinate (meters)
-    """
+   
     if R is None:
         R = cfg.R_earth
 
@@ -70,20 +45,7 @@ def enu_to_latlon(
     lon0_rad: float,
     R: float | None = None
 ) -> Tuple[float, float]:
-    """
-    Convert ENU coordinates back to latitude/longitude.
-
-    Args:
-        x: East coordinate (meters)
-        y: North coordinate (meters)
-        lat0_rad: Reference latitude in radians
-        lon0_rad: Reference longitude in radians
-        R: Earth radius in meters
-
-    Returns:
-        lat_deg: Latitude in degrees
-        lon_deg: Longitude in degrees
-    """
+   
     if R is None:
         R = cfg.R_earth
 
@@ -96,17 +58,7 @@ def enu_to_latlon(
 # ==================== Dataset Class ====================
 
 class JammerDataset(Dataset):
-    """
-    PyTorch Dataset for jammer localization.
-
-    Features: [x_enu, y_enu, building_density, local_signal_variance]
-    Target: J_hat (estimated RSSI from Stage 1)
-
-    Optional:
-      - device_idx: for device-based FL partitioning
-      - dist_to_jammer: for distance-based FL partitioning (near→far)
-    """
-
+    
     def __init__(
         self,
         x_enu: np.ndarray,
@@ -200,14 +152,7 @@ def load_data(
     config: Config | None = None,
     verbose: bool = True
 ) -> Tuple[pd.DataFrame, float, float]:
-    """
-    Load and prepare data from CSV file.
-
-    Returns:
-        df: Prepared DataFrame with ENU coordinates (neutral frame)
-        lat0_rad: Reference latitude in radians
-        lon0_rad: Reference longitude in radians
-    """
+   
     if config is None:
         config = cfg
     if csv_path is None:
@@ -470,17 +415,7 @@ def partition_for_clients(
     strategy: str = "geographic",
     device_labels: np.ndarray | None = None
 ) -> List[Subset]:
-    """
-    Partition dataset into client subsets for federated learning.
-
-    Strategies:
-      - random: IID random split
-      - balanced: equal sizes, random
-      - geographic: by angle sector in ENU
-      - signal_strength: by target RSSI value
-      - device: by device label
-      - distance: by distance-to-jammer quantiles (near→far)  [requires dist_to_jammer]
-    """
+   
     N = len(dataset)
     indices = np.arange(N)
 

@@ -1,26 +1,7 @@
 #!/usr/bin/env python3
 """
-Trainer Module for Physics-Informed Jammer Localization (Enhanced)
+Trainer Module for Jammer Localization
 ==================================================================
-TRAINER.PY - UPDATED VERSION
-
-Changes applied:
-1. Replaced MSELoss with PeakWeightedHuberLoss (Robust to multipath outliers).
-2. Added L-BFGS Phase (Fine-tuning for sub-meter accuracy).
-3. Updated Federated Client training to use HuberLoss.
-4. IMPROVED: Centralized training optimized to outperform FL methods.
-5. FIXED: Removed oracle theta_true defaults - now requires explicit value.
-6. ADDED: w_PL regularization option to prevent NN dominance.
-
-Input: [x_enu, y_enu, building_density, signal_variance]
-Output: Predicted RSSI
-
-METHODOLOGY NOTES:
-==================
-- Localization uses NEUTRAL reference frame (origin = receiver centroid)
-- theta_true must be provided explicitly (no default to (0,0))
-- Localization error = ||theta_hat - theta_true||
-- This prevents oracle bias from jammer-centered coordinates
 """
 
 import os
@@ -67,14 +48,7 @@ def _compute_theta_true_from_config(config, lat0_rad: float, lon0_rad: float):
 # ============================================================================
 
 class PeakWeightedHuberLoss(nn.Module):
-    """
-    Computes a weighted Huber Loss to handle urban multipath.
-    
-    Logic:
-    1. Huber Loss: Reduces the penalty for massive outliers (multipath spikes).
-    2. Peak Weighting: Assigns higher importance to STRONG signals (likely LOS).
-       w_i = ((y_i - min) / (max - min))^2
-    """
+   
     def __init__(self, delta=1.5):
         super().__init__()
         self.delta = delta
@@ -103,16 +77,7 @@ class PeakWeightedHuberLoss(nn.Module):
 
 
 class PhysicsWeightRegularizedLoss(nn.Module):
-    """
-    Loss function with optional regularization to keep physics weight meaningful.
-    
-    This prevents the NN branch from completely dominating, which would make
-    theta unidentifiable (reviewer concern A.3).
-    
-    Loss = base_loss + lambda_pl * (1 - w_PL)^2
-    
-    where w_PL is the softmax weight for the physics branch.
-    """
+   
     def __init__(self, base_loss, lambda_pl=0.01):
         super().__init__()
         self.base_loss = base_loss
@@ -132,27 +97,41 @@ class PhysicsWeightRegularizedLoss(nn.Module):
         return loss
 
 
+def _physics_param_regularization(model: nn.Module, config: Config) -> torch.Tensor:
+  
+    device = next(model.parameters()).device
+    reg = torch.zeros((), device=device)
+
+    # L2 on theta (keeps theta from drifting wildly in ill-conditioned splits)
+    theta_l2 = float(getattr(config, 'theta_l2_reg', 0.0) or 0.0)
+    if theta_l2 > 0 and hasattr(model, 'theta'):
+        reg = reg + theta_l2 * torch.sum(model.theta ** 2)
+
+    # gamma prior
+    gamma_reg = float(getattr(config, 'gamma_reg', 0.0) or 0.0)
+    if gamma_reg > 0 and hasattr(model, 'gamma'):
+        tgt = getattr(config, 'gamma_reg_target', None)
+        if tgt is None:
+            tgt = getattr(config, 'gamma_init', float(model.gamma.detach().cpu().item()))
+        reg = reg + gamma_reg * (model.gamma - float(tgt)) ** 2
+
+    # P0 prior
+    P0_reg = float(getattr(config, 'P0_reg', 0.0) or 0.0)
+    if P0_reg > 0 and hasattr(model, 'P0'):
+        tgt = getattr(config, 'P0_reg_target', None)
+        if tgt is None:
+            tgt = getattr(config, 'P0_init', float(model.P0.detach().cpu().item()))
+        reg = reg + P0_reg * (model.P0 - float(tgt)) ** 2
+
+    return reg
+
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
 def compute_localization_error(theta, theta_true):
-    """
-    Compute localization error (distance from estimated to true jammer position).
-    
-    UPDATED: theta_true is now REQUIRED (no default to origin).
-    This prevents oracle bias from implicit assumptions.
-    
-    Args:
-        theta: Estimated jammer position [x, y]
-        theta_true: True jammer position [x, y] (REQUIRED)
-    
-    Returns:
-        float: Euclidean distance ||theta - theta_true|| in meters
-    
-    Raises:
-        ValueError: If theta_true is None
-    """
+
     if theta_true is None:
         raise ValueError(
             "theta_true is required for localization error computation. "
@@ -170,52 +149,49 @@ def compute_localization_error(theta, theta_true):
 
 
 def create_model(config, theta_init=None):
-    """Create Net_augmented model."""
+  
     from model import Net_augmented
-    
-    input_dim = getattr(config, 'input_dim', 4) # Default to 4 (Smart Inputs)
+
+    input_dim = getattr(config, 'input_dim', 4)  # Default to 4 (Smart Inputs)
     hidden_layers = getattr(config, 'hidden_layers', [512, 256, 128, 64, 1])
     nonlinearity = getattr(config, 'nonlinearity', 'leaky_relu')
     gamma_init = getattr(config, 'gamma_init', 2.5)
-    
+    P0_init = getattr(config, 'P0_init', None)
+
     if theta_init is not None:
         if isinstance(theta_init, torch.Tensor):
             theta_init = theta_init.tolist()
         elif isinstance(theta_init, np.ndarray):
             theta_init = theta_init.tolist()
-    
+
     model = Net_augmented(
         input_dim=input_dim,
         layer_wid=hidden_layers,
         nonlinearity=nonlinearity,
         gamma=gamma_init,
-        theta0=theta_init
+        theta0=theta_init,
+        P0_init=P0_init,
     )
-    
-    physics_bias = getattr(config, 'physics_bias', 2.0)
-    if physics_bias != 1.0:
+
+    # Initialize fusion logits from desired ratio (physics_bias = w_PL / w_NN)
+    physics_bias = getattr(config, 'physics_bias', 1.0)
+    try:
+        physics_bias = float(physics_bias)
+    except Exception:
+        physics_bias = 1.0
+
+    if physics_bias is not None and physics_bias > 0:
         with torch.no_grad():
-            model.w.data = torch.tensor([physics_bias, 0.2], dtype=torch.float32)
-    
+            model.w.data = torch.tensor([
+                float(np.log(physics_bias)),
+                0.0
+            ], dtype=torch.float32)
+
     return model
 
 
 def evaluate(model, test_loader, device='cpu', theta_true=None):
-    """
-    Evaluate model and return localization error.
-    
-    UPDATED: theta_true is now REQUIRED.
-    
-    Args:
-        model: The trained model
-        test_loader: DataLoader for evaluation
-        device: Compute device
-        theta_true: True jammer position (REQUIRED)
-    
-    Returns:
-        loc_error: Localization error in meters (or inf if theta_true is None)
-        rssi_mse: Mean squared error of RSSI prediction
-    """
+   
     model.eval()
     
     # Compute localization error
@@ -260,37 +236,7 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
                       input_dim=None, physics_params=None,
                       true_jammer_pos=None,  # Backward compatibility alias
                       **kwargs):
-    """
-    Train centralized model with Robust Loss and L-BFGS refinement.
-    
-    OPTIMIZED: Centralized training now significantly outperforms FL by:
-    1. Using ALL data at once (no client drift)
-    2. More epochs with proper learning rate scheduling
-    3. Two-phase optimization: Adam warmup + L-BFGS fine-tuning
-    4. Early stopping with best model restoration
-    
-    UPDATED: theta_true handling
-    - No longer defaults to (0,0)
-    - Must be provided for localization error computation
-    - Prevents oracle bias from implicit assumptions
-    
-    Args:
-        train_loader: Training DataLoader
-        val_loader: Validation DataLoader  
-        test_loader: Test DataLoader
-        theta_true: True jammer position in ENU frame (REQUIRED for localization)
-        theta_init: Initial theta estimate (defaults to data centroid)
-        config: Configuration object
-        verbose: Print progress
-        data_path: Path to CSV (alternative to providing loaders)
-        model: Pre-created model (optional)
-        epochs: Number of training epochs
-        true_jammer_pos: Alias for theta_true (backward compatibility)
-    
-    Returns:
-        model: Trained model
-        history: Training history dict
-    """
+   
     # Handle backward compatibility alias
     if theta_true is None and true_jammer_pos is not None:
         theta_true = true_jammer_pos
@@ -318,7 +264,7 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
     # Warn if theta_true is not provided
     if theta_true is None:
         print("="*60)
-        print("⚠️  WARNING: theta_true not provided")
+        print("  WARNING: theta_true not provided")
         print("="*60)
         print("Localization error will be reported as 'inf'.")
         print("To compute localization error, provide theta_true or set")
@@ -362,6 +308,84 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
     base_criterion = PeakWeightedHuberLoss(delta=1.5)
     lambda_pl = getattr(config, 'lambda_physics_weight', 0.01)  # Regularization strength
     criterion = PhysicsWeightRegularizedLoss(base_criterion, lambda_pl=lambda_pl)
+
+    # =========================================================================
+    # PHASE 0: Physics-only warmup (NEW)
+    # =========================================================================
+    warmup_epochs = int(getattr(config, 'warmup_epochs', 0) or 0)
+    if warmup_epochs > 0:
+        if verbose:
+            print(f"\n  Phase 0: Physics-only warmup ({warmup_epochs} epochs)...")
+
+        # Temporarily force physics dominance during warmup (true physics-only behavior)
+        base_bias = float(getattr(config, 'physics_bias', 1.0) or 1.0)
+        warmup_bias = max(base_bias, 50.0)  # ~99% physics weight
+        with torch.no_grad():
+            if warmup_bias > 0:
+                model.w.data = torch.tensor([float(np.log(warmup_bias)), 0.0], dtype=torch.float32, device=model.w.device)
+
+        # Freeze NN + fusion weights (train only theta, P0, gamma)
+        physics_names = {'theta', 'P0', 'gamma'}
+        prev_requires_grad = {}
+        for name, p in model.named_parameters():
+            if name not in physics_names:
+                prev_requires_grad[name] = p.requires_grad
+                p.requires_grad_(False)
+
+        # Warmup optimizer (physics params only)
+        lr_theta_w = float(getattr(config, 'lr_theta_warmup', lr_theta) or lr_theta)
+        lr_P0_w = float(getattr(config, 'lr_P0_warmup', lr_P0) or lr_P0)
+        lr_gamma_w = float(getattr(config, 'lr_gamma_warmup', lr_gamma) or lr_gamma)
+
+        warmup_optimizer = optim.Adam([
+            {'params': [model.theta], 'lr': lr_theta_w, 'weight_decay': 0},
+            {'params': [model.P0], 'lr': lr_P0_w, 'weight_decay': 0},
+            {'params': [model.gamma], 'lr': lr_gamma_w, 'weight_decay': 0},
+        ])
+
+        warmup_clip = float(getattr(config, 'gradient_clip', 1.0) or 1.0)
+
+        for we in range(warmup_epochs):
+            model.train()
+            w_train_loss = 0.0
+            w_batches = 0
+
+            for batch in train_loader:
+                x, y = batch[0].to(device), batch[1].to(device)
+
+                warmup_optimizer.zero_grad()
+                pred = model(x)
+
+                if pred.shape != y.shape:
+                    if len(y.shape) == 1:
+                        y = y.unsqueeze(1)
+                    min_dim = min(pred.shape[1], y.shape[1])
+                    pred = pred[:, :min_dim]
+                    y = y[:, :min_dim]
+
+                loss = criterion(pred, y, model=model) + _physics_param_regularization(model, config)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_([model.theta, model.P0, model.gamma], max_norm=warmup_clip)
+                warmup_optimizer.step()
+
+                w_train_loss += float(loss.item())
+                w_batches += 1
+
+            if verbose and ((we + 1) % 10 == 0 or (we + 1) == warmup_epochs):
+                model.eval()
+                _, vloss = evaluate(model, val_loader, device, theta_true)
+                th = model.get_theta().detach().cpu().numpy()
+                print(f"    Warmup {we+1}/{warmup_epochs}: train_loss={w_train_loss/max(w_batches,1):.4f}, val_mse={vloss:.4f}, θ=({th[0]:.1f}, {th[1]:.1f})")
+
+        # Restore baseline physics bias and unfreeze
+        with torch.no_grad():
+            if base_bias > 0:
+                model.w.data = torch.tensor([float(np.log(base_bias)), 0.0], dtype=torch.float32, device=model.w.device)
+
+        for name, p in model.named_parameters():
+            if name in prev_requires_grad:
+                p.requires_grad_(prev_requires_grad[name])
+
     
     # History tracking
     history = {
@@ -407,11 +431,11 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
                 y = y[:, :min_dim]
             
             # Use regularized loss
-            loss = criterion(pred, y, model=model)
+            loss = criterion(pred, y, model=model) + _physics_param_regularization(model, config)
             loss.backward()
             
             # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(config, 'gradient_clip', 1.0))
             
             optimizer.step()
             
@@ -437,13 +461,11 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
         history['gamma'].append(float(model.gamma.item()))
         history['P0'].append(float(model.P0.item()))
         
-        # Best model tracking (by localization error if available, else val_loss)
-        track_metric = loc_error if theta_true is not None else val_loss
-        best_metric = best_loc_error if theta_true is not None else best_val_loss
-        
-        if track_metric < best_metric - min_improvement:
-            best_loc_error = loc_error
+        # Best model tracking (by val_loss ONLY - oracle-free, same as FL)
+        # NOTE: loc_error is tracked for reporting but NOT used for model selection
+        if val_loss < best_val_loss - min_improvement:
             best_val_loss = val_loss
+            best_loc_error = loc_error  # Record loc_error at best val_loss
             best_state = copy.deepcopy(model.state_dict())
             patience_counter = 0
         else:
@@ -504,7 +526,7 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
                 y_adj = all_y[:, :min_dim]
             else:
                 pred_adj, y_adj = pred, all_y
-            loss = criterion(pred_adj, y_adj, model=model)
+            loss = criterion(pred_adj, y_adj, model=model) + _physics_param_regularization(model, config)
             loss.backward()
             return loss
         
@@ -512,15 +534,16 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
         for _ in range(3):
             lbfgs_optimizer.step(closure)
         
-        # Check if L-BFGS improved
+        # Check if L-BFGS improved (based on val_loss, oracle-free)
         model.eval()
         lbfgs_loc_error, lbfgs_val_loss = evaluate(model, val_loader, device, theta_true)
         
-        if lbfgs_loc_error < best_loc_error:
-            best_loc_error = lbfgs_loc_error
+        if lbfgs_val_loss < best_val_loss:
             best_val_loss = lbfgs_val_loss
+            best_loc_error = lbfgs_loc_error  # Record loc_error at best val_loss
             if verbose:
-                print(f"  L-BFGS improved: {lbfgs_loc_error:.2f}m")
+                loc_str = f"{lbfgs_loc_error:.2f}m" if theta_true is not None else "N/A"
+                print(f"  L-BFGS improved: val_loss={lbfgs_val_loss:.4f}, loc_err={loc_str}")
         else:
             # Restore pre-L-BFGS state if no improvement
             if best_state is not None:
@@ -637,7 +660,7 @@ def train_client(model, train_loader, config, device, global_params=None, algori
                 loss += (mu / 2) * prox_term
             
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=getattr(config, 'gradient_clip', 1.0))
             optimizer.step()
     
     return get_model_params(model), len(train_loader.dataset)
@@ -657,23 +680,7 @@ def train_federated(
     early_stopping_config=None,
     device_labels=None,
 ):
-    """
-    Federated Learning entrypoint.
-
-    UPDATED:
-    - Canonical FL implementation is in server.py + client.py.
-    - This is a thin wrapper around server.run_federated_experiment() to avoid
-      duplicated/bug-prone federated logic (e.g., accidental test leakage).
-
-    Args:
-        train_loader/val_loader/test_loader: DataLoaders (preferred)
-        data_path: CSV path (used if loaders not provided)
-        theta_true: True jammer position in ENU (for localization error)
-        theta_init: Initial theta in ENU
-        algorithms: list[str] (defaults to config.fl_algorithms)
-        early_stopping_config: server.FLEarlyStoppingConfig (optional)
-        device_labels: labels for device partitioning (optional)
-    """
+    
     # Backward compatibility
     if theta_true is None and true_jammer_pos is not None:
         theta_true = true_jammer_pos

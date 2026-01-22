@@ -1,16 +1,6 @@
 """
-Comprehensive Exploratory Data Analysis (EDA) for GNSS Jamming Dataset
+Exploratory Data Analysis (EDA) for GNSS Jamming Dataset
 ========================================================================
-
-This script performs in-depth analysis of GNSS data with jamming detection,
-including signal quality metrics, spatial distribution, temporal patterns,
-and feature relationships.
-
-Dataset columns:
-- timestamp, AGC, CN0, RSSI, jammed, device, band, env, is_synth
-- lat, lon, h_m, building_density, local_signal_variance
-- AGC_diff, CN0_diff, AGC_rolling_mean, AGC_rolling_std
-- CN0_rolling_mean, CN0_rolling_std, AGC_CN0_product
 """
 
 import numpy as np
@@ -34,17 +24,7 @@ class GNSSDataEDA:
     """Comprehensive EDA for GNSS jamming detection dataset"""
     
     def __init__(self, csv_path, save_plots=True, output_dir=None):
-        """Load and prepare data
         
-        Parameters:
-        -----------
-        csv_path : str
-            Path to CSV file
-        save_plots : bool
-            Whether to save plots to disk (default: True)
-        output_dir : str
-            Directory to save plots (default: same as CSV file)
-        """
         print("="*80)
         print("LOADING DATA")
         print("="*80)
@@ -74,7 +54,7 @@ class GNSSDataEDA:
                 self.df['timestamp'] = pd.to_datetime(self.df['timestamp'])
                 print(f"✓ Timestamp range: {self.df['timestamp'].min()} to {self.df['timestamp'].max()}")
             except:
-                print("⚠ Could not parse timestamp column")
+                print(" Could not parse timestamp column")
         
         self._categorize_columns()
     
@@ -107,10 +87,10 @@ class GNSSDataEDA:
         print("DATASET OVERVIEW")
         print("="*80)
         
-        print(f"\n📊 Shape: {self.df.shape[0]:,} rows × {self.df.shape[1]} columns")
+        print(f"\n Shape: {self.df.shape[0]:,} rows × {self.df.shape[1]} columns")
         
         # Column types
-        print(f"\n📋 Column Categories:")
+        print(f"\n Column Categories:")
         print(f"  Signal metrics:     {len(self.signal_cols)} columns")
         print(f"  Spatial features:   {len(self.spatial_cols)} columns")
         print(f"  Categorical:        {len(self.categorical_cols)} columns")
@@ -118,28 +98,28 @@ class GNSSDataEDA:
         # Missing values
         missing = self.df.isnull().sum()
         if missing.sum() > 0:
-            print(f"\n⚠ Missing Values:")
+            print(f"\n Missing Values:")
             for col in missing[missing > 0].index:
                 pct = missing[col] / len(self.df) * 100
                 print(f"  {col:25s}: {missing[col]:6d} ({pct:5.2f}%)")
         else:
-            print(f"\n✓ No missing values")
+            print(f"\n No missing values")
         
         # Duplicates
         n_dup = self.df.duplicated().sum()
         if n_dup > 0:
-            print(f"\n⚠ Duplicate rows: {n_dup:,} ({n_dup/len(self.df)*100:.2f}%)")
+            print(f"\n Duplicate rows: {n_dup:,} ({n_dup/len(self.df)*100:.2f}%)")
         else:
-            print(f"\n✓ No duplicate rows")
+            print(f"\n No duplicate rows")
         
         # Data types
-        print(f"\n📝 Data Types:")
+        print(f"\n Data Types:")
         dtype_counts = self.df.dtypes.value_counts()
         for dtype, count in dtype_counts.items():
             print(f"  {str(dtype):20s}: {count:3d} columns")
         
         # First few rows
-        print(f"\n👀 First 3 rows:")
+        print(f"\n First 3 rows:")
         print(self.df.head(3).to_string())
     
     def categorical_analysis(self):
@@ -149,7 +129,7 @@ class GNSSDataEDA:
         print("="*80)
         
         for col in self.categorical_cols:
-            print(f"\n📌 {col.upper()}")
+            print(f"\n {col.upper()}")
             print(f"   Unique values: {self.df[col].nunique()}")
             
             value_counts = self.df[col].value_counts()
@@ -194,7 +174,7 @@ class GNSSDataEDA:
         main_signals = [c for c in main_signals if c in self.df.columns]
         
         for col in main_signals:
-            print(f"\n📡 {col.upper()}")
+            print(f"\n {col.upper()}")
             print(f"   Mean:   {self.df[col].mean():8.2f}")
             print(f"   Median: {self.df[col].median():8.2f}")
             print(f"   Std:    {self.df[col].std():8.2f}")
@@ -206,7 +186,7 @@ class GNSSDataEDA:
             mean, std = self.df[col].mean(), self.df[col].std()
             outliers = ((self.df[col] < mean - 3*std) | (self.df[col] > mean + 3*std)).sum()
             if outliers > 0:
-                print(f"   ⚠ Outliers (>3σ): {outliers} ({outliers/len(self.df)*100:.2f}%)")
+                print(f"    Outliers (>3σ): {outliers} ({outliers/len(self.df)*100:.2f}%)")
         
         # Distribution plots
         n_signals = len(main_signals)
@@ -254,12 +234,12 @@ class GNSSDataEDA:
         n_jammed = (self.df['jammed'] == 1).sum()
         n_clean = (self.df['jammed'] == 0).sum()
         
-        print(f"\n📊 Jamming Distribution:")
+        print(f"\n Jamming Distribution:")
         print(f"   Jammed:  {n_jammed:6d} ({n_jammed/len(self.df)*100:5.2f}%)")
         print(f"   Clean:   {n_clean:6d} ({n_clean/len(self.df)*100:5.2f}%)")
         
         # Compare signal metrics between jammed and clean
-        print(f"\n🔍 Signal Comparison: Jammed vs Clean")
+        print(f"\n Signal Comparison: Jammed vs Clean")
         print(f"{'Metric':<20} {'Clean Mean':>12} {'Jammed Mean':>12} {'Difference':>12} {'% Change':>10}")
         print("-"*70)
         
@@ -274,7 +254,7 @@ class GNSSDataEDA:
                       f"{diff:>12.2f} {pct_change:>9.1f}%")
         
         # Statistical tests
-        print(f"\n📈 Statistical Significance (t-tests):")
+        print(f"\n Statistical Significance (t-tests):")
         for col in ['AGC', 'CN0', 'RSSI']:
             if col in self.df.columns:
                 clean = self.df[self.df['jammed'] == 0][col].dropna()
@@ -337,14 +317,14 @@ class GNSSDataEDA:
     def spatial_analysis(self):
         """Analyze spatial distribution"""
         if not all(c in self.df.columns for c in ['lat', 'lon']):
-            print("\n⚠ 'lat' or 'lon' columns not found, skipping spatial analysis")
+            print("\n 'lat' or 'lon' columns not found, skipping spatial analysis")
             return
         
         print("\n" + "="*80)
         print("SPATIAL ANALYSIS")
         print("="*80)
         
-        print(f"\n🗺️  Geographic Coverage:")
+        print(f"\n Geographic Coverage:")
         print(f"   Latitude:  [{self.df['lat'].min():.6f}, {self.df['lat'].max():.6f}]")
         print(f"   Longitude: [{self.df['lon'].min():.6f}, {self.df['lon'].max():.6f}]")
         
@@ -358,7 +338,7 @@ class GNSSDataEDA:
         print(f"   Approx area: {area_km2:.2f} km²")
         
         if 'building_density' in self.df.columns:
-            print(f"\n🏙️  Building Density:")
+            print(f"\n Building Density:")
             print(f"   Mean:   {self.df['building_density'].mean():.1f} buildings/km²")
             print(f"   Median: {self.df['building_density'].median():.1f} buildings/km²")
             print(f"   Min:    {self.df['building_density'].min():.1f} buildings/km²")
@@ -437,7 +417,7 @@ class GNSSDataEDA:
             return
         
         if self.df['timestamp'].dtype != 'datetime64[ns]':
-            print("\n⚠ Timestamp not in datetime format, skipping temporal analysis")
+            print("\n Timestamp not in datetime format, skipping temporal analysis")
             return
         
         print("\n" + "="*80)
@@ -446,14 +426,14 @@ class GNSSDataEDA:
         
         # Time range
         duration = self.df['timestamp'].max() - self.df['timestamp'].min()
-        print(f"\n⏱️  Time Coverage:")
+        print(f"\n Time Coverage:")
         print(f"   Start:    {self.df['timestamp'].min()}")
         print(f"   End:      {self.df['timestamp'].max()}")
         print(f"   Duration: {duration}")
         
         # Sampling rate
         if 'device' in self.df.columns:
-            print(f"\n📊 Sampling Statistics:")
+            print(f"\n Sampling Statistics:")
             for device in self.df['device'].unique():
                 device_data = self.df[self.df['device'] == device].sort_values('timestamp')
                 if len(device_data) > 1:
@@ -528,14 +508,14 @@ class GNSSDataEDA:
         numerical_cols = [c for c in numerical_cols if c in self.df.columns]
         
         if len(numerical_cols) < 2:
-            print("\n⚠ Not enough numerical columns for correlation analysis")
+            print("\n Not enough numerical columns for correlation analysis")
             return
         
         # Correlation matrix
         corr_matrix = self.df[numerical_cols].corr()
         
         # Print strong correlations
-        print(f"\n🔗 Strong Correlations (|r| > 0.5):")
+        print(f"\n Strong Correlations (|r| > 0.5):")
         strong_corr = []
         for i in range(len(corr_matrix.columns)):
             for j in range(i+1, len(corr_matrix.columns)):
@@ -570,7 +550,7 @@ class GNSSDataEDA:
     def feature_importance_for_jamming(self):
         """Analyze which features are most predictive of jamming"""
         if 'jammed' not in self.df.columns:
-            print("\n⚠ 'jammed' column not found, skipping feature importance analysis")
+            print("\n'jammed' column not found, skipping feature importance analysis")
             return
         
         print("\n" + "="*80)
@@ -595,7 +575,7 @@ class GNSSDataEDA:
         # Sort by absolute correlation
         correlations.sort(key=lambda x: abs(x[1]), reverse=True)
         
-        print(f"\n📊 Feature Correlations with Jamming Status:")
+        print(f"\n Feature Correlations with Jamming Status:")
         print(f"{'Feature':<30} {'Correlation':>12} {'P-value':>12} {'Significance':>12}")
         print("-"*70)
         
@@ -657,12 +637,12 @@ class GNSSDataEDA:
         n_synth = (self.df['is_synth'] == 1).sum()
         n_real = (self.df['is_synth'] == 0).sum()
         
-        print(f"\n📊 Data Composition:")
+        print(f"\n Data Composition:")
         print(f"   Real data:      {n_real:6d} ({n_real/len(self.df)*100:5.2f}%)")
         print(f"   Synthetic data: {n_synth:6d} ({n_synth/len(self.df)*100:5.2f}%)")
         
         # Compare distributions
-        print(f"\n🔍 Feature Comparison: Real vs Synthetic")
+        print(f"\n Feature Comparison: Real vs Synthetic")
         print(f"{'Metric':<20} {'Real Mean':>12} {'Synth Mean':>12} {'Difference':>12} {'KS p-value':>12}")
         print("-"*72)
         
@@ -720,21 +700,7 @@ class GNSSDataEDA:
     
     def localization_geometry_analysis(self, jammer_lat=None, jammer_lon=None, 
                                         environment=None, rssi_col='RSSI'):
-        """
-        Analyze data geometry for jammer localization.
         
-        This analysis explains WHY centroid-based localization works well or poorly,
-        and whether RSSI provides additional localization value.
-        
-        Parameters:
-        -----------
-        jammer_lat, jammer_lon : float
-            Known jammer location. If None, auto-detected from environment.
-        environment : str
-            Environment name ('open_sky', 'suburban', 'urban', 'lab_wired')
-        rssi_col : str
-            Column name for RSSI values (default: 'RSSI')
-        """
         # Jammer locations for each environment
         JAMMER_LOCATIONS = {
             'open_sky': {'lat': 45.145, 'lon': 7.62},
@@ -751,7 +717,7 @@ class GNSSDataEDA:
         
         # Check required columns
         if 'lat' not in self.df.columns or 'lon' not in self.df.columns:
-            print("❌ Missing lat/lon columns!")
+            print(" Missing lat/lon columns!")
             return
         
         # Auto-detect environment if not provided
@@ -763,10 +729,10 @@ class GNSSDataEDA:
             if environment and environment in JAMMER_LOCATIONS:
                 jammer_lat = JAMMER_LOCATIONS[environment]['lat']
                 jammer_lon = JAMMER_LOCATIONS[environment]['lon']
-                print(f"📍 Auto-detected environment: {environment}")
+                print(f" Auto-detected environment: {environment}")
                 print(f"   Jammer location: ({jammer_lat:.4f}, {jammer_lon:.4f})")
             else:
-                print("❌ Cannot determine jammer location!")
+                print(" Cannot determine jammer location!")
                 print("   Please provide environment or jammer_lat/jammer_lon parameters.")
                 return
         
@@ -833,12 +799,12 @@ class GNSSDataEDA:
         print(f"   Max distance from jammer: {distances.max():.1f} m")
         print(f"   Mean distance from jammer: {distances.mean():.1f} m")
         
-        print(f"\n🎯 Centroid Analysis:")
+        print(f"\n Centroid Analysis:")
         print(f"   Centroid position: ({centroid_x:.2f}, {centroid_y:.2f}) m")
         print(f"   Centroid error: {centroid_error:.2f} m")
         print(f"   Jammer position: (0.00, 0.00) m [origin]")
         
-        print(f"\n📊 Quadrant Distribution:")
+        print(f"\n Quadrant Distribution:")
         for quad, count in quadrant_counts.items():
             pct = 100 * count / total
             balance = "✓ Good" if 15 <= pct <= 35 else "⚠ Imbalanced"
@@ -853,17 +819,17 @@ class GNSSDataEDA:
                 print(f"   Estimated P0 = {P0_est:.1f} dBm")
             
             if r_squared < 0.05:
-                print(f"   ⚠️ VERY WEAK: RSSI has almost NO correlation with distance!")
+                print(f"   VERY WEAK: RSSI has almost NO correlation with distance!")
             elif r_squared < 0.2:
-                print(f"   ⚠️ WEAK: RSSI provides minimal distance information")
+                print(f"   WEAK: RSSI provides minimal distance information")
             elif r_squared < 0.5:
-                print(f"   ✓ MODERATE: RSSI provides useful distance information")
+                print(f"   MODERATE: RSSI provides useful distance information")
             else:
-                print(f"   ✓ STRONG: RSSI provides good distance information")
+                print(f"   STRONG: RSSI provides good distance information")
         
         # Key insight
         print(f"\n{'='*60}")
-        print("💡 KEY INSIGHT")
+        print(" KEY INSIGHT")
         print(f"{'='*60}")
         
         if centroid_error < 2.0:
@@ -990,10 +956,10 @@ class GNSSDataEDA:
             
             # Interpretation text
             if r_squared < 0.05:
-                interpretation = "⚠️ NO CORRELATION\nRSSI cannot help"
+                interpretation = " NO CORRELATION\nRSSI cannot help"
                 text_color = 'red'
             elif r_squared < 0.2:
-                interpretation = "⚠️ WEAK CORRELATION\nRSSI helps marginally"
+                interpretation = " WEAK CORRELATION\nRSSI helps marginally"
                 text_color = 'orange'
             elif r_squared < 0.5:
                 interpretation = "✓ MODERATE CORRELATION\nRSSI is useful"
@@ -1020,7 +986,7 @@ class GNSSDataEDA:
         
         # Summary for thesis
         print(f"\n{'='*60}")
-        print("📋 SUMMARY FOR THESIS")
+        print(" SUMMARY FOR THESIS")
         print(f"{'='*60}")
 
         r2_str = f"{r_squared:.4f}" if r_squared is not None else "N/A"
@@ -1062,18 +1028,7 @@ class GNSSDataEDA:
         }
     
     def localization_geometry_analysis_all_envs(self, rssi_col='RSSI'):
-        """
-        Run localization geometry analysis for ALL environments in the dataset.
-
-        Parameters:
-        -----------
-        rssi_col : str
-            Column name for RSSI values (default: 'RSSI')
-            
-        Returns:
-        --------
-        dict : Results for each environment
-        """
+       
         # Jammer locations for each environment
         JAMMER_LOCATIONS = {
             'open_sky': {'lat': 45.145, 'lon': 7.62},
@@ -1083,7 +1038,7 @@ class GNSSDataEDA:
         }
 
         if 'env' not in self.df.columns:
-            print("\n⚠ 'env' column not found!")
+            print("\n 'env' column not found!")
             print("   Running single analysis without environment filter...")
             return self.localization_geometry_analysis(rssi_col=rssi_col)
 
@@ -1092,7 +1047,7 @@ class GNSSDataEDA:
         print("="*80)
 
         environments = self.df['env'].unique()
-        print(f"\n📊 Found {len(environments)} environments: {list(environments)}")
+        print(f"\n Found {len(environments)} environments: {list(environments)}")
 
         all_results = {}
 
@@ -1109,15 +1064,15 @@ class GNSSDataEDA:
                 print(f"⚠ Skipping {env}: only {n_samples} samples")
                 continue
             
-            print(f"📊 Samples in {env}: {n_samples}")
+            print(f" Samples in {env}: {n_samples}")
             
             # Get jammer location
             if env in JAMMER_LOCATIONS:
                 jammer_lat = JAMMER_LOCATIONS[env]['lat']
                 jammer_lon = JAMMER_LOCATIONS[env]['lon']
-                print(f"📍 Jammer location: ({jammer_lat:.4f}, {jammer_lon:.4f})")
+                print(f" Jammer location: ({jammer_lat:.4f}, {jammer_lon:.4f})")
             else:
-                print(f"⚠ Unknown environment '{env}', skipping...")
+                print(f" Unknown environment '{env}', skipping...")
                 continue
             
             # Convert to ENU coordinates centered on jammer
@@ -1186,14 +1141,14 @@ class GNSSDataEDA:
             }
             
             # Print results for this environment
-            print(f"\n📐 Spatial Extent:")
+            print(f"\n Spatial Extent:")
             print(f"   X range: [{x_enu.min():.1f}, {x_enu.max():.1f}] m ({x_enu.max()-x_enu.min():.1f}m span)")
             print(f"   Y range: [{y_enu.min():.1f}, {y_enu.max():.1f}] m ({y_enu.max()-y_enu.min():.1f}m span)")
             
-            print(f"\n🎯 Centroid Analysis:")
+            print(f"\n Centroid Analysis:")
             print(f"   Centroid error: {centroid_error:.2f} m")
             
-            print(f"\n📊 Quadrant Distribution:")
+            print(f"\n Quadrant Distribution:")
             for quad, count in quadrant_counts.items():
                 pct = 100 * count / total
                 print(f"   {quad}: {count:4d} samples ({pct:5.1f}%)")
@@ -1310,7 +1265,7 @@ class GNSSDataEDA:
 
         # ========== SUMMARY TABLE FOR ALL ENVIRONMENTS ==========
         print("\n" + "="*80)
-        print("📋 SUMMARY TABLE - ALL ENVIRONMENTS")
+        print(" SUMMARY TABLE - ALL ENVIRONMENTS")
         print("="*80)
 
         print(f"\n{'Environment':<15} {'Centroid Err':>12} {'RSSI R²':>10} {'Balance':>10} {'Extent':>20} {'Mean Dist':>12} {'Samples':>10}")
@@ -1342,7 +1297,7 @@ class GNSSDataEDA:
             summary_df = pd.DataFrame(summary_data)
             summary_file = os.path.join(self.output_dir, 'geometry_analysis_summary.csv')
             summary_df.to_csv(summary_file, index=False)
-            print(f"\n📊 Summary saved to: {summary_file}")
+            print(f"\n Summary saved to: {summary_file}")
 
         return all_results
     
@@ -1352,11 +1307,11 @@ class GNSSDataEDA:
         print("SUMMARY REPORT")
         print("="*80)
         
-        print(f"\n📄 Dataset: {self.original_shape[0]:,} rows × {self.original_shape[1]} columns")
+        print(f"\n Dataset: {self.original_shape[0]:,} rows × {self.original_shape[1]} columns")
         
         if 'jammed' in self.df.columns:
             n_jammed = (self.df['jammed'] == 1).sum()
-            print(f"\n🎯 Jamming Detection:")
+            print(f"\n Jamming Detection:")
             print(f"   Jamming rate: {n_jammed/len(self.df)*100:.1f}%")
             
             if 'CN0' in self.df.columns:
@@ -1365,26 +1320,26 @@ class GNSSDataEDA:
                 print(f"   CN0 degradation: {clean_cn0 - jammed_cn0:.1f} dB-Hz")
         
         if 'device' in self.df.columns:
-            print(f"\n📱 Devices:")
+            print(f"\n Devices:")
             print(f"   Number of devices: {self.df['device'].nunique()}")
             print(f"   Samples per device: {len(self.df) / self.df['device'].nunique():.0f} avg")
         
         if all(c in self.df.columns for c in ['lat', 'lon']):
             lat_range = (self.df['lat'].max() - self.df['lat'].min()) * 111
             lon_range = (self.df['lon'].max() - self.df['lon'].min()) * 111
-            print(f"\n🗺️  Geographic Coverage:")
+            print(f"\n  Geographic Coverage:")
             print(f"   Area: {lat_range:.2f} km × {lon_range:.2f} km")
         
         if 'building_density' in self.df.columns:
-            print(f"\n🏙️  Environment:")
+            print(f"\n  Environment:")
             print(f"   Avg building density: {self.df['building_density'].mean():.0f} buildings/km²")
         
         if 'is_synth' in self.df.columns:
             n_synth = (self.df['is_synth'] == 1).sum()
-            print(f"\n🔬 Data Composition:")
+            print(f"\n Data Composition:")
             print(f"   Synthetic data: {n_synth/len(self.df)*100:.1f}%")
         
-        print(f"\n✅ EDA Complete!")
+        print(f"\n EDA Complete!")
         
         # Save summary statistics to CSV
         if self.save_plots:
@@ -1403,7 +1358,7 @@ class GNSSDataEDA:
             
         # Save to CSV
         pd.Series(summary_stats).to_csv(summary_file)
-        print(f"📊 Summary statistics saved: {summary_file}")
+        print(f" Summary statistics saved: {summary_file}")
 
     def env_conditioned_feature_importance(self, min_samples=200):
         """
@@ -1411,7 +1366,7 @@ class GNSSDataEDA:
         This exposes domain shift and justifies env-aware ML / FL.
         """
         if 'jammed' not in self.df.columns or 'env' not in self.df.columns:
-            print("\n⚠ Missing 'jammed' or 'env' column, skipping env-conditioned importance")
+            print("\n Missing 'jammed' or 'env' column, skipping env-conditioned importance")
             return
 
         print("\n" + "="*80)
@@ -1482,7 +1437,7 @@ class GNSSDataEDA:
         Clients = devices, partitioned by environment.
         """
         if 'device' not in self.df.columns or 'env' not in self.df.columns:
-            print("\n⚠ Missing 'device' or 'env' column, skipping FL analysis")
+            print("\nMissing 'device' or 'env' column, skipping FL analysis")
             return
 
         print("\n" + "="*80)
@@ -1496,7 +1451,7 @@ class GNSSDataEDA:
             .unstack(fill_value=0)
         )
 
-        print("\n📱 Client × Environment sample counts:")
+        print("\n Client × Environment sample counts:")
         print(client_env_counts)
 
         # Identify dominant environment per client
@@ -1509,12 +1464,12 @@ class GNSSDataEDA:
             'total_samples': client_env_counts.sum(axis=1)
         })
 
-        print("\n🔍 Client environment dominance:")
+        print("\n Client environment dominance:")
         print(summary.sort_values('dominance_ratio', ascending=False))
 
         # Warn about non-IID severity
         highly_skewed = summary[summary['dominance_ratio'] > 0.8]
-        print(f"\n⚠ Highly non-IID clients (>80% single env): {len(highly_skewed)}")
+        print(f"\n Highly non-IID clients (>80% single env): {len(highly_skewed)}")
 
         # Visualization
         fig, ax = plt.subplots(figsize=(10, 6))
@@ -1527,7 +1482,7 @@ class GNSSDataEDA:
         self._save_plot('10_fl_client_env_dominance.png')
         plt.show()
 
-        print("\n💡 FL DESIGN IMPLICATIONS:")
+        print("\n FL DESIGN IMPLICATIONS:")
         if highly_skewed.shape[0] > 0:
             print("  → Strong non-IID data distribution detected")
             print("  → FedAvg likely suboptimal")
@@ -1555,33 +1510,8 @@ class GNSSDataEDA:
 
 # =============== MAIN EXECUTION ==========================
 
-def run_eda(csv_path='combined_data.csv', analyses='all', save_plots=True, output_dir=None):
-    """
-    Run EDA on GNSS jamming dataset
-    
-    Parameters:
-    -----------
-    csv_path : str
-        Path to CSV file
-    analyses : str or list
-        'all' for complete analysis, or list of specific analyses:
-        ['overview', 'categorical', 'signal', 'jamming', 'spatial', 
-         'temporal', 'correlation', 'importance', 'synthetic', 'summary']
-    save_plots : bool
-        Whether to save plots to disk (default: True)
-    output_dir : str
-        Directory to save plots (default: creates 'eda_plots' folder)
-    
-    Returns:
-    --------
-    GNSSDataEDA object with all analysis methods
-    
-    Example:
-    
-    >>> eda = run_eda('realistic_open_sky_v2.csv')
-    >>> # Or run specific analyses
-    >>> eda = run_eda('realistic_open_sky_v2.csv', analyses=['signal', 'jamming'], save_plots=False)
-    """
+def run_eda(csv_path='combined_data_urban.csv', analyses='all', save_plots=True, output_dir=None):
+  
     
     eda = GNSSDataEDA(csv_path, save_plots=save_plots, output_dir=output_dir)
     
@@ -1606,7 +1536,7 @@ def run_eda(csv_path='combined_data.csv', analyses='all', save_plots=True, outpu
             if analysis in analysis_map:
                 analysis_map[analysis]()
             else:
-                print(f"⚠ Unknown analysis: {analysis}")
+                print(f" Unknown analysis: {analysis}")
     
     return eda
 
@@ -1615,7 +1545,7 @@ if __name__ == "__main__":
     import sys
     
     # Get CSV path from command line or use default
-    csv_file = sys.argv[1] if len(sys.argv) > 1 else 'combined_data.csv'
+    csv_file = sys.argv[1] if len(sys.argv) > 1 else 'combined_data_urban.csv'
     
     # Optional: disable plot saving
     save_plots = True
@@ -1639,7 +1569,7 @@ if __name__ == "__main__":
         print(f"{'='*80}")
         
         if save_plots:
-            print(f"\n📁 All plots saved to: {eda.output_dir}")
+            print(f"\n All plots saved to: {eda.output_dir}")
             print(f"   Files created:")
             plot_files = [f for f in os.listdir(eda.output_dir) if f.endswith('.png')]
             for file in sorted(plot_files):
@@ -1649,14 +1579,14 @@ if __name__ == "__main__":
         
         print(f"\nTo run specific analyses in Jupyter:")
         print(">>> from comprehensive_eda import GNSSDataEDA")
-        print(">>> eda = GNSSDataEDA('combined_data.csv')")
+        print(">>> eda = GNSSDataEDA('combined_data_urban.csv')")
         print(">>> eda.jamming_analysis()  # Run specific analysis")
         
     except FileNotFoundError:
-        print(f"\n❌ Error: File '{csv_file}' not found")
+        print(f"\n Error: File '{csv_file}' not found")
         print("Usage: python comprehensive_eda.py <path_to_csv> [nosave]")
         print("       Use 'nosave' to disable plot saving")
     except Exception as e:
-        print(f"\n❌ Error during EDA: {e}")
+        print(f"\n Error during EDA: {e}")
         import traceback
         traceback.print_exc()

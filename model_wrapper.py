@@ -8,7 +8,7 @@ Handles edge cases like:
 - Near-field path loss singularities
 - Safe forward methods
 
-NOTE: The original BatchNorm concerns are outdated - model.py now uses LayerNorm
+The original BatchNorm concerns are outdated - model.py now uses LayerNorm
 which works fine with any batch size. We still handle dropout for batch=1.
 """
 
@@ -23,20 +23,7 @@ from config import cfg
 # ==================== Safe Forward Functions ====================
 
 def safe_forward_PL(model: nn.Module, x: torch.Tensor, d_min: float = 1.0) -> torch.Tensor:
-    """
-    Safe path loss forward that:
-    1. Only uses first 2 dims (x, y) for distance computation
-    2. Clamps minimum distance to avoid log(0)
-    3. Handles near-field gracefully
-    
-    Args:
-        model: Net_augmented model
-        x: Input tensor [batch, features]
-        d_min: Minimum distance clamp
-    
-    Returns:
-        Path loss prediction [batch, 1]
-    """
+ 
     # Extract position (first 2 features)
     pos = x[:, :2]
     
@@ -52,23 +39,7 @@ def safe_forward_PL(model: nn.Module, x: torch.Tensor, d_min: float = 1.0) -> to
 
 
 def safe_forward_NN(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """
-    Safe neural network forward that handles batch size 1.
-    
-    NOTE: The original BatchNorm concern is outdated - model.py now uses LayerNorm
-    which works fine with batch size 1. However, we still disable dropout for
-    batch size 1 to avoid training instability.
-    
-    IMPORTANT: This function must mirror model.py's forward_NN exactly,
-    including the LayerNorm layers, to ensure consistent behavior.
-    
-    Args:
-        model: Net_augmented model
-        x: Input tensor [batch, features]
-    
-    Returns:
-        NN prediction [batch, 1]
-    """
+   
     training_mode = model.training
     
     # Input normalization (must match model.py's forward_NN)
@@ -91,19 +62,7 @@ def safe_forward_NN(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 def safe_forward(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    """
-    Safe combined forward pass.
-    
-    Combines physics-based path loss and neural network using
-    learned softmax weights, with safe handling of edge cases.
-    
-    Args:
-        model: Net_augmented model
-        x: Input tensor [batch, features]
-    
-    Returns:
-        Combined prediction [batch, 1]
-    """
+   
     # Get fusion weights
     w_PL, w_NN = torch.softmax(model.w, dim=0)
     
@@ -118,18 +77,7 @@ def safe_forward(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
 
 
 def patch_model(model: nn.Module):
-    """
-    Patch a Net_augmented model with safe forward methods.
     
-    Replaces the original forward methods with safe versions
-    that handle edge cases properly.
-    
-    Args:
-        model: Net_augmented model to patch
-    
-    Returns:
-        The patched model (for chaining)
-    """
     # Store original methods only if they exist (for debugging if needed)
     # This allows patching different model types without crashing
     if hasattr(model, 'forward_PL'):
@@ -159,23 +107,7 @@ def create_model(input_dim: int = None,
                  gamma_init: float = None,
                  theta_init: np.ndarray = None,
                  device: torch.device = None):
-    """
-    Create and patch a Net_augmented model.
     
-    This function imports Jaramillo's model, creates an instance,
-    and patches it with safe forward methods.
-    
-    Args:
-        input_dim: Input feature dimension
-        hidden_layers: Hidden layer sizes
-        nonlinearity: Activation function
-        gamma_init: Initial path loss exponent
-        theta_init: Initial jammer position
-        device: Compute device
-    
-    Returns:
-        Patched Net_augmented model
-    """
     # Use config defaults
     if input_dim is None:
         input_dim = cfg.input_dim
@@ -216,16 +148,18 @@ def create_model(input_dim: int = None,
 
 # ==================== Model Utilities ====================
 
+def _set_requires_grad(module, flag: bool):
+    """Safely set requires_grad for all parameters in a module/modulelist."""
+    try:
+        for p in module.parameters():
+            p.requires_grad = flag
+    except Exception:
+        # If it's not a nn.Module (or has no parameters), ignore
+        pass
+
+
 def get_physics_params(model: nn.Module) -> dict:
-    """
-    Extract physics parameters from model.
-    
-    Args:
-        model: Net_augmented model
-    
-    Returns:
-        Dictionary with theta, P0, gamma, w values
-    """
+   
     with torch.no_grad():
         w_PL, w_NN = torch.softmax(model.w, dim=0)
         
@@ -239,17 +173,28 @@ def get_physics_params(model: nn.Module) -> dict:
 
 
 def freeze_nn(model: nn.Module):
-    """Freeze neural network parameters (for physics-only training)"""
-    for param in model.fc_layers.parameters():
-        param.requires_grad = False
-    model.w.requires_grad = False
+    """Freeze neural network parameters (for physics-only training)."""
+    if hasattr(model, 'fc_layers'):
+        _set_requires_grad(model.fc_layers, False)
+    # LayerNorm / other norms may have learnable params
+    if hasattr(model, 'hidden_norms'):
+        _set_requires_grad(model.hidden_norms, False)
+    if hasattr(model, 'normalization'):
+        _set_requires_grad(model.normalization, False)
+    if hasattr(model, 'w'):
+        model.w.requires_grad = False
 
 
 def unfreeze_nn(model: nn.Module):
-    """Unfreeze neural network parameters"""
-    for param in model.fc_layers.parameters():
-        param.requires_grad = True
-    model.w.requires_grad = True
+    """Unfreeze neural network parameters."""
+    if hasattr(model, 'fc_layers'):
+        _set_requires_grad(model.fc_layers, True)
+    if hasattr(model, 'hidden_norms'):
+        _set_requires_grad(model.hidden_norms, True)
+    if hasattr(model, 'normalization'):
+        _set_requires_grad(model.normalization, True)
+    if hasattr(model, 'w'):
+        model.w.requires_grad = True
 
 
 def freeze_physics(model: nn.Module):

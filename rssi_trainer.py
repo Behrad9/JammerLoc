@@ -5,24 +5,6 @@ RSSI Trainer (Stage 1) - Complete Training Pipeline with CV Grid Search
 Complete training pipeline for jammer RSSI estimation using the
 physics-informed ExactHybrid model from the approved thesis.
 
-Features:
-- Cross-validation grid search over top_q and mono_w
-- Walk-forward time-aware CV (no future leakage)
-- Jamming detection (Delta-based threshold)
-- Post-hoc calibration
-
-UPDATED: Fixed embedding parameter selection (reviewer concern D.3)
-- Previous code: selected ALL params with 'weight' in name
-- Fixed code: properly identifies nn.Embedding parameters only
-
-FIXES APPLIED:
-- Consolidated detection functions here (removed duplicates from rssi_model.py)
-- Fixed type consistency in AGC orientation map (returns int, not float)
-- Added documentation for detection threshold method
-
-References:
-- Thesis document: "Jammer-Aware RSSI Estimation"
-- Original notebook: RSSIESTIMATION.ipynb
 """
 
 import os
@@ -106,24 +88,7 @@ DET_WINDOW_SIZE = 5
 # ============================================================
 
 def get_embedding_parameters(model: nn.Module) -> Tuple[set, set]:
-    """
-    Properly separate embedding parameters from other parameters.
-    
-    FIXED: Previous implementation used:
-        emb_params = {p for n, p in model.named_parameters() if 'weight' in n}
-    
-    This was WRONG because it selected ALL parameters with 'weight' in name,
-    including Linear layer weights, LayerNorm weights, etc.
-    
-    Correct approach: Check if the module is an nn.Embedding instance.
-    
-    Args:
-        model: PyTorch model
-    
-    Returns:
-        emb_params: Set of parameters belonging to nn.Embedding modules
-        other_params: Set of all other parameters
-    """
+   
     emb_params = set()
     other_params = set()
     
@@ -156,18 +121,7 @@ def create_optimizer_with_weight_decay(model: nn.Module,
                                        lr: float = LR_ADAM,
                                        emb_weight_decay: float = WEIGHT_DECAY_EMB,
                                        other_weight_decay: float = WEIGHT_DECAY_OTHER) -> torch.optim.Adam:
-    """
-    Create Adam optimizer with proper weight decay for embedding vs other params.
     
-    Args:
-        model: PyTorch model
-        lr: Learning rate
-        emb_weight_decay: Weight decay for embedding parameters
-        other_weight_decay: Weight decay for other parameters
-    
-    Returns:
-        Adam optimizer with parameter groups
-    """
     emb_params, other_params = get_embedding_parameters(model)
     
     optimizer = torch.optim.Adam([
@@ -260,14 +214,7 @@ def build_category_indices(df: pd.DataFrame) -> Dict[str, Dict[str, int]]:
 # ============================================================
 
 def time_indices(n: int, test_frac: float = 0.15, n_folds: int = 4) -> Tuple[np.ndarray, np.ndarray, List]:
-    """
-    Create time-aware train/test split with walk-forward CV folds.
     
-    Returns:
-        pre_idx: Indices for pre-test (training + CV)
-        test_idx: Indices for final test (last test_frac of data)
-        folds: List of (train_idx, val_idx) tuples for walk-forward CV
-    """
     n_test = max(int(round(n * test_frac)), 1)
     test_start = n - n_test
     pre_idx = np.arange(0, test_start)
@@ -287,41 +234,14 @@ def time_indices(n: int, test_frac: float = 0.15, n_folds: int = 4) -> Tuple[np.
 
 
 # ============================================================
-# Jamming Detection (CONSOLIDATED - primary source)
-# ============================================================
-# NOTE: Detection functions are consolidated here. The versions in
-# rssi_model.py have been removed to avoid confusion.
-#
-# Threshold method: Percentile-based (more robust than mean+k*std)
-# T = percentile_95(S_clean) + 0.5
-# This is more robust to outliers than the μ + k*σ method.
+# Jamming Detection Functions
 # ============================================================
 
 def compute_detection_params(df: pd.DataFrame, 
                             clean_cn0_max: float = DET_CLEAN_CN0_MAX,
                             clean_agc_max: float = DET_CLEAN_AGC_MAX,
                             k_sigma: float = DET_K_SIGMA) -> Dict:
-    """
-    Learn detection threshold from clean (unjammed) samples.
     
-    Uses Delta features to identify clean samples and compute
-    threshold using percentile-based method (more robust than mean+k*std).
-    
-    Threshold method:
-        T = percentile_95(S_clean) + 0.5
-        
-    This is more robust to outliers than T = μ_S + k * σ_S.
-    The k_sigma parameter is used as a minimum threshold floor.
-    
-    Args:
-        df: DataFrame with Delta_CN0 and Delta_AGC columns
-        clean_cn0_max: Maximum |Delta_CN0| for clean samples
-        clean_agc_max: Maximum |Delta_AGC| for clean samples
-        k_sigma: Minimum threshold floor
-        
-    Returns:
-        Dict with T, sigma_cn0, sigma_agc
-    """
     # Identify clean samples (small deltas)
     clean_mask = (df["Delta_CN0"].abs() <= clean_cn0_max) & (df["Delta_AGC"].abs() <= clean_agc_max)
     clean = df[clean_mask] if clean_mask.sum() >= 50 else df
@@ -347,17 +267,7 @@ def compute_detection_params(df: pd.DataFrame,
 
 
 def apply_detection(df: pd.DataFrame, det_params: Dict, use_rolling: bool = False) -> pd.DataFrame:
-    """
-    Apply jamming detection to DataFrame.
     
-    Args:
-        df: DataFrame with Delta_CN0 and Delta_AGC columns
-        det_params: Detection parameters from compute_detection_params
-        use_rolling: If True, apply rolling window smoothing
-        
-    Returns:
-        DataFrame with jammed_pred and detection_score columns
-    """
     df = df.copy()
     
     sigma_cn0 = det_params["sigma_cn0"]
@@ -529,20 +439,6 @@ def compute_rssi_metrics(y_true, y_pred):
         "huber": huber,
         "r2": r2_score(y_true, y_pred),
     }
-
-
-# ============================================================
-# Simplified Preprocessing (from original notebook)
-# ============================================================
-# NOTE: This implementation uses a SIMPLIFIED baseline pipeline that computes
-# baselines per (device, band) WITHOUT elevation bins. This is intentional:
-#
-# - The simplified approach is more robust with limited data
-# - Elevation bins require sufficient samples per bin to be reliable
-# - For thesis: Document as "simplified per-(device,band) baseline correction"
-#
-# If elevation binning is needed, use compute_baseline_map/apply_baselines
-# from rssi_model.py instead, which supports config.elev_bins.
 # ============================================================
 
 def compute_baseline_map_train_only(df: pd.DataFrame, train_idx: np.ndarray, 
@@ -571,15 +467,7 @@ def compute_baseline_map_train_only(df: pd.DataFrame, train_idx: np.ndarray,
 
 def add_deltas_with_bases(df: pd.DataFrame,
                           baseline_map: Dict[Tuple[str, str], Tuple[float, float]]) -> pd.DataFrame:
-    """Add baseline columns and Delta features using a consistent convention.
-
-    Convention (matches rssi_model.apply_baselines and thesis):
-        Delta_CN0     = CN0_base - CN0
-        Delta_AGC_raw = AGC_base - AGC
-        Delta_AGC     = oriented version of Delta_AGC_raw (computed later)
-
-    Positive deltas should correspond to stronger jammer/interference effects (subject to orientation map).
-    """
+    
     def get_bases(row):
         key = (row["device"], row["band"])
         band_key = ("__BAND__", row["band"])
@@ -612,21 +500,7 @@ def add_deltas_with_bases(df: pd.DataFrame,
 
 
 def compute_agc_orientation_map_train_only(df: pd.DataFrame, min_n: int = 20) -> Dict[Tuple[str, str], int]:
-    """Compute AGC orientation signs from TRAIN-only data.
-
-    This maps each (device, band) to a sign (+1/-1) applied to Delta_AGC_raw such that:
-        Delta_AGC = sign * Delta_AGC_raw
-    has non-negative covariance with RSSI on training data (fallbacks included).
-
-    FIXED: Return type is consistently int (not float from safe_cov_sign).
-
-    NOTE:
-      - Delta_AGC_raw must exist (produced by add_deltas_with_bases).
-      - Uses safe_cov_sign from rssi_model (robust to low variance).
-      
-    Returns:
-        Dict mapping (device, band) tuples to int signs (+1 or -1)
-    """
+    
     sgn_map: Dict[Tuple[str, str], int] = {}
 
     # Per (device, band)
@@ -653,13 +527,7 @@ def compute_agc_orientation_map_train_only(df: pd.DataFrame, min_n: int = 20) ->
 
 
 def apply_agc_orientation_simple(df: pd.DataFrame, sgn_map: Dict[Tuple[str, str], int]) -> pd.DataFrame:
-    """Apply AGC orientation to produce Delta_AGC from Delta_AGC_raw.
-
-    Fallback hierarchy:
-      1) (device, band)
-      2) ("__BAND__", band)
-      3) ("__GLOBAL__", "__GLOBAL__")
-    """
+    
     df = df.copy()
 
     def get_sign(row):
@@ -680,17 +548,8 @@ def apply_agc_orientation_simple(df: pd.DataFrame, sgn_map: Dict[Tuple[str, str]
 # ============================================================
 
 def run_cv_fold(df_raw_train, df_raw_val, n_devices, n_bands, top_q, mono_w, device, verbose=False):
-    """
-    Run one CV fold with given hyperparameters.
     
-    FIXED: Now properly recomputes baselines with the specific top_q value,
-    so grid search over top_q actually varies the results.
     
-    Returns:
-        dict with mae, mse, huber metrics for comprehensive evaluation
-    """
-    # CRITICAL FIX: Recompute baselines with THIS fold's top_q
-    # This ensures grid search over top_q actually has an effect
     train_idx = np.arange(len(df_raw_train))
     baseline_map = compute_baseline_map_train_only(df_raw_train, train_idx, top_q)
     
@@ -761,28 +620,7 @@ def grid_search_cv(df_raw, folds, n_devices, n_bands,
                    top_q_grid: List[float] = None,
                    mono_weight_grid: List[float] = None,
                    verbose: bool = True):
-    """
-    Grid search over hyperparameters with cross-validation.
     
-    FIXED: Now passes RAW data (without deltas) to run_cv_fold,
-    so each top_q value actually produces different results.
-    
-    Also logs MAE, MSE, and Huber for comprehensive evaluation.
-    Selection is by MAE (consistent with final evaluation), but all
-    metrics are recorded to justify the choice.
-    
-    Args:
-        df_raw: DataFrame WITHOUT Delta features (raw AGC/CN0 only)
-        folds: List of (train_idx, val_idx) tuples
-        n_devices: Number of unique devices
-        n_bands: Number of unique bands
-        top_q_grid: List of top_q values to try
-        mono_weight_grid: List of monotonic penalty weights to try
-        verbose: Print progress
-    
-    Returns:
-        best_top_q, best_mono_w, results
-    """
     if top_q_grid is None:
         top_q_grid = TOP_Q_GRID
     if mono_weight_grid is None:
@@ -843,20 +681,7 @@ def train_rssi_pipeline(
     mono_weight_grid: List[float] = None,
     verbose: bool = True
 ) -> Dict:
-    """
-    Complete RSSI training pipeline.
     
-    Steps:
-    1. Load and prepare data
-    2. Compute baselines and AGC orientation
-    3. Grid search CV for hyperparameters
-    4. Train final model
-    5. Calibrate and evaluate
-    6. Save model and artifacts
-    
-    Returns:
-        Dict with model, artifacts, metrics
-    """
     if config is None:
         config = rssi_cfg
     if top_q_grid is None:
@@ -930,8 +755,7 @@ def train_rssi_pipeline(
         print("BASELINE COMPUTATION (with best top_q)")
         print(f"{'='*60}")
     
-    # FIXED: Use df_pretest_raw explicitly (not df with pre_idx) for clarity and safety
-    # This ensures we only use pre-test data and makes the code self-documenting
+    
     baseline_map = compute_baseline_map_train_only(
         df_pretest_raw, 
         np.arange(len(df_pretest_raw)),  # All indices within pretest

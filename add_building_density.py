@@ -49,18 +49,7 @@ def get_building_count(lat, lon, radius=100):
 
 
 def calculate_density_grid(df, grid_size=0.0005, radius=50):
-    """
-    Calculate building density using a grid-based approach.
-    This reduces API calls by grouping nearby points.
-    
-    Parameters:
-    - df: DataFrame with 'lat' and 'lon' columns
-    - grid_size: Grid cell size in degrees (default: ~55m at mid-latitudes)
-    - radius: Search radius in meters for each grid cell
-    
-    Returns:
-    - DataFrame with added 'building_density' column (buildings/km²)
-    """
+  
     print(f"Creating grid with cell size: {grid_size} degrees (~{grid_size*111000:.0f}m)")
     print(f"Using search radius: {radius} meters")
     
@@ -113,17 +102,7 @@ def calculate_density_grid(df, grid_size=0.0005, radius=50):
 
 
 def calculate_density_direct(df, radius=50):
-    """
-    Calculate building density by querying each point individually.
-    More accurate but slower - use for small datasets.
     
-    Parameters:
-    - df: DataFrame with 'lat' and 'lon' columns
-    - radius: Search radius in meters
-    
-    Returns:
-    - DataFrame with added 'building_density' column (buildings/km²)
-    """
     print(f"Calculating building density for {len(df)} points...")
     print(f"Using search radius: {radius} meters")
     
@@ -144,19 +123,7 @@ def calculate_density_direct(df, radius=50):
 
 def add_building_density(csv_path, output_path=None, method='direct', 
                          grid_size=0.0005, radius=50):
-    """
-    Main function to add building density to a CSV file.
-    
-    Parameters:
-    - csv_path: Path to input CSV file (must have 'lat' and 'lon' columns)
-    - output_path: Path to save output CSV (default: adds '_with_density' suffix)
-    - method: 'grid' (faster, recommended) or 'direct' (more accurate)
-    - grid_size: Grid cell size in degrees (only for 'grid' method)
-    - radius: Search radius in meters
-    
-    Returns:
-    - DataFrame with building density added
-    """
+  
     print(f"Loading data from {csv_path}...")
     df = pd.read_csv(csv_path)
     

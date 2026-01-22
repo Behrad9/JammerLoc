@@ -1,20 +1,5 @@
-"""
-Stage 1 Plotting Module for RSSI Estimation (Thesis-Quality)
-=============================================================
 
-Publication-ready plots for Stage 1 (RSSI estimation from AGC/CN0).
-
-Key Improvements:
-- LaTeX-compatible typography
-- Colorblind-friendly palette  
-- Confidence intervals and error bands
-- Multi-format export (PNG + PDF)
-- Better figure sizing for thesis inclusion
-- Enhanced statistical annotations
-- Professional axis formatting with proper units
-
-Author: Thesis Research
-"""
+#Stage 1 Plotting Module for RSSI Estimation (Thesis-Quality)
 
 import os
 import numpy as np
@@ -40,9 +25,6 @@ try:
 except ImportError:
     HAS_SCIPY = False
 
-
-# ============================================================================
-# THESIS STYLE CONFIGURATION
 # ============================================================================
 
 def setup_thesis_style():
@@ -108,7 +90,7 @@ def setup_thesis_style():
     })
 
 
-# Colorblind-friendly palette (Tol's bright)
+
 COLORS = {
     'primary': '#4477AA',       # Blue
     'secondary': '#EE6677',     # Rose/Red

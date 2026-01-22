@@ -1,67 +1,8 @@
 """
-Comprehensive Ablation Studies for Thesis
-==========================================
-
-This module provides ablation studies that prove:
-
-1. RSSI QUALITY MATTERS (run_rssi_source_ablation):
-   - Oracle RSSI → Best localization
-   - Predicted RSSI → Near-oracle performance (Stage 1 works!)
-   - Shuffled/Random RSSI → Poor localization (proves RSSI-distance correlation matters)
-
-2. MODEL ARCHITECTURE MATTERS BY ENVIRONMENT (run_model_architecture_ablation):
-   - Open-sky: Pure PL wins (simple physics sufficient, γ≈2)
-   - Urban: APBM wins (NN captures multipath/NLOS effects)
-   - Suburban: APBM slight edge
-
-METHODOLOGY NOTES:
-==================
-
-1. COORDINATE SYSTEM (CRITICAL - NEUTRAL FRAME):
-   - Origin = RECEIVER CENTROID (NOT jammer location!)
-   - theta_true = jammer position in this neutral frame
-   - Localization error = ||theta_hat - theta_true||
-   - This prevents oracle bias from jammer-centered coordinates
-   
-   WHY THIS MATTERS:
-   - If we center on jammer, ||theta|| = localization error, BUT:
-     * Model initialization is biased toward correct answer
-     * L2 regularization pulls toward correct answer
-     * Early stopping uses oracle information
-   - Neutral frame ensures fair, unbiased evaluation
-
-2. OPTIMIZATION APPROACH:
-   - Models minimize RSSI prediction error (not localization error directly)
-   - Jammer position θ emerges as learned parameter
-   - This is "inverse localization via RSSI reconstruction" (Jaramillo et al.)
-   - Localization error is used for early stopping and model selection
-
-3. STATISTICAL RIGOR:
-   - Multiple trials with different random seeds
-   - Multiple random initializations per trial
-   - Paired t-tests for significance testing
-   - Effect size (Cohen's d) for practical significance
-   - R² reported to assess path-loss model fit quality
-
-Key Tables for Thesis:
-
-Table 1: RSSI Source Impact on Localization
-| RSSI Source    | Loc Error (m) | vs Oracle | Conclusion |
-|----------------|---------------|-----------|------------|
-| Oracle (GT)    | X.XX          | 1.00x     | Best possible |
-| Predicted (S1) | X.XX          | ~1.2x     | Stage 1 works! |
-| Shuffled       | XX.XX         | ~10-15x   | RSSI matters! |
-| Constant       | XX.XX         | ~3-5x     | RSSI matters! |
-
-Table 2: Model Architecture by Environment
-| Model    | Open-sky | Suburban | Urban    |
-|----------|----------|----------|----------|
-| Pure NN  | X.XX m   | X.XX m   | X.XX m   |
-| Pure PL  | X.XX m*  | X.XX m   | X.XX m   |
-| APBM     | X.XX m   | X.XX m*  | X.XX m*  |
-(* = best for that environment)
-
-Author: Behrad Shayegan
+Ablation Studies for Jammer Localization:
+===============================================
+1. RSSI QUALITY MATTERS
+2. MODEL ARCHITECTURE MATTERS BY ENVIRONMENT   
 """
 
 import os
@@ -88,7 +29,7 @@ def to_serializable(obj):
     except ImportError:
         pass
     
-    # Plain python types (str, int, float, bool, None) are already serializable
+    # Plain python types (str, int, float, bool, None) _ serializable
     return obj
 import pandas as pd
 import torch
@@ -99,9 +40,8 @@ from scipy import stats
 from scipy.optimize import minimize
 
 # ============================================================================
-# THESIS-QUALITY PLOTTING CONFIGURATION
+# CONFIGURATION
 # ============================================================================
-
 
 PLOT_COLORS = {
     'blue': '#648FFF',
@@ -115,9 +55,11 @@ PLOT_COLORS = {
 }
 
 MODEL_COLORS = {
-    'pure_nn': '#DC267F',   
-    'pure_pl': '#648FFF',   
-    'apbm': '#2E8B57',      
+    'pure_nn': '#DC267F',        
+    'pure_pl': '#648FFF',        
+    'pure_pl_oracle': '#9b59b6', 
+    'pure_pl_joint': '#648FFF',  
+    'apbm': '#2E8B57',           
 }
 
 RSSI_COLORS = {
@@ -132,7 +74,7 @@ RSSI_COLORS = {
 
 
 def _setup_thesis_style():
-    """Configure matplotlib for figures."""
+    """Configure matplotlib for publication-quality figures."""
     try:
         import matplotlib.pyplot as plt
         plt.rcParams.update({
@@ -178,10 +120,6 @@ def _save_figure(fig, output_dir: str, name: str, formats: List[str] = None):
                    bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close(fig)
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
 @dataclass
 class AblationConfig:
     """Configuration for ablation studies."""
@@ -199,7 +137,7 @@ class AblationConfig:
             self.hidden_dims = [64, 32]
 
 
-# Environment-specific parameters
+# Environment parameters
 GAMMA_ENV = {
     'open_sky': 2.0,
     'suburban': 2.8,
@@ -239,7 +177,7 @@ def get_jammer_location(df: pd.DataFrame, env: str, verbose: bool = True) -> Dic
     lon_col = next((c for c in lon_cols if c in df.columns), None)
     
     if lat_col and lon_col:
-        # Get unique jammer location
+        # Get unique jammer location (should be same for all rows)
         jammer_lat = df[lat_col].iloc[0]
         jammer_lon = df[lon_col].iloc[0]
         
@@ -273,11 +211,7 @@ def latlon_to_enu(lat, lon, lat0_rad, lon0_rad):
 
 
 def estimate_gamma_from_data(positions, rssi, theta_true=None):
-    """Estimate path-loss parameters from data.
-
-    NOTE: theta_true must be provided in the *same ENU frame* as positions.
-    We do not default to (0,0) because ENU origin is receiver-centroid (neutral), not the jammer.
-    """
+    
     if theta_true is None:
         raise ValueError("theta_true is required (ENU coordinates of true jammer position).")
 
@@ -293,6 +227,52 @@ def estimate_gamma_from_data(positions, rssi, theta_true=None):
     gamma = np.clip(gamma, 1.5, 5.0)
     
     return P0, gamma, r_value**2
+
+
+def estimate_gamma_joint(positions, rssi, n_iterations=10, verbose=False):
+    # Initialize θ at receiver centroid (no oracle info)
+    theta = positions.mean(axis=0).copy()
+    
+    P0, gamma, r2 = 0.0, 2.0, 0.0
+    
+    for iteration in range(n_iterations):
+        # Step 1: Fix θ, estimate γ/P₀
+        distances = np.linalg.norm(positions - theta, axis=1)
+        distances = np.maximum(distances, 1.0)
+        log_d = np.log10(distances)
+        
+        slope, intercept, r_value, _, _ = stats.linregress(log_d, rssi)
+        P0 = intercept
+        gamma = np.clip(-slope / 10.0, 1.5, 5.0)
+        r2 = r_value ** 2
+        
+        # Step 2: Fix γ/P₀, update θ via L-BFGS
+        def loss_fn(theta_flat):
+            d = np.sqrt(((positions - theta_flat)**2).sum(axis=1) + 1.0)
+            rssi_pred = P0 - 10 * gamma * np.log10(d)
+            return ((rssi_pred - rssi)**2).mean()
+        
+        result = minimize(loss_fn, theta, method='L-BFGS-B', options={'maxiter': 50})
+        theta_new = result.x
+        
+        # Check convergence
+        delta = np.linalg.norm(theta_new - theta)
+        if verbose:
+            print(f"  Iteration {iteration+1}: θ moved {delta:.4f}m, R²={r2:.4f}")
+        
+        if delta < 0.01:
+            theta = theta_new
+            break
+        theta = theta_new
+    
+    # Final R² computation with converged θ
+    distances = np.linalg.norm(positions - theta, axis=1)
+    distances = np.maximum(distances, 1.0)
+    log_d = np.log10(distances)
+    _, _, r_value, _, _ = stats.linregress(log_d, rssi)
+    r2 = r_value ** 2
+    
+    return P0, gamma, r2, theta
 
 
 def set_seed(seed):
@@ -328,30 +308,11 @@ class PurePathLoss(nn.Module):
 
 
 class PureNN(nn.Module):
-    """Pure NN Model: Learns RSSI from relative position to theta (no physics equation).
-    
-    CRITICAL FOR LOCALIZATION: theta must be part of the forward pass!
-    The NN learns: RSSI = f(pos - theta, distance_to_theta)
-    This allows theta to receive gradients and be optimized.
-    
-    Unlike PurePathLoss, this model doesn't assume the path-loss equation.
-    Instead, it learns the RSSI-distance relationship purely from data.
-    
-    NOTE: This model ONLY uses the first 2 input dimensions (x, y positions).
-    Extra features (building_density, etc.) are IGNORED by design - the pure NN
-    should learn localization from position alone to test if physics is needed.
-    The input_dim parameter is kept for API consistency but not used.
-    """
     
     def __init__(self, input_dim, theta_init, hidden_dims=[64, 32]):
         super().__init__()
         self.theta = nn.Parameter(torch.tensor(theta_init, dtype=torch.float32))
         
-        # NOTE: input_dim is ignored - we only use position-derived features
-        # This is intentional: Pure NN should learn from position alone
-        
-        # NN input: relative position (x-θ_x, y-θ_y) + distance + log_distance
-        # This gives the NN all the information it needs to learn any distance relationship
         nn_input_dim = 4  # rel_x, rel_y, distance, log_distance
         
         layers = []
@@ -389,18 +350,6 @@ class PureNN(nn.Module):
 
 
 class APBM(nn.Module):
-    """Augmented Physics-Based Model: Physics + NN residual correction.
-    
-    KEY DESIGN: The NN learns a RESIDUAL correction on top of physics.
-    This ensures APBM >= Pure PL (NN can only help, not hurt).
-    
-    The NN receives the physics prediction as input, so it learns:
-    "Given the physics says X, what correction should I apply?"
-    
-    Final prediction = Physics + scale * tanh(NN_residual) * max_correction
-    
-    tanh bounds the correction, preventing wild predictions.
-    """
     
     def __init__(self, input_dim, theta_init, gamma_init=2.0, P0_init=-30.0, 
                  hidden_dims=[32, 16], max_correction=10.0):
@@ -505,18 +454,7 @@ def run_rssi_source_ablation(
     n_trials: int = 5,
     verbose: bool = True
 ) -> Dict:
-    """
-    RSSI Source Ablation: Proves Stage 1 predictions matter for localization.
-    
-    Compares localization with different RSSI sources:
-    - ORACLE: Ground truth RSSI (best possible)
-    - PREDICTED: Stage 1 output (your model)
-    - NOISY: Ground truth + Gaussian noise (simulates estimation error)
-    - SHUFFLED: Randomly permuted RSSI (breaks position correlation)
-    - CONSTANT: Mean RSSI (no distance information)
-    
-    Key Result: If Predicted << Shuffled, then Stage 1 predictions are useful!
-    """
+   
     os.makedirs(output_dir, exist_ok=True)
     
     # Load data
@@ -544,7 +482,7 @@ def run_rssi_source_ablation(
         if env is None:
             env = 'mixed'
             if verbose:
-                print("⚠ Could not infer environment from filename or df['env']; defaulting to 'mixed'. "
+                print(" Could not infer environment from filename or df['env']; defaulting to 'mixed'. "
                       "For exact results, pass env='open_sky'/'suburban'/'urban'/'lab_wired'.")
     
     if verbose:
@@ -556,22 +494,11 @@ def run_rssi_source_ablation(
     # Get jammer location (from data if available, else hardcoded)
     jammer_loc = get_jammer_location(df, env, verbose=verbose)
     
-    # =================================================================
-    # NEUTRAL REFERENCE FRAME (NOT oracle-centered)
-    # =================================================================
-    # Origin = centroid of RECEIVERS (not jammer!)
-    # This ensures the model must actually learn the jammer offset
-    # ENU reference frame will be computed after filtering jammed samples
-    # =================================================================
-    
     # Filter jammed samples
     if 'jammed' in df.columns:
         df = df[df['jammed'] == 1].copy()
 
-
-    # =================================================================
     # Convert to ENU (origin = receiver centroid of *jammed* samples)
-    # =================================================================
     lat0 = df['lat'].mean()
     lon0 = df['lon'].mean()
     lat0_rad = np.radians(lat0)
@@ -579,7 +506,7 @@ def run_rssi_source_ablation(
 
     df['x_enu'], df['y_enu'] = latlon_to_enu(df['lat'].values, df['lon'].values, lat0_rad, lon0_rad)
 
-    # True jammer in the SAME ENU frame 
+    # True jammer in the SAME ENU frame (neutral origin; not (0,0))
     jammer_x, jammer_y = latlon_to_enu(
         np.array([jammer_loc['lat']]),
         np.array([jammer_loc['lon']]),
@@ -753,9 +680,8 @@ def run_rssi_source_ablation(
     # Generate plot
     _plot_rssi_ablation(results, output_dir, env, verbose)
 
-    # -----------------------------------------------------------------
-    # Additional analytical plots (Stage-1-like & Stage-2-like diagnostics)
-    # -----------------------------------------------------------------
+    # plots:
+   
     try:
         # Stage 1 diagnostics: predicted vs true + residual distribution (if available)
         if pred_col:
@@ -800,20 +726,7 @@ def run_rssi_source_ablation(
 
 
 def _run_single_localization(positions, rssi, gamma, P0, theta_true, n_epochs=200, lr=0.5, n_starts=5, seed=42):
-    """Run single localization trial using scipy optimization.
-    
-    Args:
-        positions: Receiver positions in neutral ENU frame
-        rssi: RSSI measurements
-        gamma: Path loss exponent
-        P0: Reference power
-        theta_true: True jammer position in neutral ENU frame (NOT (0,0)!)
-        n_epochs: Max iterations
-        lr: Not used (scipy handles step size)
-    
-    Returns:
-        Localization error: ||theta_hat - theta_true||
-    """
+   
     X = positions.astype(np.float32)
     J = rssi.astype(np.float32)
     
@@ -936,42 +849,7 @@ def run_model_architecture_ablation(
     use_predicted_rssi: bool = False,  # NEW: Use predicted RSSI instead of ground truth
     verbose: bool = True
 ) -> Dict:
-    """
-    Model Architecture Ablation for JAMMER LOCALIZATION.
     
-    This ablation tests: "Which model architecture best estimates jammer position (θ)?"
-    
-    All models:
-    1. Take receiver positions + RSSI as input
-    2. Learn to predict RSSI by optimizing jammer position θ
-    3. Are evaluated by LOCALIZATION ERROR: ||θ_estimated - θ_true||
-    
-    Models Compared:
-    - Pure NN: RSSI = NN(pos - θ, distance) - learns from data only
-    - Pure PL: RSSI = P0 - 10γlog10(d) - physics equation only  
-    - APBM: RSSI = PL(d) + NN_correction - physics + learned residuals
-    
-    Key Features:
-    - Statistical significance testing (paired t-test)
-    - Low R² detection and warnings
-    - Multiple random initializations for robustness
-    - Proper confidence interval reporting
-    
-    Args:
-        input_csv: Path to input CSV file
-        output_dir: Output directory for results
-        environments: List of environments to test (default: open_sky, suburban, urban)
-        n_trials: Number of trials per model (default: 5)
-        n_inits: Random initializations per trial (default: 3)
-        use_predicted_rssi: If True, use predicted RSSI. If False (default), use
-                           ground truth RSSI for fair model comparison.
-        verbose: Print progress
-    
-    Expected Results:
-    - Open-sky: Pure PL ≈ APBM (simple physics works, γ≈2)
-    - Urban: APBM < Pure PL (NN captures multipath/NLOS effects)
-    - All: Pure NN worst (needs physics inductive bias)
-    """
     os.makedirs(output_dir, exist_ok=True)
     
     if environments is None:
@@ -992,9 +870,15 @@ def run_model_architecture_ablation(
     # Results structure
     results = {env: {} for env in environments}
     
+    # Models to test:
+    # - pure_nn: Pure neural network (no physics)
+    # - pure_pl_oracle: Pure path-loss with oracle γ/P₀ (diagnostic only)
+    # - pure_pl_joint: Pure path-loss with jointly estimated θ,γ,P₀ (deployable baseline)
+    # - apbm: Augmented physics-based model
     models = [
         ('pure_nn', 'Pure NN'),
-        ('pure_pl', 'Pure PL'),
+        ('pure_pl_oracle', 'Pure PL (oracle)'),
+        ('pure_pl_joint', 'Pure PL (joint)'),
         ('apbm', 'APBM')
     ]
     
@@ -1020,13 +904,6 @@ def run_model_architecture_ablation(
         gamma_env = GAMMA_ENV.get(env, 2.0)
         P0_env = P0_ENV.get(env, -30.0)
         
-        # =================================================================
-        # NEUTRAL REFERENCE FRAME (NOT oracle-centered)
-        # =================================================================
-        # Origin = centroid of RECEIVERS (not jammer!)
-        # This ensures the model must actually learn the jammer offset
-        # and doesn't get implicit oracle information from the frame
-        # =================================================================
         
         # Filter jammed samples first (ensures neutral frame reflects the jammed set)
         if 'jammed' in df_env.columns:
@@ -1058,18 +935,8 @@ def run_model_architecture_ablation(
             print(f"  Reference frame: receiver centroid (NEUTRAL)")
             print(f"  True jammer position: ({theta_true[0]:.1f}, {theta_true[1]:.1f}) m")
         
-        # =================================================================
-        # RSSI COLUMN SELECTION (CRITICAL FOR R² ACCURACY)
-        # =================================================================
-        # For MODEL ARCHITECTURE ablation, we want to test localization 
-        # ability, so we should use GROUND TRUTH RSSI ('RSSI') by default.
-        # Using predicted RSSI conflates Stage 1 errors with Stage 2 model.
-        #
-        # Priority depends on use_predicted_rssi parameter:
-        # - False (default): Ground truth first, then predicted as fallback
-        # - True: Predicted first, then ground truth as fallback
-        # =================================================================
         
+        # RSSI COLUMN SELECTION (CRITICAL FOR R² ACCURACY)
         # Check for ground truth RSSI first
         gt_rssi_col = 'RSSI' if 'RSSI' in df_env.columns else None
         pred_rssi_col = next((c for c in ['RSSI_pred_cal', 'RSSI_pred_final', 'RSSI_pred'] 
@@ -1097,7 +964,7 @@ def run_model_architecture_ablation(
                 if pred_rssi_col:
                     print(f"         (Predicted RSSI also available: '{pred_rssi_col}')")
             else:
-                print(f"  ⚠️  Using: PREDICTED RSSI ('{rssi_col}') - {'requested' if use_predicted_rssi else 'ground truth not available'}")
+                print(f"    Using: PREDICTED RSSI ('{rssi_col}') - {'requested' if use_predicted_rssi else 'ground truth not available'}")
                 if not use_predicted_rssi:
                     print(f"      R² will be lower due to Stage 1 prediction errors")
         
@@ -1128,11 +995,11 @@ def run_model_architecture_ablation(
             
             # Warn about low R²
             if r2 < 0.3:
-                print(f"  ⚠️  WARNING: Very low R²={r2:.3f} - path-loss model is a poor fit!")
+                print(f"    WARNING: Very low R²={r2:.3f} - path-loss model is a poor fit!")
                 print(f"      Physics-based models may not have advantage in this data.")
                 print(f"      Consider checking: jammer location, data quality, environment.")
             elif r2 < 0.5:
-                print(f"  ⚠️  NOTE: Moderate R²={r2:.3f} - results may have high variance.")
+                print(f"    NOTE: Moderate R²={r2:.3f} - results may have high variance.")
         
         # Add features for NN - more features help capture multipath effects
         X = positions.copy()
@@ -1167,11 +1034,6 @@ def run_model_architecture_ablation(
         
         # =================================================================
         # TRAIN/TEST SPLIT STRATEGY
-        # =================================================================
-        # Use a BASE split that's consistent, but also test with different
-        # splits to get proper variance estimates. The split seed varies
-        # slightly per trial to capture data variance while maintaining
-        # reproducibility.
         # =================================================================
         n = len(X)
         
@@ -1218,10 +1080,27 @@ def run_model_architecture_ablation(
                     # Create model
                     if model_key == 'pure_nn':
                         model = PureNN(X_train.shape[1], theta_init)
-                    elif model_key == 'pure_pl':
+                    elif model_key == 'pure_pl_oracle':
+                        # Oracle variant: uses γ/P₀ estimated from theta_true distances
+                        # This is diagnostic only - gives upper bound performance
                         model = PurePathLoss(theta_init, gamma_est, P0_est)
+                    elif model_key == 'pure_pl_joint':
+                        # Non-oracle variant: jointly estimates θ,γ,P₀ without oracle info
+                        # This is the deployable baseline for fair comparison
+                        P0_joint, gamma_joint, r2_joint, theta_joint = estimate_gamma_joint(
+                            positions, rssi, n_iterations=10
+                        )
+                        # Use the jointly estimated theta as initialization
+                        theta_init_joint = theta_joint.astype(np.float32)
+                        model = PurePathLoss(theta_init_joint, gamma_joint, P0_joint)
                     else:  # apbm
                         model = APBM(X_train.shape[1], theta_init, gamma_est, P0_est)
+                    
+                    # Determine model type for training
+                    if model_key in ['pure_pl_oracle', 'pure_pl_joint']:
+                        model_type = 'pure_pl'
+                    else:
+                        model_type = model_key
                     
                     # Train with model-specific approach
                     # Use more epochs for low R² scenarios
@@ -1230,7 +1109,7 @@ def run_model_architecture_ablation(
                         model, X_train, y_train, X_val, y_val,
                         theta_true=theta_true,  # Pass true jammer position for evaluation
                         n_epochs=n_epochs, patience=60,
-                        model_type=model_key
+                        model_type=model_type  # Use determined model_type, not model_key
                     )
                     
                     if loc_err < best_trial_error:
@@ -1305,9 +1184,9 @@ def run_model_architecture_ablation(
             
             print(f"  RSSI used: {rssi_used}")
             if r2_env < 0.3:
-                print(f"  ⚠️  R² = {r2_env:.3f} (POOR FIT - interpret with caution)")
+                print(f"    WARNING: R² = {r2_env:.3f} (POOR FIT - interpret with caution)")
             elif r2_env < 0.5:
-                print(f"  ⚠️  R² = {r2_env:.3f} (MODERATE FIT)")
+                print(f"    R² = {r2_env:.3f} (MODERATE FIT)")
             else:
                 print(f"  ✓ R² = {r2_env:.3f} (GOOD FIT)")
             
@@ -1413,7 +1292,7 @@ def run_model_architecture_ablation(
                 if best_model in ['apbm', 'pure_pl']:
                     print(f"✓ Suburban: {best_model.upper()} wins ({env_model_results[best_model]:.1f}m)")
                 elif best_model == 'pure_nn':
-                    print(f"⚠️  Suburban: Pure NN wins ({env_model_results['pure_nn']:.1f}m)")
+                    print(f" Suburban: Pure NN wins ({env_model_results['pure_nn']:.1f}m)")
                     print(f"    This is unexpected - check data quality (R²={r2_env:.2f})")
             
             elif env == 'lab_wired':
@@ -1443,14 +1322,14 @@ def run_model_architecture_ablation(
     _plot_model_ablation(results, environments, output_dir, verbose)
 
     # -----------------------------------------------------------------
-    # Additional analytical plots (Stage-2-like diagnostics)
+    # Additional plots 
     # -----------------------------------------------------------------
     try:
         _plot_model_ablation_detailed(results, environments, output_dir, verbose)
         _plot_model_r2_diagnostics(results, environments, output_dir, verbose)
     except Exception as e:
         if verbose:
-            print(f"  ⚠ Plotting diagnostics failed (non-fatal): {e}")
+            print(f"   Plotting diagnostics failed (non-fatal): {e}")
 
     
     return results
@@ -1458,19 +1337,7 @@ def run_model_architecture_ablation(
 
 def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300, patience=30, 
                  model_type='generic'):
-    """Train a localization model and return final localization error.
     
-    CRITICAL: Uses NEUTRAL reference frame evaluation.
-    - theta_true: True jammer position in neutral ENU frame (NOT (0,0)!)
-    - Localization error = ||theta_hat - theta_true||
-    
-    For APBM: Uses two-phase training:
-      Phase 1: Train physics parameters only (warmup) - matches Pure PL
-      Phase 2: Allow NN to learn residual corrections (only if it helps LOCALIZATION)
-    
-    KEY: We track localization error (distance to TRUE jammer), not just RSSI loss.
-    This ensures fair evaluation without oracle bias.
-    """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = model.to(device)
     
@@ -1481,26 +1348,32 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
     
     criterion = nn.HuberLoss(delta=1.5)
     
+    def get_val_mse():
+        """Get validation MSE - ORACLE-FREE metric for selection."""
+        model.eval()
+        with torch.no_grad():
+            val_pred = model(X_val_t)
+            return torch.nn.functional.mse_loss(val_pred, y_val_t).item()
+    
     def get_loc_error():
-        """Get current localization error: ||theta_hat - theta_true||
+        """Get localization error - EVALUATION ONLY, not for training decisions.
         
         Uses NEUTRAL reference frame where theta_true is NOT at origin.
-        This prevents oracle bias from jammer-centered coordinates.
         """
         theta_hat = model.get_theta()
         return np.linalg.norm(theta_hat - theta_true)
     
-    best_loc_error = float('inf')
+    best_val_mse = float('inf')
     best_state = None
     patience_counter = 0
     
     if model_type == 'apbm':
         # =====================================================================
-        # APBM TWO-PHASE TRAINING
+        # APBM TWO-PHASE TRAINING (Oracle-Free)
         # =====================================================================
         
         # PHASE 1: Physics-only warmup (150 epochs)
-        # This ensures we match Pure PL baseline
+        # Selection by val_mse, NOT loc_error
         physics_params = [model.theta, model.gamma, model.P0]
         physics_optimizer = torch.optim.Adam([
             {'params': [model.theta], 'lr': 0.3},
@@ -1517,10 +1390,10 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
             torch.nn.utils.clip_grad_norm_(physics_params, 1.0)
             physics_optimizer.step()
             
-            # Track by LOCALIZATION ERROR, not RSSI loss
-            loc_err = get_loc_error()
-            if loc_err < best_loc_error - 0.01:  # 1cm improvement
-                best_loc_error = loc_err
+            # Track by val_mse (NOT loc_error!)
+            val_mse = get_val_mse()
+            if val_mse < best_val_mse - 1e-4:
+                best_val_mse = val_mse
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         
         # L-BFGS refinement of physics params
@@ -1538,19 +1411,19 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
                 return loss
             lbfgs.step(closure)
             
-            loc_err = get_loc_error()
-            if loc_err < best_loc_error - 0.01:
-                best_loc_error = loc_err
+            val_mse = get_val_mse()
+            if val_mse < best_val_mse - 1e-4:
+                best_val_mse = val_mse
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         except:
             pass
         
         # Record physics-only best performance
-        physics_only_error = best_loc_error
+        physics_only_mse = best_val_mse
         physics_only_state = {k: v.clone() for k, v in best_state.items()} if best_state is not None else None
         
         # PHASE 2: Fine-tune with NN residuals (100 epochs)
-        # Only accept updates that IMPROVE localization
+        # Only accept updates that IMPROVE val_mse
         if best_state:
             model.load_state_dict(best_state)
         
@@ -1577,10 +1450,10 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             all_optimizer.step()
             
-            # Only save if LOCALIZATION improved
-            loc_err = get_loc_error()
-            if loc_err < best_loc_error - 0.01:
-                best_loc_error = loc_err
+            # Only save if val_mse improved (NOT loc_error!)
+            val_mse = get_val_mse()
+            if val_mse < best_val_mse - 1e-4:
+                best_val_mse = val_mse
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
@@ -1588,15 +1461,15 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
                 if patience_counter >= 30:
                     break
         
-        # CRITICAL: If NN didn't help, revert to physics-only
-        if best_loc_error >= physics_only_error - 0.01:
+        # CRITICAL: If NN didn't improve val_mse, revert to physics-only
+        if best_val_mse >= physics_only_mse - 1e-4:
             if physics_only_state is not None:
                 best_state = physics_only_state
-                best_loc_error = physics_only_error
+                best_val_mse = physics_only_mse
     
     elif model_type == 'pure_pl':
         # =====================================================================
-        # PURE PATH LOSS - Thorough optimization
+        # PURE PATH LOSS - (Oracle-Free)
         # =====================================================================
         optimizer = torch.optim.Adam([
             {'params': [model.theta], 'lr': 0.3},
@@ -1624,10 +1497,10 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
             
             scheduler.step(val_loss)
             
-            # Track localization error
-            loc_err = get_loc_error()
-            if loc_err < best_loc_error - 0.01:
-                best_loc_error = loc_err
+            # Track by val_mse (NOT loc_error!)
+            val_mse = get_val_mse()
+            if val_mse < best_val_mse - 1e-4:
+                best_val_mse = val_mse
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
@@ -1653,16 +1526,16 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
                 return loss
             lbfgs.step(closure)
             
-            loc_err = get_loc_error()
-            if loc_err < best_loc_error - 0.01:
-                best_loc_error = loc_err
+            val_mse = get_val_mse()
+            if val_mse < best_val_mse - 1e-4:
+                best_val_mse = val_mse
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         except:
             pass
     
     else:
         # =====================================================================
-        # STANDARD TRAINING (Pure NN)
+        # STANDARD TRAINING (Pure NN) - Oracle-Free
         # =====================================================================
         param_groups = []
         for name, param in model.named_parameters():
@@ -1684,9 +1557,10 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
-            loc_err = get_loc_error()
-            if loc_err < best_loc_error - 0.01:
-                best_loc_error = loc_err
+            # Track by val_mse (NOT loc_error!)
+            val_mse = get_val_mse()
+            if val_mse < best_val_mse - 1e-4:
+                best_val_mse = val_mse
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0
             else:
@@ -1712,9 +1586,9 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
                 return loss
             lbfgs.step(closure)
             
-            loc_err = get_loc_error()
-            if loc_err < best_loc_error - 0.01:
-                best_loc_error = loc_err
+            val_mse = get_val_mse()
+            if val_mse < best_val_mse - 1e-4:
+                best_val_mse = val_mse
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
         except:
             pass
@@ -1722,7 +1596,8 @@ def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300
     if best_state:
         model.load_state_dict(best_state)
     
-    # Return final localization error
+    # Return final localization error (for EVALUATION ONLY)
+    # Note: This was NOT used for any training decisions
     return get_loc_error()
 
 
@@ -1731,13 +1606,19 @@ def _plot_model_ablation(results: Dict, environments: List[str], output_dir: str
     try:
         import matplotlib.pyplot as plt
         
-        fig, ax = plt.subplots(figsize=(10, 6))
+        fig, ax = plt.subplots(figsize=(12, 6))
         
-        models = [('pure_nn', 'Pure NN'), ('pure_pl', 'Pure PL'), ('apbm', 'APBM')]
-        colors = ['#e74c3c', '#3498db', '#2ecc71']
+        # Updated model list with oracle and joint variants
+        models = [
+            ('pure_nn', 'Pure NN'),
+            ('pure_pl_oracle', 'Pure PL (oracle)†'),
+            ('pure_pl_joint', 'Pure PL (joint)'),
+            ('apbm', 'APBM')
+        ]
+        colors = ['#e74c3c', '#9b59b6', '#3498db', '#2ecc71']
         
         x = np.arange(len(environments))
-        width = 0.25
+        width = 0.2
         
         for i, (model_key, model_name) in enumerate(models):
             means = []
@@ -1782,7 +1663,7 @@ def _plot_model_ablation(results: Dict, environments: List[str], output_dir: str
 
 
 # ============================================================================
-# DIAGNOSTIC / ANALYTICAL PLOTS (Stage-1-like & Stage-2-like)
+# PLOTS 
 # ============================================================================
 
 def _plot_stage1_rssi_quality(
@@ -1793,15 +1674,7 @@ def _plot_stage1_rssi_quality(
     pred_col_name: str = "RSSI_pred",
     verbose: bool = True
 ):
-    """
-    Publication-quality Stage 1 diagnostics.
     
-    Creates:
-    1. Predicted vs True scatter with regression line and metrics
-    2. Residual distribution histogram with normal fit
-    
-    Saves: stage1_pred_vs_true_<env>.{png,pdf}, stage1_residual_hist_<env>.{png,pdf}
-    """
     try:
         import matplotlib.pyplot as plt
         from matplotlib.patches import Patch
@@ -1924,14 +1797,7 @@ def _plot_pathloss_fit(
     label: str = "oracle",
     verbose: bool = True
 ):
-    """
-    Publication-quality path-loss fit visualization.
     
-    Shows RSSI vs log-distance with fitted line, confidence bands, and R².
-    Visually explains why ablation works.
-    
-    Saves: pathloss_fit_<label>_<env>.{png,pdf}
-    """
     try:
         import matplotlib.pyplot as plt
         
@@ -2012,16 +1878,7 @@ def _plot_pathloss_fit(
 
 
 def _plot_rssi_ablation_detailed(results: Dict, output_dir: str, env: str, verbose: bool = True):
-    """
-    Publication-quality RSSI ablation analysis plots.
-    
-    Creates:
-    1. Box plot showing distribution across trials (colored by condition)
-    2. CDF comparison with significance markers
-    3. Bar chart with statistical significance annotations
-    
-    Saves: rssi_ablation_{box,cdf,bar}_<env>.{png,pdf}
-    """
+   
     try:
         import matplotlib.pyplot as plt
         from matplotlib.lines import Line2D
@@ -2194,7 +2051,13 @@ def _plot_model_ablation_detailed(results: Dict, environments: List[str], output
         _setup_thesis_style()
         os.makedirs(output_dir, exist_ok=True)
         
-        models = [('pure_nn', 'Pure NN'), ('pure_pl', 'Pure PL'), ('apbm', 'APBM')]
+        # Updated model list with oracle and joint variants
+        models = [
+            ('pure_nn', 'Pure NN'),
+            ('pure_pl_oracle', 'Pure PL (oracle)†'),
+            ('pure_pl_joint', 'Pure PL (joint)'),
+            ('apbm', 'APBM')
+        ]
         envs = [e for e in environments if e in results and results[e]]
         
         if not envs:
@@ -2282,14 +2145,7 @@ def _plot_model_ablation_detailed(results: Dict, environments: List[str], output
 
 
 def _plot_model_r2_diagnostics(results: Dict, environments: List[str], output_dir: str, verbose: bool = True):
-    """
-    Publication-quality R² vs Error diagnostic plot.
     
-    Shows relationship between path-loss fit quality and best localization performance.
-    Helps explain when physics-based models win.
-    
-    Saves: model_r2_vs_error.{png,pdf}
-    """
     try:
         import matplotlib.pyplot as plt
         from matplotlib.patches import Patch
@@ -2379,7 +2235,7 @@ def _plot_model_r2_diagnostics(results: Dict, environments: List[str], output_di
             Patch(facecolor=MODEL_COLORS['pure_pl'], edgecolor='black', label='Pure PL wins'),
             Patch(facecolor=MODEL_COLORS['apbm'], edgecolor='black', label='APBM wins'),
         ]
-        ax.legend(handles=legend_elements, loc='upper left', title='Best Model')
+        ax.legend(handles=legend_elements, loc='upper right', title='Best Model')
         
         ax.set_xlim(0, 1)
         ax.set_ylim(bottom=0, top=y_max)
@@ -2505,7 +2361,7 @@ if __name__ == "__main__":
 
 
 # ============================================================================
-# BACKWARD COMPATIBILITY - Legacy function aliases
+# BACKWARD COMPATIBILITY 
 # ============================================================================
 
 # Alias for legacy --ablation and --comprehensive-ablation flags
@@ -2518,10 +2374,7 @@ def run_comprehensive_rssi_ablation(
     verbose: bool = True,
     **kwargs
 ) -> Dict:
-    """
-    Legacy comprehensive RSSI ablation.
-    Wraps run_rssi_source_ablation for backward compatibility.
-    """
+    
     return run_rssi_source_ablation(
         input_csv=input_csv,
         output_dir=output_dir,

@@ -1,25 +1,6 @@
 """
 Configuration Module for Jammer Localization
 =============================================
-
-Centralized hyperparameters and experiment settings using dataclass.
-Supports YAML configuration loading for reproducible experiments.
-
-Two configuration classes:
-- RSSIConfig: Stage 1 (RSSI estimation from AGC/CN0)
-- Config: Stage 2 (Localization from RSSI)
-
-FIXES APPLIED for proper FL performance ranking (SCAFFOLD > FedProx ≈ FedAvg on non-IID):
-- FedProx mu reduced to fair value (0.01)
-- Theta aggregation uses geometric_median for robustness
-- FL warmup rounds increased for SCAFFOLD control variate buildup
-- Global rounds increased to give SCAFFOLD time to converge
-- Early stopping patience increased
-
-CRITICAL FIX (January 2026):
-- SCAFFOLD was showing MSE↓ but loc_error constant (θ frozen)
-- Root cause: Single LR caused NN to learn faster than θ
-- Fix: Hybrid SCAFFOLD with separate θ optimizer (5x LR, no control variates)
 """
 
 from dataclasses import dataclass, field
@@ -97,6 +78,122 @@ def get_gamma_init(environment: str) -> float:
 def get_P0_init(environment: str) -> float:
     """Get recommended P0 initialization for an environment."""
     return P0_INIT_ENV.get(environment, -32.0)
+
+
+# AUTO-TUNED FL PROFILES (Environment × Partition Strategy)
+
+FL_TUNING_PROFILES: Dict[str, Dict[str, Dict[str, float]]] = {
+    # Distance-based partitioning
+    "distance": {
+        "__default__": {
+            "lr_fl": 0.005,
+            "local_epochs": 3,
+            "global_rounds": 180,
+            "fl_warmup_rounds": 5,
+            "fl_early_stopping_patience": 30,
+            "scaffold_physics_lr_mult": 0.5,
+            "scaffold_nn_lr_mult": 0.1,
+            "scaffold_local_epochs_multiplier": 1.0,
+        },
+        "suburban": {"scaffold_theta_lr_mult": 0.2},
+        "open_sky": {"scaffold_theta_lr_mult": 0.3},
+        "urban": {"scaffold_theta_lr_mult": 0.2},
+        "lab_wired": {"scaffold_theta_lr_mult": 0.6},
+        "mixed": {"scaffold_theta_lr_mult": 0.6},
+    },
+
+    # Device-based partitioning
+    "device": {
+        "__default__": {
+            "lr_fl": 0.005,
+            "local_epochs": 3,
+            "global_rounds": 170,
+            "fl_warmup_rounds": 5,
+            "fl_early_stopping_patience": 25,
+            "scaffold_physics_lr_mult": 0.5,
+            "scaffold_nn_lr_mult": 0.1,
+            "scaffold_local_epochs_multiplier": 1.0,
+            "scaffold_theta_lr_mult": 0.7,
+        },
+        "suburban": {"scaffold_theta_lr_mult": 0.2},
+        "open_sky": {"scaffold_theta_lr_mult": 0.2},
+        "urban": {"scaffold_theta_lr_mult": 0.4},
+        "lab_wired": {"scaffold_theta_lr_mult": 0.2},
+        "mixed": {"scaffold_theta_lr_mult": 0.7},
+    },
+
+    # Signal-strength partitioning
+    "signal_strength": {
+        "__default__": {
+            "lr_fl": 0.0045,
+            "local_epochs": 3,
+            "global_rounds": 170,
+            "fl_warmup_rounds": 5,
+            "fl_early_stopping_patience": 25,
+            "scaffold_physics_lr_mult": 0.5,
+            "scaffold_nn_lr_mult": 0.08,   
+            "scaffold_local_epochs_multiplier": 1.0,
+            "scaffold_theta_lr_mult": 0.6,
+        },
+        "suburban": {"scaffold_theta_lr_mult": 0.4},
+        "open_sky": {"scaffold_theta_lr_mult": 0.4},
+        "urban": {"scaffold_theta_lr_mult": 0.2},
+        "lab_wired": {"scaffold_theta_lr_mult": 0.2},
+        "mixed": {"scaffold_theta_lr_mult": 0.6},
+    },
+
+    # Geographic partitioning
+    "geographic": {
+        "__default__": {
+            "lr_fl": 0.005,
+            "local_epochs": 3,
+            "global_rounds": 160,
+            "fl_warmup_rounds": 5,
+            "fl_early_stopping_patience": 20,
+            "scaffold_physics_lr_mult": 0.5,
+            "scaffold_nn_lr_mult": 0.1,
+            "scaffold_local_epochs_multiplier": 1.0,
+            "scaffold_theta_lr_mult": 0.2,
+        },
+        
+        "suburban": {"scaffold_theta_lr_mult": 0.1},
+        "open_sky": {"scaffold_theta_lr_mult": 0.2},
+        "urban": {"scaffold_theta_lr_mult": 0.2},
+        "lab_wired": {"scaffold_theta_lr_mult": 0.2},
+        "mixed": {"scaffold_theta_lr_mult": 0.6},
+        
+    },
+
+    # Random/IID
+    "random": {
+        "__default__": {
+            "lr_fl": 0.005,
+            "local_epochs": 3,
+            "global_rounds": 120,
+            "fl_warmup_rounds": 5,
+            "fl_early_stopping_patience": 15,
+            "scaffold_physics_lr_mult": 0.5,
+            "scaffold_nn_lr_mult": 0.1,
+            "scaffold_local_epochs_multiplier": 1.0,
+            "scaffold_theta_lr_mult": 0.4,
+        },
+        "suburban": {"scaffold_theta_lr_mult": 0.4},
+        "open_sky": {"scaffold_theta_lr_mult": 0.2},
+        "urban": {"scaffold_theta_lr_mult": 0.2},
+        "lab_wired": {"scaffold_theta_lr_mult": 0.2},
+        "mixed": {"scaffold_theta_lr_mult": 0.6},
+        
+    },
+}
+
+def get_fl_tuning_profile(environment: str, partition_strategy: str) -> Dict[str, float]:
+    """Return the merged FL tuning profile for (environment, partition_strategy)."""
+    env = (environment or "mixed").lower()
+    part = (partition_strategy or "geographic").lower()
+    bucket = FL_TUNING_PROFILES.get(part, {})
+    base = dict(bucket.get("__default__", {}))
+    base.update(bucket.get(env, {}))
+    return base
 
 
 # ==================== Stage 1: RSSI Estimation Config ====================
@@ -212,17 +309,6 @@ rssi_cfg = RSSIConfig()
 
 @dataclass
 class Config:
-    """
-    Configuration for Stage 2 (Jammer Localization).
-    
-    FIXED: Hyperparameters tuned for proper performance ranking on non-IID data:
-    - Centralized > SCAFFOLD > FedProx ≈ FedAvg
-    
-    Key changes for SCAFFOLD to win:
-    - FedProx mu reduced to fair value
-    - Theta aggregation uses geometric_median
-    - More global rounds and patience for SCAFFOLD
-    """
 
     # ==================== Environment ====================
     environment: str = "urban"
@@ -277,7 +363,7 @@ class Config:
 
     # ==================== CENTRALIZED TRAINING ====================
     batch_size: int = 32
-    epochs: int = 800
+    epochs: int = 200
 
     # Learning rates
     lr_theta: float = 0.015
@@ -315,11 +401,11 @@ class Config:
     min_samples_per_client: int = 10
 
     # Data partitioning - distance creates strong non-IID (SCAFFOLD's advantage)
-    partition_strategy: str = "distance"
+    partition_strategy: str = "signal_strength"  # Options: random, geographic, signal_strength, device, distance
 
     # FL training - more rounds for SCAFFOLD to converge
     local_epochs: int = 3
-    global_rounds: int = 100  # INCREASED from 80
+    global_rounds: int = 150  # INCREASED from 80
 
     # FL warmup (physics-only rounds) - REDUCED: θ now moves from round 1 with hybrid SCAFFOLD
     fl_warmup_rounds: int = 5
@@ -334,21 +420,45 @@ class Config:
     # FedProx settings - FIXED: fair comparison (was artificially hurting FedProx)
     fedprox_mu: float = 0.01  # REDUCED from 0.05 to fair value
 
-    # Theta aggregation 
-    theta_aggregation: str = "mean"  # CHANGED from "geometric_median"
+    # Theta aggregation - FIXED: geometric_median is more robust for non-IID
+    theta_aggregation: str = "geometric_median"  
 
-    # ==================== FL Early Stopping ====================
+    # ==================== FL Early Stopping (Oracle-Free) ====================
+    # All decisions use val_loss ONLY - never loc_error
     fl_early_stopping_enabled: bool = True
-    fl_early_stopping_patience: int = 25  # INCREASED from 15 for SCAFFOLD
-    fl_early_stopping_min_delta: float = 0.05  # 5cm threshold
-    fl_divergence_threshold: float = 2.0  # INCREASED from 1.5 - SCAFFOLD can recover
-    fl_max_error: float = 100.0
+    fl_early_stopping_patience: int = 15  # Rounds without improvement
+    fl_early_stopping_min_delta: float = 0.1  # Minimum improvement threshold
+    fl_divergence_threshold: float = 3.0  # FIXED: Less trigger-happy (was 2.0)
+    fl_consecutive_divergence: int = 2    # NEW: Require 2 consecutive bad rounds
+    # NOTE: fl_max_error REMOVED - was oracle-based!
     
     # ==================== SCAFFOLD Tuning Parameters ====================
-    # These control the hybrid SCAFFOLD behavior
-    scaffold_theta_lr_mult: float = 2.0   # θ LR = base_lr × this (conservative)
-    scaffold_physics_lr_mult: float = 1.0  # P0/γ LR = base_lr × this (same as base)
-    # Note: local_epochs_multiplier is set in server.py _get_algorithm_config()
+    # These control the hybrid SCAFFOLD behavior.
+    #
+    # NOTE: scaffold_physics_lr_mult is the *default* multiplier for P0/gamma
+    # in client.py (unless you explicitly set scaffold_P0_lr_mult / scaffold_gamma_lr_mult).
+    scaffold_theta_lr_mult: float = 0.6
+    scaffold_physics_lr_mult: float = 0.5
+
+    # Optional explicit physics multipliers (override scaffold_physics_lr_mult when not None)
+    scaffold_P0_lr_mult: Optional[float] = None
+    scaffold_gamma_lr_mult: Optional[float] = None
+
+    # Controlled block multipliers (NN + w) for SCAFFOLD
+    scaffold_nn_lr_mult: float = 0.1
+    scaffold_w_lr_mult: Optional[float] = None  # if None, follows scaffold_nn_lr_mult
+
+    # SGD hyperparams for the controlled block
+    scaffold_sgd_momentum: float = 0.0
+    scaffold_sgd_nesterov: bool = False
+
+    # Optional local-epochs multiplier used by server.py for SCAFFOLD (best-practice knob)
+    scaffold_local_epochs_multiplier: float = 1.0
+
+    # Auto-tuning (env × partition) to pick sensible defaults
+    auto_tune_fl_by_env_partition: bool = True
+    print_fl_profile_on_start: bool = True
+
 
     # ==================== Device and Reproducibility ====================
     seed: int = 42
@@ -373,6 +483,10 @@ class Config:
         assert self.environment in valid_envs
 
         self._update_from_environment()
+        
+        # Apply (env × partition) FL profile after env defaults are set
+        self.apply_fl_profile(force=False, verbose=False)
+
 
     def _update_from_environment(self):
         """Update settings based on environment."""
@@ -398,11 +512,49 @@ class Config:
         self.environment = environment
         self._update_from_environment()
 
+        # Apply (env × partition) FL profile after env defaults are set
+        self.apply_fl_profile(force=False, verbose=False)
+
+
     def get_device(self) -> torch.device:
         return torch.device(self.device)
 
     def get_jammer_location(self) -> tuple:
         return self.jammer_lat, self.jammer_lon
+
+
+    def apply_fl_profile(self, force: bool = False, verbose: bool = False) -> Dict[str, float]:
+        
+        if not (force or getattr(self, "auto_tune_fl_by_env_partition", True)):
+            return {}
+
+        profile = get_fl_tuning_profile(self.environment, self.partition_strategy)
+
+        # Apply known keys only (avoid typos silently changing behavior)
+        for k, v in profile.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
+
+        # If scaffold_w_lr_mult not set, align it to scaffold_nn_lr_mult
+        if getattr(self, "scaffold_w_lr_mult", None) is None:
+            self.scaffold_w_lr_mult = float(getattr(self, "scaffold_nn_lr_mult", 0.1))
+
+        if verbose or getattr(self, "print_fl_profile_on_start", False):
+            print("\n" + "=" * 70)
+            print("AUTO-TUNED FL PROFILE (env × partition)")
+            print("=" * 70)
+            print(f"environment       : {self.environment}")
+            print(f"partition_strategy: {self.partition_strategy}")
+            for k in sorted(profile.keys()):
+                print(f"  {k}: {getattr(self, k)}")
+            print("=" * 70 + "\n")
+
+        return profile
+
+    def set_partition_strategy(self, partition_strategy: str):
+        """Change the FL partition strategy and re-apply the FL tuning profile."""
+        self.partition_strategy = partition_strategy
+        self.apply_fl_profile(force=True, verbose=False)
 
     def get_environment_info(self) -> dict:
         return {

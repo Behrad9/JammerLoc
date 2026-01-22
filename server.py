@@ -1,37 +1,7 @@
 """
 Server Module for Federated Learning
 =====================================
-
-Orchestrates federated learning process:
-- Coordinates client training rounds
-- Aggregates model updates
-- Manages global model
-- Tracks training progress
-- Implements early stopping for FL algorithms
-
-CRITICAL FIX APPLIED (January 2026):
-=====================================
-SCAFFOLD was showing MSE↓ but loc_error constant. Root cause: single learning
-rate caused NN to learn faster than θ, making θ effectively frozen.
-
-FIX: Client now uses hybrid SCAFFOLD:
-- θ: Separate optimizer with HIGHER LR, NO control variates  
-- NN: SCAFFOLD with control variates
-
-Server changes:
-- Control variates now only cover NN params
-- Added θ movement logging for debugging
-- Updated algorithm configs
-
-AGGREGATION METHODOLOGY:
-========================
-The FL aggregation uses a TWO-STEP approach:
-1. FedAvg on ALL parameters (including theta)
-2. REPLACE theta with robust aggregation (geometric median)
-
-This is intentional because:
-- FedAvg works well for NN parameters
-- Theta benefits from robust aggregation (outlier resistance)
+Orchestrates federated learning process
 """
 
 import numpy as np
@@ -59,37 +29,39 @@ from client import ClientManager
 
 @dataclass
 class FLEarlyStoppingConfig:
-    """Configuration for FL early stopping."""
     
     patience: int = 15
     min_delta: float = 0.1
-    divergence_threshold: float = 1.5
-    max_error: float = 50.0
-    warmup_rounds: int = 10
-    monitor: str = 'val_loss'  # Use val_loss to avoid oracle bias (not loc_error)
+    divergence_threshold: float = 3.0  # Less trigger-happy for oracle-free
+    warmup_rounds: int = 5             # FIXED: Same for all algorithms
+    monitor: str = 'val_loss'          # Use val_loss to avoid oracle bias
     enabled: bool = True
+    consecutive_divergence: int = 2    # Require 2 consecutive bad rounds
 
 
 class FLEarlyStopping:
-    """Early stopping handler for Federated Learning."""
     
     def __init__(self, config: Optional[FLEarlyStoppingConfig] = None):
         self.config = config or FLEarlyStoppingConfig()
         self.reset()
     
     def reset(self):
-        self.best_error = float('inf')
-        self.best_loss = float('inf')
+        self.best_val_loss = float('inf')
         self.best_round = 0
         self.rounds_without_improvement = 0
+        self.consecutive_divergence_count = 0  # NEW: track consecutive divergence
         self.history: List[dict] = []
         self.stopped = False
         self.stop_reason = ""
+        # Track loc_error for reporting only (not used for decisions)
+        self.best_loc_error_at_best_val = float('inf')
     
     def check(self, round: int, loc_error: float, val_loss: float = None) -> Tuple[bool, str]:
+        
         if not self.config.enabled:
-            if loc_error < self.best_error:
-                self.best_error = loc_error
+            if val_loss is not None and val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.best_loc_error_at_best_val = loc_error
                 self.best_round = round
             return False, ""
         
@@ -99,73 +71,74 @@ class FLEarlyStopping:
             'val_loss': val_loss
         })
         
-        if self.config.monitor == 'loc_error':
-            current = loc_error
-            best = self.best_error
-        else:
-            current = val_loss if val_loss is not None else loc_error
-            best = self.best_loss if val_loss is not None else self.best_error
+        # Use val_loss for all decisions (oracle-free)
+        if val_loss is None:
+            return False, ""  # Can't make decision without val_loss
+        
+        current = val_loss
+        best = self.best_val_loss
 
-        # Warmup period
+        # Warmup period - no stopping, just track
         if round < self.config.warmup_rounds:
-            if loc_error > self.config.max_error:
-                self.stopped = True
-                self.stop_reason = f"Max error exceeded: {loc_error:.2f}m > {self.config.max_error}m"
-                return True, self.stop_reason
+            if val_loss < self.best_val_loss:
+                self.best_val_loss = val_loss
+                self.best_loc_error_at_best_val = loc_error
+                self.best_round = round
             return False, ""
 
-        # Check for improvement
-        if best == float('inf'):
-            improved = True
-        else:
-            improved = current < (best - self.config.min_delta)
+        # Check for improvement (based on val_loss only)
+        improved = current < (best - self.config.min_delta)
 
         if improved:
-            self.best_error = min(self.best_error, loc_error)
-            if val_loss is not None:
-                self.best_loss = min(self.best_loss, val_loss)
+            self.best_val_loss = val_loss
+            self.best_loc_error_at_best_val = loc_error
             self.best_round = round
             self.rounds_without_improvement = 0
+            self.consecutive_divergence_count = 0  # Reset divergence counter on improvement
         else:
             self.rounds_without_improvement += 1
 
-        # Divergence detection
-        if self.best_error > 0 and loc_error > self.best_error * self.config.divergence_threshold:
-            self.stopped = True
-            self.stop_reason = f"Divergence: {loc_error:.2f}m > {self.best_error:.2f}m × {self.config.divergence_threshold}"
-            return True, self.stop_reason
+        # Divergence detection (based on val_loss, requires consecutive rounds)
+        divergence_threshold = self.config.divergence_threshold
+        consecutive_required = getattr(self.config, 'consecutive_divergence', 2)
         
-        # Max error
-        if loc_error > self.config.max_error:
-            self.stopped = True
-            self.stop_reason = f"Max error exceeded: {loc_error:.2f}m > {self.config.max_error}m"
-            return True, self.stop_reason
+        if self.best_val_loss > 0 and val_loss > self.best_val_loss * divergence_threshold:
+            self.consecutive_divergence_count += 1
+            if self.consecutive_divergence_count >= consecutive_required:
+                self.stopped = True
+                self.stop_reason = f"Divergence: val_loss {val_loss:.4f} > {self.best_val_loss:.4f} × {divergence_threshold} for {consecutive_required} consecutive rounds"
+                return True, self.stop_reason
+        else:
+            self.consecutive_divergence_count = 0  # Reset if not diverging
         
         # Patience exhausted
         if self.rounds_without_improvement >= self.config.patience:
             self.stopped = True
-            self.stop_reason = f"No improvement for {self.config.patience} rounds (best: {self.best_error:.2f}m at round {self.best_round + 1})"
+            self.stop_reason = f"No improvement for {self.config.patience} rounds (best val_loss: {self.best_val_loss:.4f} at round {self.best_round + 1})"
             return True, self.stop_reason
         
         return False, ""
     
     def get_best(self) -> Tuple[int, float]:
-        return self.best_round, self.best_error
+        """Return (best_round, best_loc_error_at_best_val)."""
+        return self.best_round, self.best_loc_error_at_best_val
     
     def get_summary(self) -> dict:
         if not self.history:
             return {}
         
-        errors = [h['loc_error'] for h in self.history]
+        val_losses = [h['val_loss'] for h in self.history if h['val_loss'] is not None]
+        loc_errors = [h['loc_error'] for h in self.history]
+        
         return {
             'best_round': self.best_round,
-            'best_error': self.best_error,
-            'final_error': errors[-1] if errors else float('inf'),
+            'best_val_loss': self.best_val_loss,
+            'best_loc_error': self.best_loc_error_at_best_val,
+            'final_val_loss': val_losses[-1] if val_losses else float('inf'),
+            'final_loc_error': loc_errors[-1] if loc_errors else float('inf'),
             'total_rounds': len(self.history),
             'early_stopped': self.stopped,
             'stop_reason': self.stop_reason,
-            'degradation_pct': ((errors[-1] - self.best_error) / self.best_error * 100 
-                               if self.best_error > 0 and errors else 0),
         }
 
 
@@ -174,14 +147,7 @@ class FLEarlyStopping:
 # =============================================================================
 
 class Server:
-    """
-    Federated Learning Server.
-
-    Orchestrates the FL process: client coordination, aggregation, evaluation.
-
-    CRITICAL FIX: Now supports hybrid SCAFFOLD where θ is trained separately.
-    """
-
+    
     def __init__(
         self,
         global_model: nn.Module,
@@ -201,18 +167,19 @@ class Server:
         self.val_loader = val_loader
         self.test_loader = test_loader
 
-        # SCAFFOLD server control variate (for NN params only now)
+        # SCAFFOLD server control variate (covers NN + w, excludes theta/P0/gamma)
         self.c_server: Optional[torch.Tensor] = None
 
-        # Early stopping
+        # Early stopping - uses val_loss ONLY (oracle-free)
+        # All algorithms use the same settings for fair comparison
         if early_stopping_config is None:
             early_stopping_config = FLEarlyStoppingConfig(
                 patience=getattr(self.config, 'fl_early_stopping_patience', 15),
                 min_delta=getattr(self.config, 'fl_early_stopping_min_delta', 0.1),
-                divergence_threshold=getattr(self.config, 'fl_divergence_threshold', 1.5),
-                warmup_rounds=getattr(self.config, 'fl_warmup_rounds', 10),
-                max_error=getattr(self.config, 'fl_max_error', 50.0),
+                divergence_threshold=getattr(self.config, 'fl_divergence_threshold', 3.0),
+                warmup_rounds=getattr(self.config, 'fl_warmup_rounds', 5),  # FIXED: 5 for all
                 enabled=getattr(self.config, 'fl_early_stopping_enabled', True),
+                consecutive_divergence=getattr(self.config, 'fl_consecutive_divergence', 2),
             )
         self.early_stopping_config = early_stopping_config
         self.early_stopper: Optional[FLEarlyStopping] = None
@@ -247,7 +214,7 @@ class Server:
         else:
             self.theta_true = None
             print("="*60)
-            print("⚠️  WARNING: theta_true not provided to Server")
+            print(" WARNING: theta_true not provided to Server")
             print("="*60)
             print("Localization error will be reported as 'inf'.")
             print("="*60)
@@ -281,28 +248,36 @@ class Server:
             )
 
     def update_scaffold_control(self, client_delta_c: List[torch.Tensor]):
-        """
-        Update SCAFFOLD server control variate.
         
-        NOTE: Now only covers NN parameters (θ excluded from control variates).
-        """
-        # Get NN param vector size from first valid delta
-        valid_deltas = [dc for dc in client_delta_c if dc is not None]
-        
-        if not valid_deltas:
+        # Pair deltas with client weights (ignore warmup/None deltas)
+        weighted = [
+            (float(w), dc)
+            for w, dc in zip(self.client_manager.client_weights, client_delta_c)
+            if dc is not None
+        ]
+
+        if not weighted:
             return
-        
+
         # Initialize c_server if needed
         if self.c_server is None:
-            self.c_server = torch.zeros_like(valid_deltas[0])
-        
-        # Average the deltas
-        delta_c_avg = torch.zeros_like(self.c_server)
-        for dc in valid_deltas:
-            delta_c_avg += dc.to(self.c_server.device)
-        delta_c_avg /= len(valid_deltas)
+            self.c_server = torch.zeros_like(weighted[0][1])
 
-        # Update server control variate
+        # Weighted aggregation of client delta_c
+        # This is the proper SCAFFOLD update: c_server += weighted_avg(delta_c)
+        delta_c_weighted_sum = torch.zeros_like(self.c_server)
+        total_weight = 0.0
+
+        for w, dc in weighted:
+            delta_c_weighted_sum += w * dc.to(self.c_server.device)
+            total_weight += w
+
+        # Normalize by total weight (handles partial participation correctly)
+        if total_weight > 0:
+            delta_c_avg = delta_c_weighted_sum / total_weight
+        else:
+            delta_c_avg = delta_c_weighted_sum
+
         self.c_server = self.c_server + delta_c_avg
 
     def evaluate(self, loader: DataLoader) -> float:
@@ -335,33 +310,39 @@ class Server:
         return self.global_model.get_theta().detach().cpu().numpy()
 
     def _get_algorithm_config(self, algo: str) -> dict:
-        """
-        Get algorithm-specific configuration.
         
-        FIXED: SCAFFOLD now works properly with hybrid θ training.
-        """
+        warmup = int(getattr(self.config, "fl_warmup_rounds", 5))
+        div_th = float(getattr(self.config, "fl_divergence_threshold", 3.0))
+
+        # Optional per-algo patience knobs (if not present, keep legacy defaults)
+        p_fedavg = int(getattr(self.config, "fl_patience_fedavg", 20))
+        p_fedprox = int(getattr(self.config, "fl_patience_fedprox", 20))
+        p_scaffold = int(getattr(self.config, "fl_patience_scaffold", 30))
+
+        # Optional SCAFFOLD local-epochs multiplier (profile-controlled)
+        scaffold_e_mult = float(getattr(self.config, "scaffold_local_epochs_multiplier", 1.0))
+
         configs = {
             "fedavg": {
                 "lr_multiplier": 1.0,
                 "local_epochs_multiplier": 1.0,
-                "patience": 20,
-                "divergence_threshold": 2.0,
-                "warmup_rounds": 5,
+                "patience": p_fedavg,
+                "divergence_threshold": div_th,
+                "warmup_rounds": warmup,
             },
             "fedprox": {
                 "lr_multiplier": 1.0,
                 "local_epochs_multiplier": 1.0,
-                "patience": 20,
-                "divergence_threshold": 2.0,
-                "warmup_rounds": 5,
+                "patience": p_fedprox,
+                "divergence_threshold": div_th,
+                "warmup_rounds": warmup,
             },
             "scaffold": {
-                # Conservative settings for consistent results
                 "lr_multiplier": 1.0,
-                "local_epochs_multiplier": 1.0,  # Same as FedAvg/FedProx for fair comparison
-                "patience": 30,
-                "divergence_threshold": 2.0,  # Same as others
-                "warmup_rounds": 10,
+                "local_epochs_multiplier": scaffold_e_mult,
+                "patience": p_scaffold,
+                "divergence_threshold": div_th,
+                "warmup_rounds": warmup,
             },
         }
         return configs.get(algo, configs["fedavg"])
@@ -374,8 +355,8 @@ class Server:
             min_delta=self.early_stopping_config.min_delta,
             divergence_threshold=algo_config["divergence_threshold"],
             warmup_rounds=algo_config.get("warmup_rounds", self.early_stopping_config.warmup_rounds),
-            max_error=self.early_stopping_config.max_error,
             enabled=self.early_stopping_config.enabled,
+            consecutive_divergence=self.early_stopping_config.consecutive_divergence,
         )
 
     def train(
@@ -383,13 +364,15 @@ class Server:
         algo: str = "fedavg",
         global_rounds: int = 80,
         local_epochs: int = 2,
-        warmup_rounds: int = 10,
+        warmup_rounds: int = 5,  # FIXED: Default to 5 (same for all algorithms)
         verbose: bool = True,
     ) -> Dict[str, Any]:
         """Execute full federated training with early stopping."""
         algo_config = self._get_algorithm_config(algo)
         
-        effective_warmup = max(warmup_rounds, algo_config.get("warmup_rounds", 5))
+        # Use algo_config warmup if specified, otherwise use the passed value
+        # This ensures all algorithms get the same warmup (5) by default
+        effective_warmup = algo_config.get("warmup_rounds", warmup_rounds)
         
         if verbose:
             print("\n" + "=" * 60)
@@ -629,6 +612,15 @@ def run_federated_experiment(
 
     if config is None:
         config = cfg
+    # Apply (env × partition) profile if available (oracle-free: uses only env+partition keys)
+    if hasattr(config, "apply_fl_profile"):
+        # verbose printing is controlled by config.print_fl_profile_on_start
+        try:
+            config.apply_fl_profile(force=False, verbose=verbose)
+        except TypeError:
+            # backward compatibility if signature differs
+            config.apply_fl_profile()
+
     if algorithms is None:
         algorithms = config.fl_algorithms
     if theta_init is None:
@@ -638,7 +630,7 @@ def run_federated_experiment(
 
     if theta_true is None:
         print("="*60)
-        print("⚠️  WARNING: theta_true not provided to run_federated_experiment")
+        print("  WARNING: theta_true not provided to run_federated_experiment")
         print("="*60)
         print("Localization error will be reported as 'inf'.")
         print("="*60)
@@ -678,14 +670,26 @@ def run_federated_experiment(
             print(f"FEDERATED LEARNING: {algo.upper()}")
             print("=" * 60)
 
-        # Fresh global model
-        global_model = model_class(
-            input_dim=config.input_dim,
-            layer_wid=config.hidden_layers,
-            nonlinearity=config.nonlinearity,
-            gamma=config.gamma_init,
-            theta0=theta_init,
-        )
+        # Fresh global model (pass P0_init when supported)
+        try:
+            global_model = model_class(
+                input_dim=config.input_dim,
+                layer_wid=config.hidden_layers,
+                nonlinearity=config.nonlinearity,
+                gamma=config.gamma_init,
+                theta0=theta_init,
+                P0_init=getattr(config, "P0_init", -32.0),
+                physics_bias=getattr(config, "physics_bias", 2.0),
+            )
+        except TypeError:
+            # Backward-compatible fallback
+            global_model = model_class(
+                input_dim=config.input_dim,
+                layer_wid=config.hidden_layers,
+                nonlinearity=config.nonlinearity,
+                gamma=config.gamma_init,
+                theta0=theta_init,
+            )
 
         from model_wrapper import patch_model
         patch_model(global_model)
