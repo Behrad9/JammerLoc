@@ -192,8 +192,15 @@ class Server:
             "test_mse": [],
             "loc_error": [],
             "theta_trajectory": [],
+            "theta_x": [],  # NEW: For plotting
+            "theta_y": [],  # NEW: For plotting
+            "gamma": [],    # NEW: Physics param history
+            "P0": [],       # NEW: Physics param history  
+            "w_pl": [],     # NEW: Fusion weight (physics)
+            "w_nn": [],     # NEW: Fusion weight (neural)
             "theta_movement": [],  # NEW: track θ movement per round
             "round_stats": [],
+            "client_sizes": [],  # NEW: For client distribution plot
         }
 
         # Best model tracking (by val_mse - honest, no oracle)
@@ -400,6 +407,9 @@ class Server:
         # Initialize early stopping
         es_config = self._get_algorithm_early_stopping_config(algo)
         self.early_stopper = FLEarlyStopping(es_config)
+        
+        # Store client sizes for plotting
+        self.history["client_sizes"] = self.client_manager.get_client_sizes()
 
         # Get base learning rate
         base_lr = getattr(self.config, "lr_fl", getattr(self.config, "fl_lr", 0.01))
@@ -483,8 +493,18 @@ class Server:
             self.history["test_mse"].append(test_mse)
             self.history["loc_error"].append(loc_err)
             self.history["theta_trajectory"].append(theta_hat.copy())
+            self.history["theta_x"].append(float(theta_hat[0]))
+            self.history["theta_y"].append(float(theta_hat[1]))
             self.history["theta_movement"].append(theta_movement)
             self.history["round_stats"].append(round_stats)
+            
+            # Track physics params and fusion weights
+            with torch.no_grad():
+                self.history["gamma"].append(float(self.global_model.gamma.item()))
+                self.history["P0"].append(float(self.global_model.P0.item()))
+                w_softmax = torch.softmax(self.global_model.w, dim=0).cpu().numpy()
+                self.history["w_pl"].append(float(w_softmax[0]))
+                self.history["w_nn"].append(float(w_softmax[1]))
 
             # ---- Progress logging ----
             if verbose and (rnd + 1) % 10 == 0:
@@ -575,8 +595,15 @@ class Server:
             "test_mse": [],
             "loc_error": [],
             "theta_trajectory": [],
+            "theta_x": [],
+            "theta_y": [],
+            "gamma": [],
+            "P0": [],
+            "w_pl": [],
+            "w_nn": [],
             "theta_movement": [],
             "round_stats": [],
+            "client_sizes": [],
         }
 
         self.best_loc_error = float("inf")

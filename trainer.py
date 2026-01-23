@@ -390,7 +390,8 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
     # History tracking
     history = {
         'train_loss': [], 'val_loss': [], 'loc_error': [],
-        'theta_x': [], 'theta_y': [], 'gamma': [], 'P0': []
+        'theta_x': [], 'theta_y': [], 'gamma': [], 'P0': [],
+        'w_pl': [], 'w_nn': [],  # Fusion weights for Stage 2 plots
     }
     
     # Early stopping with best model tracking
@@ -460,6 +461,12 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
         history['theta_y'].append(float(theta[1]))
         history['gamma'].append(float(model.gamma.item()))
         history['P0'].append(float(model.P0.item()))
+        
+        # Track fusion weights (softmax of w logits)
+        with torch.no_grad():
+            w_softmax = torch.softmax(model.w, dim=0).cpu().numpy()
+            history['w_pl'].append(float(w_softmax[0]))
+            history['w_nn'].append(float(w_softmax[1]))
         
         # Best model tracking (by val_loss ONLY - oracle-free, same as FL)
         # NOTE: loc_error is tracked for reporting but NOT used for model selection
@@ -579,6 +586,12 @@ def train_centralized(train_loader=None, val_loader=None, test_loader=None,
     history['theta_true'] = theta_true  # Store for reference
     history['final_gamma'] = float(model.gamma.item())
     history['final_P0'] = float(model.P0.item())
+    
+    # Final fusion weights
+    with torch.no_grad():
+        w_softmax = torch.softmax(model.w, dim=0).cpu().numpy()
+        history['final_w_pl'] = float(w_softmax[0])
+        history['final_w_nn'] = float(w_softmax[1])
     
     return model, history
 

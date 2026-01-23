@@ -212,7 +212,7 @@ class RSSIConfig:
     jammer_lon: Optional[float] = None
 
     # Physics-Aware Distance Loss
-    use_distance_aware_loss: bool = False  # Disabled by default - not always helpful
+    use_distance_aware_loss: bool = True  # Disabled by default - not always helpful
     distance_corr_weight: float = 0.3
     distance_corr_target: float = -0.4
     validate_distance_every: int = 10

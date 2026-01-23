@@ -30,6 +30,43 @@ except ImportError:
         print("stage2_plots module not available, skipping plots")
         return {}
 
+# ----------------------------------------------------------------------------
+# Result schema normalization helpers (to support plotting across variants)
+# ----------------------------------------------------------------------------
+
+def _normalize_theta_history_in_result(res: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure theta history is accessible via common keys for downstream plotting."""
+    if not isinstance(res, dict):
+        return res
+
+    # If history exists as x/y arrays, convert to theta_hat_history
+    hist = res.get("history")
+    if isinstance(hist, dict):
+        if "theta_hat_history" not in res and "theta_history" not in res:
+            if "theta_hat_x" in hist and "theta_hat_y" in hist:
+                xs = np.asarray(hist["theta_hat_x"], dtype=float).reshape(-1)
+                ys = np.asarray(hist["theta_hat_y"], dtype=float).reshape(-1)
+                n = min(len(xs), len(ys))
+                res["theta_hat_history"] = [np.array([xs[i], ys[i]], dtype=float) for i in range(n)]
+            elif "theta_x" in hist and "theta_y" in hist:
+                xs = np.asarray(hist["theta_x"], dtype=float).reshape(-1)
+                ys = np.asarray(hist["theta_y"], dtype=float).reshape(-1)
+                n = min(len(xs), len(ys))
+                res["theta_history"] = [np.array([xs[i], ys[i]], dtype=float) for i in range(n)]
+        # Promote nested lists if present
+        for k in ["theta_hat_history", "theta_history"]:
+            if k in hist and k not in res:
+                res[k] = hist[k]
+
+    # If only theta_x/y at top-level, create theta_history list
+    if "theta_history" not in res and ("theta_x" in res and "theta_y" in res):
+        xs = np.asarray(res.get("theta_x"), dtype=float).reshape(-1)
+        ys = np.asarray(res.get("theta_y"), dtype=float).reshape(-1)
+        n = min(len(xs), len(ys))
+        res["theta_history"] = [np.array([xs[i], ys[i]], dtype=float) for i in range(n)]
+
+    return res
+
 from config import (
     Config, RSSIConfig, cfg, rssi_cfg,
     JAMMER_LOCATIONS, GAMMA_INIT_ENV,
@@ -54,7 +91,7 @@ def get_rssi_config_for_environment(env: str):
     cfg = create_rssi_config_for_environment(env)
     
 
-    cfg.use_distance_aware_loss = False
+    cfg.use_distance_aware_loss = True
     cfg.validate_distance_every = 0
 
 
@@ -430,9 +467,26 @@ def run_stage2_localization(
         'test_mse': test_mse,
         'lat': lat_hat,
         'lon': lon_hat,
+
+        # Keep full training history for richer plots/diagnostics
+        'history': history,
+
+        # Common training curves (may be empty depending on trainer implementation)
         'train_loss': history.get('train_loss', []),
         'val_loss': history.get('val_loss', []),
         'loc_error': history.get('loc_error', []),
+
+        # Optional parameter trajectories (only present if trainer logs them)
+        'theta_x': history.get('theta_x', []),
+        'theta_y': history.get('theta_y', []),
+        'gamma_hist': history.get('gamma', history.get('gamma_hist', [])),
+        'p0_hist': history.get('P0', history.get('p0_hist', [])),
+        
+        # Fusion weights history (for Stage 2 plots)
+        'w_pl': history.get('w_pl', []),
+        'w_nn': history.get('w_nn', []),
+
+        # Final learned physics parameters
         'physics_params': get_physics_params(model),
     }
 
@@ -530,9 +584,20 @@ def run_stage2_localization(
                 algo=algo,
                 global_rounds=config.global_rounds,
                 local_epochs=config.local_epochs,
-                warmup_rounds=config.fl_warmup_rounds,
-                verbose=verbose
+                verbose=verbose,
             )
+
+            # Normalize schema so plotting code can find theta trajectories
+            fl_result = _normalize_theta_history_in_result(fl_result)
+
+            # Ensure a usable final theta_hat exists
+            if 'theta_hat' not in fl_result or fl_result.get('theta_hat') is None:
+                if fl_result.get('theta') is not None:
+                    fl_result['theta_hat'] = fl_result['theta']
+                elif fl_result.get('theta_hat_history'):
+                    fl_result['theta_hat'] = fl_result['theta_hat_history'][-1]
+                elif fl_result.get('theta_history'):
+                    fl_result['theta_hat'] = fl_result['theta_history'][-1]
 
             theta_fl = fl_result['theta_hat']
             lat0_rad = np.radians(config.lat0)
