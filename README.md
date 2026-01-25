@@ -6,7 +6,7 @@
 
 > **Master Thesis** - Politecnico di Torino, 2026  
 > **Author**: Behrad Shayegan  
-> **Supervisors**: [Add supervisor names]
+> **Supervisors**: [Prof.ANDREA NARDIN, Dr.IMAN EBRAHIMI MEHR]
 
 ---
 
@@ -445,10 +445,15 @@ If you use this code in your research, please cite:
 
 ### Stage 1: RSSI Estimation
 
-<!-- TODO: Add Stage 1 references -->
-[S1.1] *[Add your Stage 1 RSSI estimation references here]*
+[1] Lee, D.-K., Spens, N., Gattis, B., & Akos, D. (2021). AGC on Android Devices for GNSS.
+[2] Levigne, N. S. (2019). Automatic Gain Control Measurements as a GPS L1 Interference Detection Metric.(AGC behavior; motivation for ΔAGC as a monotone proxy).
+[3] Ghizzo, E., Djelloul, E. M., Lesouple, J., Milner, C., & Macabiau, C. (2025). Assessing jamming and spoofing impacts on GNSS receivers: Automatic gain control (AGC). Signal Processing, 228. https://doi.org/10.1016/j.sigpro.2024.109762
+[4] Zahidul, M., Bhuiyan, H., Kuusniemi, H., Söderholm, S., & Airos, E. (2014). The Impact of Interference on GNSS Receiver Observables-A Running Digital Sum Based Simple Jammer Detector. https://www.researchgate.net/publication/265726039 
+[5] K. Olsson et al., “Participatory Sensing for Localization of a GNSS Jammer,” (system model and ΔC/N₀ physics; use of deltas and median aggregation). 
+[6] J. Han et al., “Crowdsourced Smartphone-Based Machine Learning for GNSS Jammer Detection and Localization,” SSRN, 2024 (evidence for hybrid ΔAGC+ΔC/N₀, device variability, and ML fusion ideas).
+[7] F. Dovis, Satellite Navigation Course Slides (GNSS fundamentals; C/N₀ definition and tracking context).
 
-[S1.2] *[Add additional Stage 1 references]*
+
 
 ---
 
@@ -487,9 +492,3 @@ If you use this code in your research, please cite:
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ---
-
-## Acknowledgments
-
-- Politecnico di Torino
-- [Add supervisor acknowledgments]
-- [Add funding acknowledgments if applicable]
