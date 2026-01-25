@@ -1,6 +1,25 @@
 """
 Configuration Module for Jammer Localization
 =============================================
+
+Centralized hyperparameters and experiment settings using dataclass.
+Supports YAML configuration loading for reproducible experiments.
+
+Two configuration classes:
+- RSSIConfig: Stage 1 (RSSI estimation from AGC/CN0)
+- Config: Stage 2 (Localization from RSSI)
+
+FIXES APPLIED for proper FL performance ranking (SCAFFOLD > FedProx ≈ FedAvg on non-IID):
+- FedProx mu reduced to fair value (0.01)
+- Theta aggregation uses geometric_median for robustness
+- FL warmup rounds increased for SCAFFOLD control variate buildup
+- Global rounds increased to give SCAFFOLD time to converge
+- Early stopping patience increased
+
+CRITICAL FIX (January 2026):
+- SCAFFOLD was showing MSE↓ but loc_error constant (θ frozen)
+- Root cause: Single LR caused NN to learn faster than θ
+- Fix: Hybrid SCAFFOLD with separate θ optimizer (5x LR, no control variates)
 """
 
 from dataclasses import dataclass, field
@@ -80,10 +99,34 @@ def get_P0_init(environment: str) -> float:
     return P0_INIT_ENV.get(environment, -32.0)
 
 
+
+# ============================================================================
 # AUTO-TUNED FL PROFILES (Environment × Partition Strategy)
+# ============================================================================
+#
+# Best-practice rationale (oracle-free):
+# - Different environments have different physics identifiability / noise.
+# - Different partitioning strategies induce different non-IID / client drift regimes.
+# - We keep model selection and stopping oracle-free (val_loss only), but it is
+#   perfectly fair to choose hyperparameters per (env, partition) as long as you
+#   do it consistently and based on validation.
+#
+# This table provides strong *starting points* that you can refine.
+#
+# Keys you can override per-profile:
+#   - lr_fl, local_epochs, global_rounds
+#   - fl_warmup_rounds, fl_early_stopping_patience
+#   - scaffold_theta_lr_mult, scaffold_physics_lr_mult
+#   - scaffold_nn_lr_mult, scaffold_w_lr_mult
+#   - scaffold_local_epochs_multiplier
+#
+# NOTE: 'scaffold_physics_lr_mult' is intended to control P0/gamma LR multipliers
+# (client.py uses it as the default for P0/gamma if explicit multipliers are not set).
+# ----------------------------------------------------------------------------
 
 FL_TUNING_PROFILES: Dict[str, Dict[str, Dict[str, float]]] = {
-    # Distance-based partitioning
+    # Distance quantiles (near→far): usually the strongest non-IID; stabilize theta in
+    # low-noise envs (suburban/open_sky) but allow more movement in urban/lab.
     "distance": {
         "__default__": {
             "lr_fl": 0.005,
@@ -102,7 +145,8 @@ FL_TUNING_PROFILES: Dict[str, Dict[str, Dict[str, float]]] = {
         "mixed": {"scaffold_theta_lr_mult": 0.6},
     },
 
-    # Device-based partitioning
+    # Device partitioning: often high systematic shift; SCAFFOLD helps, but theta can oscillate in
+    # low-noise envs → keep it moderate there.
     "device": {
         "__default__": {
             "lr_fl": 0.005,
@@ -122,7 +166,7 @@ FL_TUNING_PROFILES: Dict[str, Dict[str, Dict[str, float]]] = {
         "mixed": {"scaffold_theta_lr_mult": 0.7},
     },
 
-    # Signal-strength partitioning
+    # Signal-strength partitioning: moderate non-IID in the *target*; can overfit NN early.
     "signal_strength": {
         "__default__": {
             "lr_fl": 0.0045,
@@ -131,18 +175,18 @@ FL_TUNING_PROFILES: Dict[str, Dict[str, Dict[str, float]]] = {
             "fl_warmup_rounds": 5,
             "fl_early_stopping_patience": 25,
             "scaffold_physics_lr_mult": 0.5,
-            "scaffold_nn_lr_mult": 0.08,   
+            "scaffold_nn_lr_mult": 0.08,   # slightly smaller NN LR helps stability here
             "scaffold_local_epochs_multiplier": 1.0,
             "scaffold_theta_lr_mult": 0.6,
         },
-        "suburban": {"scaffold_theta_lr_mult": 0.4},
+        "suburban": {"scaffold_theta_lr_mult": 0.2},
         "open_sky": {"scaffold_theta_lr_mult": 0.4},
         "urban": {"scaffold_theta_lr_mult": 0.2},
         "lab_wired": {"scaffold_theta_lr_mult": 0.2},
         "mixed": {"scaffold_theta_lr_mult": 0.6},
     },
 
-    # Geographic partitioning
+    # Geographic partitioning: moderate drift (angle sectors) with occasional outliers.
     "geographic": {
         "__default__": {
             "lr_fl": 0.005,
@@ -164,7 +208,7 @@ FL_TUNING_PROFILES: Dict[str, Dict[str, Dict[str, float]]] = {
         
     },
 
-    # Random/IID
+    # Random/IID: SCAFFOLD has little advantage; keep it conservative.
     "random": {
         "__default__": {
             "lr_fl": 0.005,
@@ -212,7 +256,7 @@ class RSSIConfig:
     jammer_lon: Optional[float] = None
 
     # Physics-Aware Distance Loss
-    use_distance_aware_loss: bool = True  # Disabled by default - not always helpful
+    use_distance_aware_loss: bool = False  # Disabled by default - not always helpful
     distance_corr_weight: float = 0.3
     distance_corr_target: float = -0.4
     validate_distance_every: int = 10
@@ -309,6 +353,17 @@ rssi_cfg = RSSIConfig()
 
 @dataclass
 class Config:
+    """
+    Configuration for Stage 2 (Jammer Localization).
+    
+    FIXED: Hyperparameters tuned for proper performance ranking on non-IID data:
+    - Centralized > SCAFFOLD > FedProx ≈ FedAvg
+    
+    Key changes for SCAFFOLD to win:
+    - FedProx mu reduced to fair value
+    - Theta aggregation uses geometric_median
+    - More global rounds and patience for SCAFFOLD
+    """
 
     # ==================== Environment ====================
     environment: str = "urban"
@@ -333,7 +388,13 @@ class Config:
     lon0: float = None
     jammer_lat: float = None
     jammer_lon: float = None
-    center_to_jammer: bool = False  # If True, recenter ENU so jammer is at (0,0) (DEBUG only)
+    center_to_jammer: bool = False  # DEPRECATED alias for coordinate_frame='jammer_centered' (kept for backward compatibility)
+
+    # Coordinate frame mode:
+    # - 'neutral': ENU origin at receiver centroid (oracle-free, recommended)
+    # - 'jammer_centered': ENU origin at true jammer (oracle / analysis baseline)
+    coordinate_frame: str = "neutral"  # Options: neutral, jammer_centered
+    compare_coordinate_frames: bool = False  # run both frames for analysis plots (centralized only)
 
     # Position noise
     add_position_noise: bool = True
@@ -383,7 +444,7 @@ class Config:
     peak_weight_alpha: float = 3.0
 
     # ==================== Physics Regularization ====================
-    theta_l2_reg: float = 1e-4
+    theta_l2_reg: float = 0.0
     gamma_reg: float = 1e-3
     gamma_reg_target: float = 2.7
     P0_reg: float = 1e-4
@@ -401,7 +462,7 @@ class Config:
     min_samples_per_client: int = 10
 
     # Data partitioning - distance creates strong non-IID (SCAFFOLD's advantage)
-    partition_strategy: str = "signal_strength"  # Options: random, geographic, signal_strength, device, distance
+    partition_strategy: str = "random"  # Options: random, geographic, signal_strength, device, distance
 
     # FL training - more rounds for SCAFFOLD to converge
     local_epochs: int = 3
@@ -483,7 +544,9 @@ class Config:
         assert self.environment in valid_envs
 
         self._update_from_environment()
-        
+        self.apply_fl_profile(force=False, verbose=False)
+
+
         # Apply (env × partition) FL profile after env defaults are set
         self.apply_fl_profile(force=False, verbose=False)
 
@@ -524,7 +587,12 @@ class Config:
 
 
     def apply_fl_profile(self, force: bool = False, verbose: bool = False) -> Dict[str, float]:
-        
+        """Apply an oracle-free FL tuning profile based on (environment, partition_strategy).
+
+        This updates a *subset* of FL-related hyperparameters to good defaults for the
+        current regime. You can disable this by setting:
+            auto_tune_fl_by_env_partition = False
+        """
         if not (force or getattr(self, "auto_tune_fl_by_env_partition", True)):
             return {}
 

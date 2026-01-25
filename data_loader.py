@@ -1,6 +1,18 @@
 """
 Data Loader Module for Jammer Localization
 =========================================
+
+Handles:
+- CSV data loading and validation
+- Coordinate conversion (lat/lon to ENU)
+- Feature engineering
+- Dataset creation
+- Client partitioning for federated learning
+
+Key design choice (IMPORTANT):
+- This loader uses a *neutral* ENU frame by default (origin is lat0/lon0, typically the median receiver position).
+- It does NOT re-center coordinates to the true jammer location.
+  (We still compute distance-to-jammer in ENU if jammer_lat/jammer_lon are provided, to support distance partitioning.)
 """
 
 from __future__ import annotations
@@ -23,7 +35,20 @@ def latlon_to_enu(
     lon0_rad: float,
     R: float | None = None
 ) -> Tuple[np.ndarray, np.ndarray]:
-   
+    """
+    Convert latitude/longitude to East-North-Up (ENU) coordinates.
+
+    Args:
+        lat_deg: Latitude in degrees
+        lon_deg: Longitude in degrees
+        lat0_rad: Reference latitude in radians
+        lon0_rad: Reference longitude in radians
+        R: Earth radius in meters
+
+    Returns:
+        x_enu: East coordinate (meters)
+        y_enu: North coordinate (meters)
+    """
     if R is None:
         R = cfg.R_earth
 
@@ -45,7 +70,20 @@ def enu_to_latlon(
     lon0_rad: float,
     R: float | None = None
 ) -> Tuple[float, float]:
-   
+    """
+    Convert ENU coordinates back to latitude/longitude.
+
+    Args:
+        x: East coordinate (meters)
+        y: North coordinate (meters)
+        lat0_rad: Reference latitude in radians
+        lon0_rad: Reference longitude in radians
+        R: Earth radius in meters
+
+    Returns:
+        lat_deg: Latitude in degrees
+        lon_deg: Longitude in degrees
+    """
     if R is None:
         R = cfg.R_earth
 
@@ -58,7 +96,17 @@ def enu_to_latlon(
 # ==================== Dataset Class ====================
 
 class JammerDataset(Dataset):
-    
+    """
+    PyTorch Dataset for jammer localization.
+
+    Features: [x_enu, y_enu, building_density, local_signal_variance]
+    Target: J_hat (estimated RSSI from Stage 1)
+
+    Optional:
+      - device_idx: for device-based FL partitioning
+      - dist_to_jammer: for distance-based FL partitioning (near→far)
+    """
+
     def __init__(
         self,
         x_enu: np.ndarray,
@@ -152,7 +200,14 @@ def load_data(
     config: Config | None = None,
     verbose: bool = True
 ) -> Tuple[pd.DataFrame, float, float]:
-   
+    """
+    Load and prepare data from CSV file.
+
+    Returns:
+        df: Prepared DataFrame with ENU coordinates (neutral frame)
+        lat0_rad: Reference latitude in radians
+        lon0_rad: Reference longitude in radians
+    """
     if config is None:
         config = cfg
     if csv_path is None:
@@ -321,7 +376,47 @@ def load_data(
         jx0, jy0 = float(jx_ref[0]), float(jy_ref[0])
         df["dist_to_jammer_enu"] = np.sqrt((x_enu - jx0) ** 2 + (y_enu - jy0) ** 2).astype(np.float32)
 
-    # 6) Add position noise (GPS uncertainty)
+    
+    # 5b) Optional: Jammer-centered ENU frame (oracle / analysis baseline)
+    # If enabled, shift coordinates so the TRUE jammer is at (0,0).
+    # This is NOT used for main results; it exists only for comparison against the oracle-centered baseline.
+    frame = str(getattr(config, "coordinate_frame", "neutral") or "neutral").lower()
+    if bool(getattr(config, "center_to_jammer", False)):
+        frame = "jammer_centered"
+
+    if frame in ("jammer_centered", "jammer", "oracle"):
+        if (jammer_lat is None) or (jammer_lon is None):
+            raise ValueError(
+                "coordinate_frame='jammer_centered' requires config.jammer_lat and config.jammer_lon."
+            )
+        # jx0,jy0 are already computed above for dist_to_jammer_enu
+        # If not computed (should not happen), compute now.
+        if 'jx0' not in locals():
+            jx_ref, jy_ref = latlon_to_enu(
+                np.array([jammer_lat], dtype=np.float64),
+                np.array([jammer_lon], dtype=np.float64),
+                lat0_rad,
+                lon0_rad,
+            )
+            jx0, jy0 = float(jx_ref[0]), float(jy_ref[0])
+
+        # Shift receiver coordinates so jammer is at origin
+        x_enu = (x_enu - jx0).astype(np.float32)
+        y_enu = (y_enu - jy0).astype(np.float32)
+
+        # Update distance-to-jammer accordingly (now simply radius)
+        df["dist_to_jammer_enu"] = np.sqrt(x_enu ** 2 + y_enu ** 2).astype(np.float32)
+
+        # Store shift for plotting/debug
+        df["frame_shift_x"] = float(jx0)
+        df["frame_shift_y"] = float(jy0)
+        df["coordinate_frame"] = "jammer_centered"
+    else:
+        df["frame_shift_x"] = 0.0
+        df["frame_shift_y"] = 0.0
+        df["coordinate_frame"] = "neutral"
+
+# 6) Add position noise (GPS uncertainty)
     pos_noise_std_m = float(getattr(config, "pos_noise_std_m", 0.0) or 0.0)
     if pos_noise_std_m > 0.0:
         x_enu = (x_enu + np.random.normal(0.0, pos_noise_std_m, size=x_enu.shape)).astype(np.float32)
@@ -415,7 +510,17 @@ def partition_for_clients(
     strategy: str = "geographic",
     device_labels: np.ndarray | None = None
 ) -> List[Subset]:
-   
+    """
+    Partition dataset into client subsets for federated learning.
+
+    Strategies:
+      - random: IID random split
+      - balanced: equal sizes, random
+      - geographic: by angle sector in ENU
+      - signal_strength: by target RSSI value
+      - device: by device label
+      - distance: by distance-to-jammer quantiles (near→far)  [requires dist_to_jammer]
+    """
     N = len(dataset)
     indices = np.arange(N)
 

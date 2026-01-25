@@ -1,8 +1,10 @@
 """
-Enhanced Stage 2 Plotting Module for JAMLOC
-============================================
-Adds: Theta aggregation, learning curves, fusion weights, client analysis, 
-      residual plots, and centralized training visualization.
+Stage 2 Plotting Module for JAMLOC
+===================================
+Comprehensive visualization suite for jammer localization results.
+Includes: localization maps, convergence plots, algorithm comparisons,
+theta trajectories, physics parameters, learning curves, fusion weights,
+client analysis, residual plots, and summary dashboards.
 """
 
 import os
@@ -103,6 +105,10 @@ CLIENT_COLORS = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd',
                  '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
 
 
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
 def save_figure(fig, path_base: str, formats: List[str] = ['png', 'pdf']):
     """Save figure in multiple formats."""
     saved = []
@@ -128,10 +134,6 @@ def add_scale_bar(ax, length_m: float, location: str = 'lower right'):
     )
     ax.add_artist(scalebar)
 
-
-# ============================================================================
-# COORDINATE HELPERS
-# ============================================================================
 
 def ensure_enu_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure DataFrame has x_enu/y_enu columns in meters."""
@@ -169,7 +171,7 @@ def generate_stage2_plots(
     """Generate all Stage 2 thesis-quality plots."""
     if not HAS_MATPLOTLIB:
         if verbose:
-            print("matplotlib not available")
+            print("⚠ matplotlib not available")
         return {}
     
     setup_thesis_style()
@@ -181,106 +183,94 @@ def generate_stage2_plots(
     
     if verbose:
         print(f"\n{'='*60}")
-        print(f"GENERATING STAGE 2 PLOTS - {env.upper()}")
+        print(f"GENERATING STAGE 2 PLOTS — {env.upper()}")
         print(f"{'='*60}")
         if true_jammer:
             print(f"True jammer: ({true_jammer[0]:.1f}, {true_jammer[1]:.1f}) m")
     
-    # 1. Localization Map
+    # Core plots
     path = plot_localization_map(df, centralized_result, federated_results,
                                   output_dir, env, true_jammer, formats)
     if path:
         saved_plots['localization_map'] = path
-        if verbose: print("[OK] Localization map")
+        if verbose: print("✓ Localization map")
     
-    # 2. Convergence Comparison (Loc Error)
     path = plot_convergence(centralized_result, federated_results, 
                             output_dir, env, formats)
     if path:
         saved_plots['convergence'] = path
-        if verbose: print("[OK] Convergence comparison")
+        if verbose: print("✓ Convergence comparison")
     
-    # 3. Algorithm Comparison Bar Chart
     if federated_results:
         path = plot_algorithm_comparison(centralized_result, federated_results,
                                          output_dir, env, formats)
         if path:
             saved_plots['algorithm_comparison'] = path
-            if verbose: print("[OK] Algorithm comparison")
+            if verbose: print("✓ Algorithm comparison")
     
-    # 4. Theta Trajectory
     path = plot_theta_trajectory(centralized_result, federated_results,
                                  output_dir, env, true_jammer, formats)
     if path:
         saved_plots['theta_trajectory'] = path
-        if verbose: print("[OK] Theta trajectory")
+        if verbose: print("✓ Theta trajectory")
     
-    # 5. Physics Parameters
     if centralized_result:
         path = plot_physics_params(centralized_result, output_dir, env, formats)
         if path:
             saved_plots['physics_params'] = path
-            if verbose: print("[OK] Physics parameters")
+            if verbose: print("✓ Physics parameters")
     
-    # ========== NEW PLOTS ==========
-    
-    # 6. Centralized Learning Curves (Train/Val Loss)
+    # Advanced analysis plots
     if centralized_result:
         path = plot_centralized_learning_curves(centralized_result, output_dir, env, formats)
         if path:
             saved_plots['centralized_learning_curves'] = path
-            if verbose: print("[OK] Centralized learning curves")
+            if verbose: print("✓ Centralized learning curves")
     
-    # 7. Theta Aggregation (FL) - Shows client thetas being aggregated
     if federated_results:
         path = plot_theta_aggregation(federated_results, output_dir, env, true_jammer, formats)
         if path:
             saved_plots['theta_aggregation'] = path
-            if verbose: print("[OK] Theta aggregation (FL)")
+            if verbose: print("✓ Theta aggregation (FL)")
     
-    # 8. Fusion Weights Evolution
     if centralized_result:
         path = plot_fusion_weights(centralized_result, federated_results, output_dir, env, formats)
         if path:
             saved_plots['fusion_weights'] = path
-            if verbose: print("[OK] Fusion weights evolution")
+            if verbose: print("✓ Fusion weights evolution")
     
-    # 9. RSSI Residual Analysis
     if centralized_result and 'theta_hat' in centralized_result:
         path = plot_rssi_residuals(df, centralized_result, output_dir, env, formats)
         if path:
             saved_plots['rssi_residuals'] = path
-            if verbose: print("[OK] RSSI residual analysis")
+            if verbose: print("✓ RSSI residual analysis")
     
-    # 10. Client Data Distribution (Non-IID visualization)
     if federated_results:
         path = plot_client_data_distribution(federated_results, output_dir, env, formats)
         if path:
             saved_plots['client_distribution'] = path
-            if verbose: print("[OK] Client data distribution")
-    
-    # 11. FL Rounds Progression (theta per round)
-    if federated_results:
+            if verbose: print("✓ Client data distribution")
+        
         path = plot_fl_rounds_progression(federated_results, output_dir, env, true_jammer, formats)
         if path:
             saved_plots['fl_rounds_progression'] = path
-            if verbose: print("[OK] FL rounds progression")
+            if verbose: print("✓ FL rounds progression")
     
-    # 12. Summary Dashboard
+    # Summary dashboard
     path = plot_summary_dashboard(df, centralized_result, federated_results,
                                    output_dir, env, true_jammer, formats)
     if path:
         saved_plots['summary'] = path
-        if verbose: print("[OK] Summary dashboard")
+        if verbose: print("✓ Summary dashboard")
     
     if verbose:
-        print(f"\n[OK] Generated {len(saved_plots)} publication-quality plots")
+        print(f"\n✓ Generated {len(saved_plots)} publication-quality plots")
     
     return saved_plots
 
 
 # ============================================================================
-# ORIGINAL PLOT FUNCTIONS
+# CORE PLOT FUNCTIONS
 # ============================================================================
 
 def plot_localization_map(df, centralized_result, federated_results,
@@ -335,7 +325,7 @@ def plot_localization_map(df, centralized_result, federated_results,
         ax.set_ylabel('North (m)')
         ax.set_aspect('equal')
         ax.legend(loc='upper left', fontsize=9, framealpha=0.9)
-        ax.set_title(f'Localization Results - {env.replace("_", " ").title()}', pad=12)
+        ax.set_title(f'Localization Results — {env.replace("_", " ").title()}', pad=12)
         
         # Add scale bar
         x_range = x_pos.max() - x_pos.min() if len(x_pos) > 0 else 100
@@ -358,7 +348,6 @@ def plot_convergence(centralized_result, federated_results, output_dir, env, for
     """Convergence curves for all methods (localization error)."""
     try:
         fig, ax = plt.subplots(figsize=(10, 6))
-        
         has_data = False
         
         # Centralized
@@ -399,7 +388,7 @@ def plot_convergence(centralized_result, federated_results, output_dir, env, for
         ax.set_xlabel('Epoch / Round')
         ax.set_ylabel('Localization Error (m)')
         ax.legend(loc='upper right', framealpha=0.9)
-        ax.set_title(f'Localization Error Convergence - {env.replace("_", " ").title()}', pad=12)
+        ax.set_title(f'Localization Error Convergence — {env.replace("_", " ").title()}', pad=12)
         
         # Log scale if range is large
         y_data = ax.get_ylim()
@@ -456,7 +445,7 @@ def plot_algorithm_comparison(centralized_result, federated_results,
         ax.set_xticks(x)
         ax.set_xticklabels(methods, fontsize=12)
         ax.set_ylabel('Localization Error (m)')
-        ax.set_title(f'Algorithm Comparison - {env.replace("_", " ").title()}', pad=12)
+        ax.set_title(f'Algorithm Comparison — {env.replace("_", " ").title()}', pad=12)
         
         # Add reference line at best error
         if errors:
@@ -484,14 +473,6 @@ def plot_theta_trajectory(centralized_result, federated_results,
         if centralized_result:
             theta_x = centralized_result.get('theta_x', [])
             theta_y = centralized_result.get('theta_y', [])
-            
-            # Also check in history
-            if not theta_x:
-                loc_error = centralized_result.get('loc_error', [])
-                theta_hat = centralized_result.get('theta_hat', None)
-                if theta_hat is not None and len(loc_error) > 1:
-                    # Can't reconstruct trajectory, just show final
-                    pass
             
             if len(theta_x) > 1:
                 theta_x = np.array(theta_x)
@@ -547,7 +528,7 @@ def plot_theta_trajectory(centralized_result, federated_results,
         ax.set_ylabel('North (m)')
         ax.set_aspect('equal')
         ax.legend(loc='best', fontsize=9)
-        ax.set_title(f'Position Estimate Trajectory - {env.replace("_", " ").title()}', pad=12)
+        ax.set_title(f'Position Estimate Trajectory — {env.replace("_", " ").title()}', pad=12)
         
         plt.tight_layout()
         return save_figure(fig, os.path.join(output_dir, f's2_trajectory_{env}'), formats)
@@ -563,18 +544,17 @@ def plot_physics_params(centralized_result, output_dir, env, formats):
         # Try to get from physics_params dict or direct keys
         physics = centralized_result.get('physics_params', {})
         
-        # Get final values
-        gamma_final = physics.get('gamma', centralized_result.get('gamma', None))
-        P0_final = physics.get('P0', centralized_result.get('P0', None))
-        
         # Get history if available
-        gamma_hist = physics.get('gamma_history', centralized_result.get('gamma_history', []))
-        P0_hist = physics.get('P0_history', centralized_result.get('P0_history', []))
+        gamma_hist = physics.get('gamma_history', centralized_result.get('gamma_history', 
+                     centralized_result.get('gamma', [])))
+        P0_hist = physics.get('P0_history', centralized_result.get('P0_history',
+                  centralized_result.get('P0', [])))
         
-        # If no history, check if final values exist
-        if not gamma_hist and gamma_final is not None:
-            # Can't plot evolution without history
-            return None
+        # Ensure they are lists
+        if not isinstance(gamma_hist, (list, np.ndarray)):
+            gamma_hist = [gamma_hist] if gamma_hist is not None else []
+        if not isinstance(P0_hist, (list, np.ndarray)):
+            P0_hist = [P0_hist] if P0_hist is not None else []
         
         if len(gamma_hist) < 2:
             return None
@@ -588,8 +568,8 @@ def plot_physics_params(centralized_result, output_dir, env, formats):
         ax.plot(epochs, gamma_hist, color=COLORS['primary'], lw=2)
         ax.axhline(gamma_hist[-1], color=COLORS['gray'], ls='--', alpha=0.5)
         ax.set_xlabel('Epoch')
-        ax.set_ylabel('Path-loss Exponent (gamma)')
-        ax.set_title('(a) gamma Evolution', fontweight='bold')
+        ax.set_ylabel('Path-loss Exponent (γ)')
+        ax.set_title('(a) γ Evolution', fontweight='bold')
         ax.text(0.95, 0.95, f'Final: {gamma_hist[-1]:.3f}', transform=ax.transAxes,
                ha='right', va='top', fontsize=10,
                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
@@ -603,10 +583,10 @@ def plot_physics_params(centralized_result, output_dir, env, formats):
                    ha='right', va='top', fontsize=10,
                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         ax.set_xlabel('Epoch')
-        ax.set_ylabel('Reference Power P0 (dBm)')
-        ax.set_title('(b) P0 Evolution', fontweight='bold')
+        ax.set_ylabel('Reference Power P₀ (dBm)')
+        ax.set_title('(b) P₀ Evolution', fontweight='bold')
         
-        fig.suptitle(f'Physics Parameter Learning - {env.replace("_", " ").title()}',
+        fig.suptitle(f'Physics Parameter Learning — {env.replace("_", " ").title()}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         return save_figure(fig, os.path.join(output_dir, f's2_physics_{env}'), formats)
@@ -617,14 +597,11 @@ def plot_physics_params(centralized_result, output_dir, env, formats):
 
 
 # ============================================================================
-# NEW PLOT FUNCTIONS
+# ADVANCED ANALYSIS PLOTS
 # ============================================================================
 
 def plot_centralized_learning_curves(centralized_result, output_dir, env, formats):
-    """
-    Centralized training: train loss, val loss, and loc error on same plot.
-    Shows oracle-free training (val_loss for selection, loc_error for reporting).
-    """
+    """Centralized training: train loss, val loss, and loc error."""
     try:
         train_loss = centralized_result.get('train_loss', [])
         val_loss = centralized_result.get('val_loss', [])
@@ -679,10 +656,10 @@ def plot_centralized_learning_curves(centralized_result, output_dir, env, format
         
         ax.set_xlabel('Epoch')
         ax.set_ylabel('Localization Error (m)')
-        ax.set_title('(b) Localization Error (for reporting only)', fontweight='bold')
+        ax.set_title('(b) Localization Error (reporting only)', fontweight='bold')
         ax.legend(loc='upper right', fontsize=9)
         
-        fig.suptitle(f'Centralized Training - {env.replace("_", " ").title()}',
+        fig.suptitle(f'Centralized Training — {env.replace("_", " ").title()}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         return save_figure(fig, os.path.join(output_dir, f's2_centralized_curves_{env}'), formats)
@@ -693,17 +670,13 @@ def plot_centralized_learning_curves(centralized_result, output_dir, env, format
 
 
 def plot_theta_aggregation(federated_results, output_dir, env, true_jammer, formats):
-    """
-    Visualize theta aggregation in FL: client thetas -> global theta.
-    Shows geometric median aggregation effect.
-    """
+    """Visualize theta aggregation in FL: client thetas -> global theta."""
     try:
         algo_list = [a for a in ['fedavg', 'fedprox', 'scaffold'] if a in federated_results]
         if not algo_list:
             return None
         
         n_algos = min(len(algo_list), 3)
-        # Much larger figure size
         fig, axes = plt.subplots(1, n_algos, figsize=(12*n_algos, 10))
         if n_algos == 1:
             axes = [axes]
@@ -713,11 +686,10 @@ def plot_theta_aggregation(federated_results, output_dir, env, true_jammer, form
             result = federated_results[algo]
             history = result.get('history', {})
             
-            # Get theta trajectory
             theta_x = history.get('theta_x', [])
             theta_y = history.get('theta_y', [])
             
-            # True jammer - much larger marker
+            # True jammer
             if true_jammer:
                 ax.scatter(true_jammer[0], true_jammer[1], c=COLORS['secondary'],
                           s=600, marker='*', edgecolors='black', linewidths=3,
@@ -734,7 +706,6 @@ def plot_theta_aggregation(federated_results, output_dir, env, true_jammer, form
                     ax.plot(theta_x[i:i+2], theta_y[i:i+2],
                            color=colors[i], lw=4, alpha=0.7)
                 
-                # Start and end - much larger markers
                 ax.scatter(theta_x[0], theta_y[0], c='lightgreen',
                           s=300, marker='o', edgecolors='black', linewidths=2.5,
                           label='Round 1')
@@ -743,7 +714,7 @@ def plot_theta_aggregation(federated_results, output_dir, env, true_jammer, form
                           s=400, marker='o', edgecolors='black', linewidths=2.5,
                           label='Final')
             
-            # Final theta - much larger marker
+            # Final theta
             if 'theta_hat' in result:
                 theta = result['theta_hat']
                 err = result.get('best_loc_error', np.nan)
@@ -751,7 +722,6 @@ def plot_theta_aggregation(federated_results, output_dir, env, true_jammer, form
                           s=500, marker='D', edgecolors='black', linewidths=3,
                           label=f'Final ({err:.2f}m)', zorder=9)
             
-            # Much larger font sizes
             ax.set_xlabel('East (m)', fontsize=20, fontweight='bold')
             ax.set_ylabel('North (m)', fontsize=20, fontweight='bold')
             ax.set_aspect('equal')
@@ -759,21 +729,16 @@ def plot_theta_aggregation(federated_results, output_dir, env, true_jammer, form
                      markerscale=1.2, edgecolor='black', fancybox=True)
             ax.set_title(f'{algo.upper()}', fontweight='bold', fontsize=22, pad=15)
             
-            # Much larger tick labels
             ax.tick_params(axis='both', which='major', labelsize=16, width=2, length=6)
             
-            # Thicker spines
             for spine in ax.spines.values():
                 spine.set_linewidth(2)
             
-            # Grid with better visibility
             ax.grid(True, alpha=0.4, linestyle='--', linewidth=1)
         
-        # Much larger title
-        fig.suptitle(f'Theta Trajectory per FL Algorithm - {env.replace("_", " ").title()}',
+        fig.suptitle(f'Theta Trajectory per FL Algorithm — {env.replace("_", " ").title()}',
                     fontsize=24, fontweight='bold', y=0.98)
         
-        # Adjust spacing between subplots
         plt.tight_layout(rect=[0, 0, 1, 0.96], w_pad=3)
         
         return save_figure(fig, os.path.join(output_dir, f's2_theta_aggregation_{env}'), formats)
@@ -782,11 +747,9 @@ def plot_theta_aggregation(federated_results, output_dir, env, true_jammer, form
         plt.close()
         return None
 
+
 def plot_fusion_weights(centralized_result, federated_results, output_dir, env, formats):
-    """
-    Evolution of fusion weights w_PL and w_NN over training.
-    Shows how the model balances physics vs neural network.
-    """
+    """Evolution of fusion weights w_PL and w_NN over training."""
     try:
         fig, ax = plt.subplots(figsize=(10, 6))
         has_data = False
@@ -805,14 +768,13 @@ def plot_fusion_weights(centralized_result, federated_results, output_dir, env, 
                        label='w_NN (Neural)', ls='-')
                 has_data = True
                 
-                # Annotate final values
                 ax.text(0.98, 0.75, f'Final w_PL: {w_pl[-1]:.3f}\nFinal w_NN: {w_nn[-1]:.3f}',
                        transform=ax.transAxes, ha='right', va='top', fontsize=10,
                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
         # FL fusion weights (if available)
         if federated_results:
-            for algo in ['scaffold']:  # Show one FL algo
+            for algo in ['scaffold']:
                 if algo in federated_results:
                     hist = federated_results[algo].get('history', {})
                     w_pl_fl = hist.get('w_pl', [])
@@ -835,7 +797,7 @@ def plot_fusion_weights(centralized_result, federated_results, output_dir, env, 
         ax.set_ylabel('Fusion Weight')
         ax.set_ylim(-0.05, 1.05)
         ax.legend(loc='best', fontsize=9)
-        ax.set_title(f'Fusion Weight Evolution - {env.replace("_", " ").title()}', pad=12)
+        ax.set_title(f'Fusion Weight Evolution — {env.replace("_", " ").title()}', pad=12)
         
         plt.tight_layout()
         return save_figure(fig, os.path.join(output_dir, f's2_fusion_weights_{env}'), formats)
@@ -846,11 +808,8 @@ def plot_fusion_weights(centralized_result, federated_results, output_dir, env, 
 
 
 def plot_rssi_residuals(df, centralized_result, output_dir, env, formats):
-    """
-    RSSI residual analysis: predicted vs actual, residuals vs distance.
-    """
+    """RSSI residual analysis: predicted vs actual, residuals vs distance."""
     try:
-        # Check for necessary columns
         rssi_col = next((c for c in ['RSSI_pred', 'RSSI'] if c in df.columns), None)
         if rssi_col is None:
             return None
@@ -859,7 +818,6 @@ def plot_rssi_residuals(df, centralized_result, output_dir, env, formats):
         if theta_hat is None:
             return None
         
-        # Compute distances to estimated jammer
         if 'x_enu' in df.columns and 'y_enu' in df.columns:
             x_pos = df['x_enu'].values
             y_pos = df['y_enu'].values
@@ -869,7 +827,7 @@ def plot_rssi_residuals(df, centralized_result, output_dir, env, formats):
         
         rssi = df[rssi_col].values
         
-        # Get physics params for theoretical curve
+        # Get physics params
         physics = centralized_result.get('physics_params', {})
         gamma = physics.get('gamma', 2.5)
         P0 = physics.get('P0', -40)
@@ -883,55 +841,49 @@ def plot_rssi_residuals(df, centralized_result, output_dir, env, formats):
         # (a) RSSI vs Distance with model fit
         ax = axes[0]
         
-        # Filter valid distances
         valid = distances > 0
         distances_valid = distances[valid]
         rssi_valid = rssi[valid]
         
-        # Scatter plot
         ax.scatter(distances_valid, rssi_valid, c=COLORS['light_gray'], s=10, alpha=0.4, label='Data')
         
-        # Theoretical curve
         d_range = np.linspace(max(1, distances_valid.min()), distances_valid.max(), 100)
         rssi_theory = P0 - 10 * gamma * np.log10(d_range)
         ax.plot(d_range, rssi_theory, color=COLORS['secondary'], lw=2.5, 
-               label=f'Model: P0={P0:.1f}, gamma={gamma:.2f}')
+               label=f'Model: P0={P0:.1f}, γ={gamma:.2f}')
         
-        ax.set_xlabel('Distance to theta_hat (m)')
+        ax.set_xlabel('Distance to θ̂ (m)')
         ax.set_ylabel('RSSI (dBm)')
         ax.legend(loc='upper right', fontsize=9)
-        ax.set_title('(a) RSSI vs Distance to Estimated Jammer', fontweight='bold')
+        ax.set_title('(a) RSSI vs Distance', fontweight='bold')
         
         # (b) Residuals vs Distance
         ax = axes[1]
         
-        # Compute residuals
         rssi_pred = P0 - 10 * gamma * np.log10(np.maximum(distances_valid, 1))
         residuals = rssi_valid - rssi_pred
         
         ax.scatter(distances_valid, residuals, c=COLORS['primary'], s=10, alpha=0.4)
         ax.axhline(0, color='black', lw=1)
         
-        # Add +/- 2sigma bands
         residual_std = np.std(residuals)
-        ax.axhline(2*residual_std, color='gray', ls='--', alpha=0.5, label=f'+/-2sigma ({2*residual_std:.1f} dB)')
+        ax.axhline(2*residual_std, color='gray', ls='--', alpha=0.5, label=f'±2σ ({2*residual_std:.1f} dB)')
         ax.axhline(-2*residual_std, color='gray', ls='--', alpha=0.5)
         ax.fill_between([distances_valid.min(), distances_valid.max()], 
                         -2*residual_std, 2*residual_std, alpha=0.1, color='gray')
         
-        ax.set_xlabel('Distance to theta_hat (m)')
+        ax.set_xlabel('Distance to θ̂ (m)')
         ax.set_ylabel('Residual (dB)')
         ax.legend(loc='upper right', fontsize=9)
-        ax.set_title('(b) RSSI Residuals (Actual - Model)', fontweight='bold')
+        ax.set_title('(b) RSSI Residuals', fontweight='bold')
         
-        # Add stats text
         mae = np.mean(np.abs(residuals))
         rmse = np.sqrt(np.mean(residuals**2))
         ax.text(0.02, 0.98, f'MAE: {mae:.2f} dB\nRMSE: {rmse:.2f} dB',
                transform=ax.transAxes, ha='left', va='top', fontsize=10,
                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
-        fig.suptitle(f'RSSI Model Fit Analysis - {env.replace("_", " ").title()}',
+        fig.suptitle(f'RSSI Model Fit Analysis — {env.replace("_", " ").title()}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         return save_figure(fig, os.path.join(output_dir, f's2_rssi_residuals_{env}'), formats)
@@ -942,11 +894,8 @@ def plot_rssi_residuals(df, centralized_result, output_dir, env, formats):
 
 
 def plot_client_data_distribution(federated_results, output_dir, env, formats):
-    """
-    Visualize client data distribution to show non-IID nature.
-    """
+    """Visualize client data distribution to show non-IID nature."""
     try:
-        # Use first available FL result
         algo = next((a for a in ['scaffold', 'fedavg', 'fedprox'] if a in federated_results), None)
         if algo is None:
             return None
@@ -954,7 +903,6 @@ def plot_client_data_distribution(federated_results, output_dir, env, formats):
         result = federated_results[algo]
         history = result.get('history', {})
         
-        # Get client sizes
         client_sizes = history.get('client_sizes', result.get('client_sizes', []))
         
         if not client_sizes:
@@ -967,18 +915,16 @@ def plot_client_data_distribution(federated_results, output_dir, env, formats):
         colors = [CLIENT_COLORS[i % len(CLIENT_COLORS)] for i in range(n_clients)]
         bars = ax.bar(x, client_sizes, color=colors, edgecolor='black', alpha=0.8)
         
-        # Add value labels
         for bar, size in zip(bars, client_sizes):
             ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(client_sizes)*0.02,
                    str(size), ha='center', va='bottom', fontsize=10, fontweight='bold')
         
-        # Add mean line
         mean_size = np.mean(client_sizes)
         ax.axhline(mean_size, color='red', ls='--', lw=2, label=f'Mean: {mean_size:.0f}')
         
         ax.set_xlabel('Client ID')
         ax.set_ylabel('Number of Samples')
-        ax.set_title(f'Client Data Distribution ({algo.upper()}) - {env.replace("_", " ").title()}', 
+        ax.set_title(f'Client Data Distribution ({algo.upper()}) — {env.replace("_", " ").title()}', 
                     fontweight='bold')
         ax.set_xticks(x)
         ax.legend(loc='upper right')
@@ -992,9 +938,7 @@ def plot_client_data_distribution(federated_results, output_dir, env, formats):
 
 
 def plot_fl_rounds_progression(federated_results, output_dir, env, true_jammer, formats):
-    """
-    Show FL training progression: loss and theta error per round for all algorithms.
-    """
+    """Show FL training progression: loss and theta error per round."""
     try:
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         
@@ -1026,7 +970,7 @@ def plot_fl_rounds_progression(federated_results, output_dir, env, true_jammer, 
         else:
             ax.text(0.5, 0.5, 'Val loss data\nnot available', 
                    transform=ax.transAxes, ha='center', va='center')
-            ax.set_title('(a) Validation Loss per Round', fontweight='bold')
+            ax.set_title('(a) Validation Loss', fontweight='bold')
         
         # (b) Loc error per round
         ax = axes[1]
@@ -1054,16 +998,15 @@ def plot_fl_rounds_progression(federated_results, output_dir, env, true_jammer, 
             ax.legend(loc='upper right', fontsize=9)
             ax.set_title('(b) Localization Error per Round', fontweight='bold')
             
-            # Log scale if needed
             y_data = ax.get_ylim()
             if y_data[1] / max(y_data[0], 0.1) > 20:
                 ax.set_yscale('log')
         else:
             ax.text(0.5, 0.5, 'Loc error data\nnot available',
                    transform=ax.transAxes, ha='center', va='center')
-            ax.set_title('(b) Localization Error per Round', fontweight='bold')
+            ax.set_title('(b) Localization Error', fontweight='bold')
         
-        fig.suptitle(f'FL Training Progression - {env.replace("_", " ").title()}',
+        fig.suptitle(f'FL Training Progression — {env.replace("_", " ").title()}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         return save_figure(fig, os.path.join(output_dir, f's2_fl_progression_{env}'), formats)
@@ -1192,7 +1135,7 @@ def plot_summary_dashboard(df, centralized_result, federated_results,
         ax.set_ylabel('Error (m)')
         ax.set_title('(c) Final Errors', fontweight='bold')
         
-        fig.suptitle(f'Stage 2: Localization Summary - {env.replace("_", " ").title()}',
+        fig.suptitle(f'Stage 2: Localization Summary — {env.replace("_", " ").title()}',
                     fontsize=16, fontweight='bold', y=0.98)
         
         return save_figure(fig, os.path.join(output_dir, f's2_summary_{env}'), formats)
@@ -1200,6 +1143,68 @@ def plot_summary_dashboard(df, centralized_result, federated_results,
         print(f"  Error in summary dashboard: {e}")
         plt.close()
         return None
+
+
+# ============================================================================
+# COORDINATE FRAME COMPARISON (ABLATION STUDY)
+# ============================================================================
+
+def plot_coordinate_frame_comparison(
+    df_neutral: Optional[pd.DataFrame],
+    df_oracle: Optional[pd.DataFrame],
+    centralized_neutral: Dict,
+    centralized_oracle: Dict,
+    output_dir: str,
+    env: str = "unknown"
+) -> Optional[str]:
+    """Create side-by-side visualization comparing neutral vs jammer-centered ENU frames."""
+    if not HAS_MATPLOTLIB or (df_neutral is None) or (df_oracle is None):
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"coordframe_comparison_{env}.png")
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=200)
+    frames = [
+        ("Neutral frame (origin = receiver centroid)", df_neutral, centralized_neutral),
+        ("Jammer-centered frame (oracle baseline, jammer at origin)", df_oracle, centralized_oracle),
+    ]
+
+    for ax, (title, df_, res_) in zip(axes, frames):
+        x = df_["x_enu"].values
+        y = df_["y_enu"].values
+        ax.scatter(x, y, s=6, alpha=0.35, label="Receivers")
+
+        ax.scatter([0], [0], marker="+", s=120, linewidths=2, label="Origin")
+
+        true_theta = res_.get("theta_true", None)
+        if true_theta is not None:
+            try:
+                tx, ty = float(true_theta[0]), float(true_theta[1])
+                ax.scatter([tx], [ty], marker="*", s=180, label="True jammer")
+            except Exception:
+                pass
+
+        theta_hat = res_.get("theta_hat", None) or res_.get("theta", None)
+        if theta_hat is not None:
+            try:
+                hx, hy = float(theta_hat[0]), float(theta_hat[1])
+                ax.scatter([hx], [hy], marker="X", s=120, label="Estimated jammer")
+            except Exception:
+                pass
+
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("East (m)")
+        ax.set_ylabel("North (m)")
+        ax.axis("equal")
+        ax.grid(True, alpha=0.25)
+        ax.legend(fontsize=8, loc="best")
+
+    fig.suptitle(f"Coordinate-frame comparison — {env}", fontsize=12)
+    fig.tight_layout(rect=[0, 0.02, 1, 0.95])
+    fig.savefig(out_path, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 # ============================================================================

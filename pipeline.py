@@ -1,6 +1,25 @@
 """
 Unified Jammer Localization Pipeline
 =====================================
+
+End-to-end pipeline combining:
+- Stage 1: RSSI Estimation from AGC/CN0 observables
+- Stage 2: Jammer Localization from estimated RSSI
+
+ORACLE-FREE METHODOLOGY (January 2026):
+=======================================
+All model selection is based on validation loss (val_loss) ONLY.
+Localization error (loc_error) is tracked for reporting but NEVER used
+for training decisions, early stopping, or model selection.
+
+This ensures deployable models that don't rely on knowing the true
+jammer position during training.
+
+MODIFICATIONS:
+- Device-based FL partitioning support
+- Oracle-free early stopping (val_loss only)
+- SCAFFOLD with control variates on NN + w parameters
+- Consistent divergence threshold (3.0) across all FL algorithms
 """
 
 import os
@@ -17,7 +36,7 @@ try:
 except ImportError:
     HAS_MATPLOTLIB = False
     def generate_stage1_plots(*args, **kwargs):
-        print("stage1_plots module not available, skipping plots")
+        print("⚠ stage1_plots module not available, skipping plots")
         return {}
 
 # Stage 2 plotting module
@@ -27,45 +46,8 @@ try:
 except ImportError:
     HAS_STAGE2_PLOTS = False
     def generate_stage2_plots(*args, **kwargs):
-        print("stage2_plots module not available, skipping plots")
+        print("⚠ stage2_plots module not available, skipping plots")
         return {}
-
-# ----------------------------------------------------------------------------
-# Result schema normalization helpers (to support plotting across variants)
-# ----------------------------------------------------------------------------
-
-def _normalize_theta_history_in_result(res: Dict[str, Any]) -> Dict[str, Any]:
-    """Ensure theta history is accessible via common keys for downstream plotting."""
-    if not isinstance(res, dict):
-        return res
-
-    # If history exists as x/y arrays, convert to theta_hat_history
-    hist = res.get("history")
-    if isinstance(hist, dict):
-        if "theta_hat_history" not in res and "theta_history" not in res:
-            if "theta_hat_x" in hist and "theta_hat_y" in hist:
-                xs = np.asarray(hist["theta_hat_x"], dtype=float).reshape(-1)
-                ys = np.asarray(hist["theta_hat_y"], dtype=float).reshape(-1)
-                n = min(len(xs), len(ys))
-                res["theta_hat_history"] = [np.array([xs[i], ys[i]], dtype=float) for i in range(n)]
-            elif "theta_x" in hist and "theta_y" in hist:
-                xs = np.asarray(hist["theta_x"], dtype=float).reshape(-1)
-                ys = np.asarray(hist["theta_y"], dtype=float).reshape(-1)
-                n = min(len(xs), len(ys))
-                res["theta_history"] = [np.array([xs[i], ys[i]], dtype=float) for i in range(n)]
-        # Promote nested lists if present
-        for k in ["theta_hat_history", "theta_history"]:
-            if k in hist and k not in res:
-                res[k] = hist[k]
-
-    # If only theta_x/y at top-level, create theta_history list
-    if "theta_history" not in res and ("theta_x" in res and "theta_y" in res):
-        xs = np.asarray(res.get("theta_x"), dtype=float).reshape(-1)
-        ys = np.asarray(res.get("theta_y"), dtype=float).reshape(-1)
-        n = min(len(xs), len(ys))
-        res["theta_history"] = [np.array([xs[i], ys[i]], dtype=float) for i in range(n)]
-
-    return res
 
 from config import (
     Config, RSSIConfig, cfg, rssi_cfg,
@@ -90,10 +72,17 @@ def get_rssi_config_for_environment(env: str):
     # Use the proper factory function from config.py
     cfg = create_rssi_config_for_environment(env)
     
-
-    cfg.use_distance_aware_loss = True
+    # FIXED: Disable physics-aware loss - not needed with SimpleLinearRSSI
+    # The overfitting was caused by DistanceAwareHybrid, not by missing physics loss
+    cfg.use_distance_aware_loss = False
     cfg.validate_distance_every = 0
 
+    # Note: The following tuning is NOT USED anymore since SimpleLinearRSSI
+    # doesn't have these parameters. Kept for reference.
+    # if env == 'open_sky':
+    #     cfg.distance_corr_weight = 0.5
+    #     cfg.distance_corr_target = -0.3
+    # ...
 
     return cfg
 
@@ -157,7 +146,14 @@ def run_stage1_rssi_estimation(
     verbose: bool = True,
     generate_plots: bool = True
 ) -> Dict[str, Any]:
-    
+    """
+    Run Stage 1: RSSI Estimation.
+
+    Estimates jammer RSSI from smartphone observables (AGC, C/N0).
+
+    NOTE: Physics-aware distance loss is controlled inside RSSIConfig and rssi_trainer.
+    It requires lat/lon in the CSV + jammer_lat/jammer_lon set in config.
+    """
     from rssi_trainer import train_rssi_pipeline, run_rssi_inference
     from rssi_trainer import load_rssi_data, build_category_indices
 
@@ -311,6 +307,55 @@ def run_stage2_localization(
     if config is None:
         config = cfg
 
+    # Optional analysis: compare coordinate frames (centralized only)
+    # - neutral: ENU origin at receiver centroid (oracle-free)
+    # - jammer_centered: ENU origin at TRUE jammer (oracle baseline, θ_true=(0,0))
+    if bool(getattr(config, "compare_coordinate_frames", False)):
+        from copy import deepcopy
+        base_out = getattr(config, "results_dir", None)
+
+        cfg_neutral = deepcopy(config)
+        cfg_neutral.compare_coordinate_frames = False
+        cfg_neutral.coordinate_frame = "neutral"
+        cfg_neutral.center_to_jammer = False
+        if base_out:
+            cfg_neutral.results_dir = os.path.join(base_out, "coordframe_neutral")
+
+        cfg_oracle = deepcopy(config)
+        cfg_oracle.compare_coordinate_frames = False
+        cfg_oracle.coordinate_frame = "jammer_centered"
+        cfg_oracle.center_to_jammer = True
+        if base_out:
+            cfg_oracle.results_dir = os.path.join(base_out, "coordframe_jammer_centered")
+
+        # Run centralized only for both frames (keep FL out of this comparison)
+        res_neutral = run_stage2_localization(input_csv, cfg_neutral, run_fl=False, verbose=verbose, generate_plots=generate_plots)
+        res_oracle = run_stage2_localization(input_csv, cfg_oracle, run_fl=False, verbose=verbose, generate_plots=generate_plots)
+
+        # Try to generate a side-by-side reference-frame plot (if stage2_plots provides it)
+        comp_plot = None
+        try:
+            from stage2_plots import plot_coordinate_frame_comparison
+            out_dir = base_out or "results"
+            os.makedirs(out_dir, exist_ok=True)
+            comp_plot = plot_coordinate_frame_comparison(
+                df_neutral=res_neutral.get("df", None),
+                df_oracle=res_oracle.get("df", None),
+                centralized_neutral=res_neutral.get("centralized", {}),
+                centralized_oracle=res_oracle.get("centralized", {}),
+                output_dir=out_dir,
+                env=str(getattr(config, "environment", "unknown"))
+            )
+        except Exception:
+            comp_plot = None
+
+        return {
+            "neutral": res_neutral,
+            "jammer_centered": res_oracle,
+            "comparison_plot": comp_plot,
+        }
+
+
     if verbose:
         print("\n" + "="*60)
         print("STAGE 2: JAMMER LOCALIZATION")
@@ -318,6 +363,10 @@ def run_stage2_localization(
 
     print_environment_info(config, verbose)
 
+    # --- Reference frame selection (neutral vs jammer-centered) ---
+    # Default: neutral ENU frame (origin = receiver centroid). This is oracle-free and recommended.
+    # Optional (analysis baseline): jammer-centered ENU frame (origin = TRUE jammer, i.e., θ_true=(0,0)).
+    # To compare both, set config.compare_coordinate_frames=True or CLI flag (if wired).
     _df_ref = pd.read_csv(input_csv)
 
     # Filter by environment if configured
@@ -326,11 +375,28 @@ def run_stage2_localization(
                           == str(config.environment).lower()]
 
     if len(_df_ref) > 0:
-        config.lat0 = float(pd.to_numeric(_df_ref["lat"], errors="coerce").median())
-        config.lon0 = float(pd.to_numeric(_df_ref["lon"], errors="coerce").median())
-        if verbose:
-            print(f"✓ ENU reference set to data centroid: lat0={config.lat0:.6f}, lon0={config.lon0:.6f}")
+        # Always compute centroid reference (used by neutral frame and as a fallback)
+        centroid_lat = float(pd.to_numeric(_df_ref["lat"], errors="coerce").median())
+        centroid_lon = float(pd.to_numeric(_df_ref["lon"], errors="coerce").median())
 
+        # Coordinate-frame mode
+        frame = str(getattr(config, "coordinate_frame", "neutral") or "neutral").lower()
+        if bool(getattr(config, "center_to_jammer", False)):
+            frame = "jammer_centered"
+
+        if frame in ("jammer_centered", "jammer", "oracle"):
+            # Oracle-centered baseline: ENU origin = true jammer (0,0)
+            if (getattr(config, "jammer_lat", None) is None) or (getattr(config, "jammer_lon", None) is None):
+                raise ValueError("coordinate_frame='jammer_centered' requires config.jammer_lat/jammer_lon.")
+            config.lat0 = float(getattr(config, "jammer_lat"))
+            config.lon0 = float(getattr(config, "jammer_lon"))
+            if verbose:
+                print(f"✓ ENU reference set to TRUE jammer (oracle baseline): lat0={config.lat0:.6f}, lon0={config.lon0:.6f}")
+        else:
+            config.lat0 = centroid_lat
+            config.lon0 = centroid_lon
+            if verbose:
+                print(f"✓ ENU reference set to data centroid (neutral): lat0={config.lat0:.6f}, lon0={config.lon0:.6f}")
     config.csv_path = input_csv
 
     # Filter stage-2 by environment if enabled
@@ -377,7 +443,9 @@ def run_stage2_localization(
     train_loader, val_loader, test_loader, dataset_full = create_dataloaders(df, config, verbose)
     train_dataset = train_loader.dataset
 
-  
+    # FIXED: Initialize theta from DataFrame ENU positions directly
+    # Previously: sliced feature tensors which is fragile and may not be actual positions
+    # Now: use x_enu, y_enu columns from the DataFrame which are guaranteed to be positions
     if 'x_enu' in df.columns and 'y_enu' in df.columns:
         # Get positions from training subset
         train_indices = train_dataset.indices if hasattr(train_dataset, 'indices') else range(len(train_dataset))
@@ -394,14 +462,17 @@ def run_stage2_localization(
             train_df['y_enu'].mean()
         ], dtype=np.float32)
     else:
-        
+        # Fallback: use feature tensor (first 2 elements assumed to be x, y)
+        # This is less reliable but maintains backward compatibility
         all_positions = np.array([train_dataset[i][0][:2].numpy() for i in range(len(train_dataset))])
         data_centroid = all_positions.mean(axis=0).astype(np.float32)
     
     theta_init = data_centroid
 
     # True jammer position in ENU (NEUTRAL FRAME)
-    
+    # FIXED: We now use data centroid as ENU origin (set above), NOT jammer location.
+    # This means true_theta is the jammer's position relative to the data centroid.
+    # Previously, the code assumed jammer was at (0,0) which was oracle leakage.
     
     jammer_lat = getattr(config, 'jammer_lat', None)
     jammer_lon = getattr(config, 'jammer_lon', None)
@@ -467,26 +538,9 @@ def run_stage2_localization(
         'test_mse': test_mse,
         'lat': lat_hat,
         'lon': lon_hat,
-
-        # Keep full training history for richer plots/diagnostics
-        'history': history,
-
-        # Common training curves (may be empty depending on trainer implementation)
         'train_loss': history.get('train_loss', []),
         'val_loss': history.get('val_loss', []),
         'loc_error': history.get('loc_error', []),
-
-        # Optional parameter trajectories (only present if trainer logs them)
-        'theta_x': history.get('theta_x', []),
-        'theta_y': history.get('theta_y', []),
-        'gamma_hist': history.get('gamma', history.get('gamma_hist', [])),
-        'p0_hist': history.get('P0', history.get('p0_hist', [])),
-        
-        # Fusion weights history (for Stage 2 plots)
-        'w_pl': history.get('w_pl', []),
-        'w_nn': history.get('w_nn', []),
-
-        # Final learned physics parameters
         'physics_params': get_physics_params(model),
     }
 
@@ -584,20 +638,9 @@ def run_stage2_localization(
                 algo=algo,
                 global_rounds=config.global_rounds,
                 local_epochs=config.local_epochs,
-                verbose=verbose,
+                warmup_rounds=config.fl_warmup_rounds,
+                verbose=verbose
             )
-
-            # Normalize schema so plotting code can find theta trajectories
-            fl_result = _normalize_theta_history_in_result(fl_result)
-
-            # Ensure a usable final theta_hat exists
-            if 'theta_hat' not in fl_result or fl_result.get('theta_hat') is None:
-                if fl_result.get('theta') is not None:
-                    fl_result['theta_hat'] = fl_result['theta']
-                elif fl_result.get('theta_hat_history'):
-                    fl_result['theta_hat'] = fl_result['theta_hat_history'][-1]
-                elif fl_result.get('theta_history'):
-                    fl_result['theta_hat'] = fl_result['theta_history'][-1]
 
             theta_fl = fl_result['theta_hat']
             lat0_rad = np.radians(config.lat0)
@@ -670,7 +713,12 @@ def augment_stage2_dataset(
     config: Config = None,
     verbose: bool = True
 ) -> str:
+    """
+    Augment Stage 2 dataset with synthetic spatial samples.
     
+    Note: Synthetic samples are generated around the ENU origin (data centroid),
+    NOT around the jammer location (which is unknown to the model).
+    """
     if config is None:
         config = cfg
 
@@ -753,7 +801,8 @@ def augment_stage2_dataset(
     rssi_synth = P0 - 10 * gamma * np.log10(distances) + shadowing
     rssi_synth = np.clip(rssi_synth, rssi_min - 5, rssi_max + 5)
 
-  
+    # FIXED: Renamed to 'distance_to_origin' since this is distance from ENU origin
+    # (data centroid), NOT distance to the actual jammer (which is unknown to model)
     df_synth = pd.DataFrame({
         'lat': lat_synth,
         'lon': lon_synth,
@@ -881,6 +930,11 @@ def run_full_pipeline(
         generate_plots=generate_plots
     )
 
+    # Handle compare_coordinate_frames mode which returns different structure
+    if 'neutral' in stage2_result and 'centralized' not in stage2_result:
+        # Use the neutral frame result as the primary result
+        stage2_result = stage2_result['neutral']
+
     results = {
         'stage1': {
             'metrics': stage1_result['metrics'],
@@ -988,7 +1042,7 @@ def run_all_environments(
             )
             all_results[env] = result
         except Exception as e:
-            print(f"\n Error processing {env}: {e}")
+            print(f"\n❌ Error processing {env}: {e}")
             all_results[env] = {'error': str(e)}
 
     # summary
