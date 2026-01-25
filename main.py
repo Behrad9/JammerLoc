@@ -1,206 +1,253 @@
-#!/usr/bin/env python3
 """
 Jammer Localization Framework - Main Entry Point
 =================================================
 
 CLI interface for running jammer localization experiments.
 
-Modes:
-    --full-pipeline    Run complete pipeline (Stage 1 + Stage 2)
-    --stage1-only      Run only RSSI estimation
-    --stage2-only      Run only localization (requires RSSI predictions)
-    --centralized-only Run only centralized training (no FL)
-    --fl-only          Run only federated learning
+THESIS EXPERIMENTS:
+    # Full two-stage pipeline (Stage 1 RSSI + Stage 2 Localization)
+    python main.py --full-pipeline --input combined_data.csv --env urban
     
-Ablation Studies (Thesis):
-    --rssi-ablation       RSSI source ablation (Oracle vs Predicted vs Shuffled)
-    --model-ablation      Model architecture ablation (Pure PL vs APBM by environment)
-    --all-ablation        Run all thesis ablation studies
-    --component-ablation  Legacy: component ablation (Pure PL vs Pure NN vs APBM)
-    --ablation            Legacy: comprehensive RSSI ablation
-
-Usage:
-    python main.py --full-pipeline --input raw_data.csv
-    python main.py --stage1-only --input raw_data.csv
-    python main.py --stage2-only --input rssi_predictions.csv
+    # Stage 1 only: RSSI estimation from AGC/CN0
+    python main.py --stage1-only --input raw_gnss_data.csv --env urban
     
-    # Thesis ablations (NEW)
-    python main.py --rssi-ablation --input stage1_rssi_output.csv
-    python main.py --model-ablation --input combined_data_v2.csv
-    python main.py --all-ablation --input combined_data_v2.csv
+    # Stage 2 only: Localization from RSSI predictions
+    python main.py --stage2-only --input rssi_predictions.csv --env urban
     
-    # Legacy ablations
-    python main.py --ablation --input stage2_data.csv --ablation-trials 5
-    python main.py --component-ablation --input stage2_data.csv --ablation-trials 5
+ABLATION STUDIES:
+    # RSSI Source Ablation: Oracle vs Predicted vs Shuffled vs Noisy
+    python main.py --rssi-ablation --input rssi_predictions.csv --env urban
+    
+    # Model Architecture Ablation: Pure PL vs APBM by environment
+    python main.py --model-ablation --input rssi_predictions.csv
+    
+    # Run all ablation studies
+    python main.py --all-ablation --input rssi_predictions.csv
 
 Author: Behrad Shayegan
+Master Thesis - Politecnico di Torino, 2026
 """
 
 import argparse
 import json
 import os
+import sys
 import numpy as np
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 from config import Config, RSSIConfig, cfg, rssi_cfg
 from utils import set_seed, ensure_dir, compute_localization_error
 
 
 def parse_args():
-    """Parse command line arguments"""
+    """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Jammer Localization with Federated Learning",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        description="GNSS Jammer Localization using ML and Federated Learning",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+EXAMPLES:
+  # Full pipeline (Stage 1 + Stage 2)
+  python main.py --full-pipeline --input data.csv --env urban
+  
+  # Stage 1 only (RSSI estimation)
+  python main.py --stage1-only --input raw_data.csv
+  
+  # Stage 2 only (Localization) with FL
+  python main.py --stage2-only --input rssi_pred.csv --algo fedavg fedprox scaffold
+  
+  # RSSI ablation (proves Stage 1 predictions matter)
+  python main.py --rssi-ablation --input rssi_pred.csv --env urban --n-trials 10
+  
+  # Model ablation (Pure PL vs APBM by environment)
+  python main.py --model-ablation --input rssi_pred.csv --environments open_sky suburban urban
+        """
     )
     
-    # Pipeline mode
-    mode_group = parser.add_mutually_exclusive_group()
-    mode_group.add_argument('--full-pipeline', action='store_true',
-                           help='Run complete pipeline (Stage 1 + Stage 2)')
-    mode_group.add_argument('--stage1-only', action='store_true',
-                           help='Run only RSSI estimation (Stage 1)')
-    mode_group.add_argument('--stage2-only', action='store_true',
-                           help='Run only localization (Stage 2)')
+    # =========================================================================
+    # PIPELINE MODE (mutually exclusive)
+    # =========================================================================
+    mode_group = parser.add_mutually_exclusive_group(required=False)
     
-    # NEW: Thesis ablation modes
-    mode_group.add_argument('--rssi-ablation', action='store_true',
-                           help='RSSI source ablation: proves Stage 1 predictions matter')
-    mode_group.add_argument('--model-ablation', action='store_true',
-                           help='Model architecture ablation: Pure PL vs APBM by environment')
+    # Main pipeline modes
+    mode_group.add_argument('--full-pipeline', action='store_true',
+                           help='Run complete pipeline: Stage 1 (RSSI) + Stage 2 (Localization)')
+    mode_group.add_argument('--stage1-only', action='store_true',
+                           help='Run Stage 1 only: RSSI estimation from AGC/CN0')
+    mode_group.add_argument('--stage2-only', action='store_true',
+                           help='Run Stage 2 only: Localization from RSSI predictions')
+    
+    # Ablation modes
+    mode_group.add_argument('--rssi-ablation', '--rssi-only', action='store_true',
+                           dest='rssi_ablation',
+                           help='RSSI Source Ablation: Oracle vs Predicted vs Shuffled vs Noisy')
+    mode_group.add_argument('--model-ablation', '--model-only', action='store_true',
+                           dest='model_ablation',
+                           help='Model Architecture Ablation: Pure PL vs APBM by environment')
     mode_group.add_argument('--all-ablation', action='store_true',
                            help='Run all thesis ablation studies')
     
-    # Legacy ablation modes (backward compatibility)
-    mode_group.add_argument('--ablation', action='store_true',
-                           help='Legacy: Run comprehensive RSSI ablation study')
-    mode_group.add_argument('--comprehensive-ablation', action='store_true',
-                           help='Legacy: Run comprehensive RSSI ablation study')
-    mode_group.add_argument('--component-ablation', action='store_true',
-                           help='Legacy: Run component ablation (Pure PL vs Pure NN vs APBM)')
+    # =========================================================================
+    # DATA INPUT/OUTPUT
+    # =========================================================================
+    data_group = parser.add_argument_group('Data')
+    data_group.add_argument('--input', '--csv', '-i', type=str, required=False,
+                           dest='csv', metavar='FILE',
+                           help='Path to input CSV file')
+    data_group.add_argument('--output-dir', '-o', type=str, default=None,
+                           metavar='DIR',
+                           help='Output directory for results (default: results/<mode>)')
     
-    # Data
-    parser.add_argument('--input', '--csv', type=str, default=None, dest='csv',
-                        help='Path to input CSV file')
-    parser.add_argument('--output-dir', type=str, default=None,
-                        help='Output directory for results')
+    # =========================================================================
+    # ENVIRONMENT SETTINGS
+    # =========================================================================
+    env_group = parser.add_argument_group('Environment')
+    env_group.add_argument('--env', '--environment', type=str, default=None,
+                          choices=['open_sky', 'suburban', 'urban', 'lab_wired', 'mixed'],
+                          help='Environment filter (single environment)')
+    env_group.add_argument('--environments', type=str, nargs='+',
+                          default=['open_sky', 'suburban', 'urban'],
+                          help='Environments for model ablation (default: open_sky suburban urban)')
     
-    # Environment filter (for ablation)
-    parser.add_argument('--env', type=str, default=None,
-                        choices=['open_sky', 'suburban', 'urban', 'lab_wired'],
-                        help='Environment filter for ablation studies')
-    parser.add_argument('--environments', type=str, nargs='+',
-                        default=['open_sky', 'suburban', 'urban'],
-                        help='Environments for model ablation')
+    # =========================================================================
+    # TRAINING MODE
+    # =========================================================================
+    train_group = parser.add_argument_group('Training Mode')
+    train_group.add_argument('--centralized-only', action='store_true',
+                            help='Run only centralized training (no FL)')
+    train_group.add_argument('--fl-only', action='store_true',
+                            help='Run only federated learning (no centralized)')
     
-    # Training mode
-    parser.add_argument('--centralized-only', action='store_true',
-                        help='Run only centralized training (no FL)')
-    parser.add_argument('--fl-only', action='store_true',
-                        help='Run only federated learning')
+    # =========================================================================
+    # FEDERATED LEARNING SETTINGS
+    # =========================================================================
+    fl_group = parser.add_argument_group('Federated Learning')
+    fl_group.add_argument('--algo', '--algorithms', type=str, nargs='+',
+                         choices=['fedavg', 'fedprox', 'scaffold'],
+                         default=None, metavar='ALGO',
+                         help='FL algorithms to run (default: fedavg fedprox scaffold)')
+    fl_group.add_argument('--clients', '--num-clients', type=int, default=None,
+                         metavar='N',
+                         help='Number of FL clients (default: 5)')
+    fl_group.add_argument('--rounds', '--global-rounds', type=int, default=None,
+                         metavar='N',
+                         help='Number of FL communication rounds (default: 100)')
+    fl_group.add_argument('--local-epochs', type=int, default=None,
+                         metavar='N',
+                         help='Local epochs per FL round (default: 5)')
+    fl_group.add_argument('--partition', '--partition-strategy', type=str,
+                         choices=['random', 'geographic', 'device', 'distance'],
+                         default=None,
+                         help='FL data partition strategy (default: distance)')
+    fl_group.add_argument('--theta-agg', '--theta-aggregation', type=str,
+                         choices=['mean', 'geometric_median'],
+                         default=None,
+                         help='Theta aggregation method (default: geometric_median)')
     
-    # FL settings
-    parser.add_argument('--algo', type=str, nargs='+',
-                        choices=['fedavg', 'fedprox', 'scaffold'],
-                        default=None,
-                        help='FL algorithms to run')
-    parser.add_argument('--clients', type=int, default=None,
-                        help='Number of FL clients')
-    parser.add_argument('--rounds', type=int, default=None,
-                        help='Number of FL rounds')
-    parser.add_argument('--local-epochs', type=int, default=None,
-                        help='Local epochs per FL round')
-    parser.add_argument('--partition', type=str,
-                        choices=['random', 'geographic', 'signal_strength'],
-                        default=None,
-                        help='FL data partition strategy')
+    # =========================================================================
+    # TRAINING HYPERPARAMETERS
+    # =========================================================================
+    hyper_group = parser.add_argument_group('Hyperparameters')
+    hyper_group.add_argument('--epochs', type=int, default=None,
+                            help='Training epochs for centralized (default: 200)')
+    hyper_group.add_argument('--batch-size', type=int, default=None,
+                            help='Batch size (default: 64)')
+    hyper_group.add_argument('--lr', '--learning-rate', type=float, default=None,
+                            help='Learning rate (default: 0.001)')
     
-    # Training settings
-    parser.add_argument('--epochs', type=int, default=None,
-                        help='Training epochs')
-    parser.add_argument('--batch-size', type=int, default=None,
-                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=None,
-                        help='Learning rate')
+    # =========================================================================
+    # ABLATION SETTINGS
+    # =========================================================================
+    ablation_group = parser.add_argument_group('Ablation Settings')
+    ablation_group.add_argument('--n-trials', '--ablation-trials', type=int, default=5,
+                               dest='n_trials', metavar='N',
+                               help='Number of trials for ablation (default: 5)')
+    ablation_group.add_argument('--noise-levels', type=float, nargs='+',
+                               default=[1, 2, 3, 5, 7, 10],
+                               help='RSSI noise levels in dB (default: 1 2 3 5 7 10)')
+    ablation_group.add_argument('--rssi-sources', type=str, nargs='+',
+                               choices=['oracle', 'predicted', 'shuffled', 'constant', 'noisy'],
+                               default=None,
+                               help='RSSI sources for ablation (default: all)')
     
-    # Aggregation
-    parser.add_argument('--theta-agg', type=str,
-                        choices=['mean', 'geometric_median'],
-                        default=None,
-                        help='Theta aggregation method for FL')
+    # =========================================================================
+    # DATA AUGMENTATION (Stage 2)
+    # =========================================================================
+    aug_group = parser.add_argument_group('Data Augmentation')
+    aug_group.add_argument('--augment-stage2', action='store_true',
+                          help='Apply physics-based augmentation for Stage 2')
+    aug_group.add_argument('--augment-factor', type=float, default=3.0,
+                          help='Augmentation factor (default: 3.0x)')
+    aug_group.add_argument('--augment-radius', type=float, default=100.0,
+                          help='Max radius for synthetic positions in meters (default: 100)')
     
-    # Ablation settings
-    parser.add_argument('--ablation-trials', '--n-trials', type=int, default=5,
-                        dest='ablation_trials',
-                        help='Number of trials for ablation study')
-    parser.add_argument('--noise-levels', type=float, nargs='+',
-                        default=[1, 2, 3, 5, 7, 10],
-                        help='RSSI noise levels for ablation (dB)')
+    # =========================================================================
+    # OUTPUT OPTIONS
+    # =========================================================================
+    output_group = parser.add_argument_group('Output')
+    output_group.add_argument('--no-plots', action='store_true',
+                             help='Disable plot generation')
+    output_group.add_argument('--save-model', action='store_true',
+                             help='Save trained model checkpoint')
+    output_group.add_argument('--save-predictions', action='store_true',
+                             help='Save predictions to CSV')
     
-    # Data augmentation settings
-    parser.add_argument('--augment-stage2', action='store_true',
-                        help='Apply physics-based augmentation for Stage 2')
-    parser.add_argument('--augment-factor', type=float, default=3.0,
-                        help='Augmentation factor (multiplier for dataset size)')
-    parser.add_argument('--augment-radius', type=float, default=100.0,
-                        help='Maximum radius for synthetic positions (meters)')
-    parser.add_argument('--augment-gamma', type=float, default=2.0,
-                        help='Path loss exponent for augmentation')
-    parser.add_argument('--augment-p0', type=float, default=None,
-                        help='Reference power P0 for augmentation (auto-estimated if None)')
-    
-    # Output
-    parser.add_argument('--no-plots', action='store_true',
-                        help='Disable plotting')
-    parser.add_argument('--save-model', action='store_true',
-                        help='Save trained model')
-    
-    # Config
-    parser.add_argument('--config', type=str, default=None,
-                        help='Path to YAML config file')
-    parser.add_argument('--seed', type=int, default=None,
-                        help='Random seed')
-    
-    # Verbosity
-    parser.add_argument('-v', '--verbose', action='store_true',
-                        help='Verbose output')
-    parser.add_argument('-q', '--quiet', action='store_true',
-                        help='Minimal output')
+    # =========================================================================
+    # GENERAL OPTIONS
+    # =========================================================================
+    general_group = parser.add_argument_group('General')
+    general_group.add_argument('--config', type=str, default=None,
+                              metavar='FILE',
+                              help='Path to YAML config file')
+    general_group.add_argument('--seed', type=int, default=None,
+                              help='Random seed for reproducibility')
+    general_group.add_argument('-v', '--verbose', action='store_true',
+                              help='Verbose output')
+    general_group.add_argument('-q', '--quiet', action='store_true',
+                              help='Minimal output')
     
     return parser.parse_args()
 
 
-def update_config_from_args(args) -> Config:
-    """Update configuration from command line arguments"""
+def update_config_from_args(args, config: Config) -> Config:
+    """Update configuration from command line arguments."""
     
-    # Load from YAML if provided
-    if args.config:
-        config = Config.from_yaml(args.config)
-    else:
-        config = Config()
-    
-    # Override with CLI arguments
+    # Data paths
     if args.csv:
         config.csv_path = args.csv
+    if args.output_dir:
+        config.results_dir = args.output_dir
+    
+    # Environment
+    if args.env:
+        config.environment = args.env
+        config.filter_by_environment = True
+    
+    # FL settings
+    if args.algo:
+        config.fl_algorithms = args.algo
     if args.clients:
         config.num_clients = args.clients
     if args.rounds:
         config.global_rounds = args.rounds
     if args.local_epochs:
         config.local_epochs = args.local_epochs
+    if args.partition:
+        config.partition_strategy = args.partition
+    if args.theta_agg:
+        config.theta_aggregation = args.theta_agg
+    
+    # Training hyperparameters
     if args.epochs:
         config.epochs = args.epochs
     if args.batch_size:
         config.batch_size = args.batch_size
     if args.lr:
         config.lr_nn = args.lr
-    if args.theta_agg:
-        config.theta_aggregation = args.theta_agg
-    if args.output_dir:
-        config.results_dir = args.output_dir
+        config.lr_fl = args.lr
+    
+    # General
     if args.seed:
         config.seed = args.seed
-    if args.algo:
-        config.fl_algorithms = args.algo
     if args.quiet:
         config.verbose = False
     if args.verbose:
@@ -209,501 +256,462 @@ def update_config_from_args(args) -> Config:
     return config
 
 
-def run_experiment(config: Config, 
-                   run_centralized: bool = True,
-                   run_fl: bool = True,
-                   show_plots: bool = True) -> Dict[str, Any]:
-    """
-    Run complete jammer localization experiment.
+def update_rssi_config_from_args(args, config: RSSIConfig) -> RSSIConfig:
+    """Update RSSI configuration from command line arguments."""
     
-    Args:
-        config: Configuration object
-        run_centralized: Whether to run centralized training
-        run_fl: Whether to run federated learning
-        show_plots: Whether to display plots (DEPRECATED)
+    if args.output_dir:
+        config.results_dir = args.output_dir
+    if args.env:
+        config.environment = args.env
+        config.filter_by_environment = True
+    if args.seed:
+        config.seed = args.seed
+    if args.batch_size:
+        config.batch_size = args.batch_size
     
-    Returns:
-        Dictionary with all results
-    """
-    from data_loader import load_data, create_dataloaders, enu_to_latlon
-    from trainer import train_centralized, evaluate
-    from model_wrapper import get_physics_params
+    return config
+
+
+def print_header(title: str, width: int = 70):
+    """Print a formatted header."""
+    print("\n" + "=" * width)
+    print(f" {title}")
+    print("=" * width)
+
+
+def print_subheader(title: str, width: int = 60):
+    """Print a formatted subheader."""
+    print("\n" + "-" * width)
+    print(f" {title}")
+    print("-" * width)
+
+
+# =============================================================================
+# MAIN PIPELINE FUNCTIONS
+# =============================================================================
+
+def run_full_pipeline_cmd(args, loc_config: Config, rssi_config: RSSIConfig) -> int:
+    """Run full two-stage pipeline: Stage 1 (RSSI) + Stage 2 (Localization)."""
+    from pipeline import run_full_pipeline
     
-    try:
-        from server import run_federated_experiment
-        has_fl = True
-    except ImportError:
-        has_fl = False
-        if run_fl:
-            print("  Note: server module not available, skipping FL")
+    if not args.csv:
+        print("❌ Error: --input/--csv is required for full pipeline")
+        print("   Provide raw GNSS data CSV with AGC, CN0, and position columns")
+        return 1
     
-    set_seed(config.seed)
-    ensure_dir(config.results_dir)
+    print_header("FULL PIPELINE: Stage 1 (RSSI) + Stage 2 (Localization)")
     
-    print("\n" + "="*60)
-    print("JAMMER LOCALIZATION EXPERIMENT")
-    print("="*60)
+    if args.env:
+        print(f"Environment: {args.env.upper()}")
     
-    # Load and prepare data
-    print("\n📂 Loading data...")
-    df, lat0, lon0 = load_data(config.csv_path, config, verbose=config.verbose)
-    train_loader, val_loader, test_loader, train_dataset = create_dataloaders(
-        df, config, verbose=config.verbose
+    verbose = not args.quiet
+    
+    results = run_full_pipeline(
+        stage1_input=args.csv,
+        stage2_output_dir=loc_config.results_dir,
+        rssi_config=rssi_config,
+        loc_config=loc_config,
+        run_fl=not args.centralized_only,
+        verbose=verbose,
+        generate_plots=not args.no_plots,
+        augment_stage2=args.augment_stage2,
+        augment_factor=args.augment_factor
     )
     
-    # Get input dimension
-    sample_x = train_dataset[0][0]
-    input_dim = sample_x.shape[0]
-    print(f"  Input dimension: {input_dim}")
+    # Print summary
+    print_header("PIPELINE COMPLETE")
     
-    # Get physics parameters
-    physics_params = get_physics_params(train_dataset)
-    print(f"  γ_init: {physics_params['gamma']:.3f}")
-    print(f"  P0_init: {physics_params['P0']:.2f} dBm")
+    if 'stage1' in results and results['stage1']:
+        s1 = results['stage1'].get('metrics', {})
+        print(f"\nStage 1 (RSSI Estimation):")
+        print(f"  MAE:  {s1.get('mae', 'N/A'):.3f} dB")
+        print(f"  RMSE: {s1.get('rmse', 'N/A'):.3f} dB")
+        print(f"  R²:   {s1.get('r2', 'N/A'):.3f}")
     
-    results = {
-        'config': config.__dict__ if hasattr(config, '__dict__') else {},
-        'data': {
-            'n_samples': len(train_dataset),
-            'input_dim': input_dim,
-        },
-        'centralized': None,
-        'federated': {}
-    }
+    if 'stage2' in results and results['stage2']:
+        s2 = results['stage2']
+        print(f"\nStage 2 (Localization):")
+        if s2.get('centralized'):
+            print(f"  Centralized: {s2['centralized'].get('loc_err', 'N/A'):.2f} m")
+        if s2.get('federated'):
+            for algo, res in s2['federated'].items():
+                print(f"  {algo.upper()}: {res.get('best_loc_error', 'N/A'):.2f} m")
     
-    # ============================================================
-    # Centralized Training
-    # ============================================================
-    if run_centralized:
-        print("\n" + "-"*60)
-        print("CENTRALIZED TRAINING")
-        print("-"*60)
-        
-        model, history = train_centralized(
-            train_loader, val_loader, test_loader,
-            config=config,
-            input_dim=input_dim,
-            physics_params=physics_params,
-            verbose=config.verbose
-        )
-        
-        # Extract results from history
-        cent_results = {
-            'model': model,
-            'history': history,
-            'test_mse': history.get('test_mse', history['val_loss'][-1] if history['val_loss'] else float('inf')),
-            'loc_err': history.get('loc_err', history['loc_error'][-1] if history['loc_error'] else float('inf')),
-        }
-        
-        results['centralized'] = cent_results
-        
-        print(f"\n✓ Centralized complete:")
-        print(f"  Test MSE: {cent_results['test_mse']:.4f}")
-        print(f"  Loc Error: {cent_results['loc_err']:.2f} m")
-    
-    # ============================================================
-    # Federated Learning
-    # ============================================================
-    if run_fl and config.fl_algorithms and has_fl:
-        print("\n" + "-"*60)
-        print("FEDERATED LEARNING")
-        print("-"*60)
-        
-        from model import Net_augmented
-        import numpy as np
-        
-        # Initialize theta to the *training receiver centroid* in ENU coordinates.
-        # This avoids any bias from assuming the origin corresponds to the jammer.
-        # (In a neutral ENU frame, (0,0) is not necessarily the jammer.)
-        def _train_centroid_enu(train_loader_obj) -> np.ndarray:
-            ds = getattr(train_loader_obj, "dataset", None)
-            if ds is None:
-                return np.array([0.0, 0.0], dtype=np.float32)
-
-            # Typical case: DataLoader over a Subset of JammerDataset
-            try:
-                from torch.utils.data import Subset as TorchSubset
-                if isinstance(ds, TorchSubset) and hasattr(ds.dataset, "positions"):
-                    pos = ds.dataset.positions
-                    pos_np = pos.detach().cpu().numpy() if hasattr(pos, "detach") else np.asarray(pos)
-                    idx = np.asarray(ds.indices, dtype=np.int64)
-                    if idx.size > 0:
-                        return pos_np[idx].mean(axis=0).astype(np.float32)
-                # If it's a full dataset with positions, just take its centroid
-                if hasattr(ds, "positions"):
-                    pos = ds.positions
-                    pos_np = pos.detach().cpu().numpy() if hasattr(pos, "detach") else np.asarray(pos)
-                    if len(pos_np) > 0:
-                        return pos_np.mean(axis=0).astype(np.float32)
-            except Exception:
-                pass
-
-            # Fallback: estimate from a few batches (slower but safe)
-            coords = []
-            for xb, _ in train_loader_obj:
-                coords.append(xb[:, :2].detach().cpu().numpy())
-                if len(coords) >= 10:  # cap work
-                    break
-            if coords:
-                return np.concatenate(coords, axis=0).mean(axis=0).astype(np.float32)
-            return np.array([0.0, 0.0], dtype=np.float32)
-
-        theta_init = _train_centroid_enu(train_loader)
-        
-        fl_results = run_federated_experiment(
-            model_class=Net_augmented,
-            train_dataset=train_dataset,
-            val_loader=val_loader,
-            test_loader=test_loader,
-            algorithms=config.fl_algorithms,
-            config=config,
-            theta_init=theta_init,
-            verbose=config.verbose,
-        )
-        
-        results['federated'] = fl_results
-        
-        for algo, res in fl_results.items():
-            print(f"  {algo.upper()}: Best error: {res['best_loc_error']:.2f} m")
-    
-    
-    # Save results
-    save_results = {
-        'centralized': {
-            k: v for k, v in results['centralized'].items() 
-            if k != 'history'
-        } if results['centralized'] else None,
-        'federated': {
-            algo: {k: v for k, v in res.items() if k != 'history'}
-            for algo, res in results['federated'].items()
-        }
-    }
-    
-    with open(os.path.join(config.results_dir, 'results.json'), 'w') as f:
-        json.dump(save_results, f, indent=2, default=str)
-    
-    return results
+    print(f"\n✓ Results saved to: {loc_config.results_dir}/")
+    return 0
 
 
-def main():
-    """Main entry point"""
+def run_stage1_cmd(args, rssi_config: RSSIConfig) -> int:
+    """Run Stage 1 only: RSSI estimation from AGC/CN0."""
+    from pipeline import run_stage1_rssi_estimation
+    
+    if not args.csv:
+        print("❌ Error: --input/--csv is required for Stage 1")
+        print("   Provide raw GNSS data CSV with AGC, CN0 columns")
+        return 1
+    
+    print_header("STAGE 1: RSSI Estimation from AGC/CN0")
+    
+    if args.env:
+        print(f"Environment: {args.env.upper()}")
+    
+    verbose = not args.quiet
+    
+    results = run_stage1_rssi_estimation(
+        input_csv=args.csv,
+        config=rssi_config,
+        verbose=verbose,
+        generate_plots=not args.no_plots
+    )
+    
+    # Print summary
+    print_header("STAGE 1 COMPLETE")
+    
+    metrics = results.get('metrics', results.get('test_metrics', {}))
+    print(f"\nTest Metrics:")
+    print(f"  MAE:  {metrics.get('mae', 'N/A'):.3f} dB")
+    print(f"  RMSE: {metrics.get('rmse', 'N/A'):.3f} dB")
+    print(f"  R²:   {metrics.get('r2', 'N/A'):.3f}")
+    
+    if 'det_metrics' in results:
+        det = results['det_metrics']
+        print(f"\nDetection Metrics:")
+        print(f"  Accuracy:  {det.get('accuracy', 'N/A'):.3f}")
+        print(f"  Precision: {det.get('precision', 'N/A'):.3f}")
+        print(f"  Recall:    {det.get('recall', 'N/A'):.3f}")
+    
+    output_csv = results.get('output_csv', 'rssi_predictions.csv')
+    print(f"\n✓ Output CSV: {output_csv}")
+    print(f"  Columns: RSSI_pred_raw, RSSI_pred_cal, RSSI_pred_final, RSSI_pred_gated")
+    
+    return 0
+
+
+def run_stage2_cmd(args, loc_config: Config) -> int:
+    """Run Stage 2 only: Localization from RSSI predictions."""
+    from pipeline import run_stage2_localization
+    
+    if not args.csv:
+        print("❌ Error: --input/--csv is required for Stage 2")
+        print("   Provide CSV with RSSI_pred (or RSSI) and position columns")
+        return 1
+    
+    print_header("STAGE 2: Jammer Localization from RSSI")
+    
+    if args.env:
+        print(f"Environment: {args.env.upper()}")
+    
+    verbose = not args.quiet
+    run_fl = not args.centralized_only
+    run_centralized = not args.fl_only
+    
+    # Set default algorithms if not specified
+    if args.algo is None and run_fl:
+        loc_config.fl_algorithms = ['fedavg', 'fedprox', 'scaffold']
+    
+    results = run_stage2_localization(
+        input_csv=args.csv,
+        config=loc_config,
+        run_fl=run_fl,
+        verbose=verbose,
+        generate_plots=not args.no_plots
+    )
+    
+    # Print summary
+    print_header("STAGE 2 COMPLETE")
+    
+    if results.get('centralized'):
+        cent = results['centralized']
+        print(f"\nCentralized Training:")
+        print(f"  Localization Error: {cent.get('loc_err', cent.get('best_loc_error', 'N/A')):.2f} m")
+        print(f"  Test MSE: {cent.get('test_mse', cent.get('best_val_mse', 'N/A')):.4f}")
+    
+    if results.get('federated'):
+        print(f"\nFederated Learning:")
+        for algo, res in results['federated'].items():
+            err = res.get('best_loc_error', 'N/A')
+            rnd = res.get('best_round', 'N/A')
+            print(f"  {algo.upper()}: {err:.2f} m (round {rnd})")
+    
+    print(f"\n✓ Results saved to: {loc_config.results_dir}/")
+    return 0
+
+
+# =============================================================================
+# ABLATION STUDY FUNCTIONS
+# =============================================================================
+
+def run_rssi_ablation_cmd(args, loc_config: Config) -> int:
+    """
+    Run RSSI Source Ablation Study.
+    
+    Proves: Stage 1 RSSI predictions enable accurate localization.
+    Compares: Oracle (ground truth) vs Predicted vs Shuffled vs Noisy RSSI.
+    """
+    from ablation import run_rssi_source_ablation
+    
+    if not args.csv:
+        print("❌ Error: --input/--csv is required for RSSI ablation")
+        print("   Use Stage 1 output CSV (rssi_predictions.csv) or stage2_input.csv")
+        return 1
+    
+    output_dir = args.output_dir or "results/rssi_ablation"
+    
+    print_header("RSSI SOURCE ABLATION STUDY")
+    print("Thesis Question: Does Stage 1 RSSI quality affect localization?")
+    print("\nRSSI Sources:")
+    print("  • Oracle:    Ground truth RSSI (upper bound)")
+    print("  • Predicted: Stage 1 model predictions")
+    print("  • Shuffled:  Randomly permuted RSSI (destroys spatial correlation)")
+    print("  • Noisy:     Oracle + Gaussian noise (controlled degradation)")
+    
+    if args.env:
+        print(f"\nEnvironment: {args.env.upper()}")
+    
+    verbose = not args.quiet
+    
+    results = run_rssi_source_ablation(
+        input_csv=args.csv,
+        output_dir=output_dir,
+        env=args.env,
+        n_trials=args.n_trials,
+        noise_levels=args.noise_levels,
+        verbose=verbose
+    )
+    
+    # Print thesis conclusions
+    print_header("THESIS CONCLUSIONS: RSSI SOURCE ABLATION")
+    
+    oracle_err = results.get('oracle', {}).get('mean', float('inf'))
+    
+    print(f"\n{'Source':<15} {'Mean Error':<12} {'Std':<10} {'Ratio vs Oracle'}")
+    print("-" * 50)
+    
+    for source in ['oracle', 'predicted', 'shuffled', 'constant']:
+        if source in results:
+            r = results[source]
+            mean = r.get('mean', float('inf'))
+            std = r.get('std', 0)
+            ratio = mean / oracle_err if oracle_err > 0 else float('inf')
+            print(f"{source:<15} {mean:>8.2f} m   {std:>6.2f} m   {ratio:>6.2f}x")
+    
+    # Print noisy results
+    if 'noisy' in results:
+        print(f"\nNoisy RSSI (σ in dB):")
+        for noise_lvl, r in results['noisy'].items():
+            mean = r.get('mean', float('inf'))
+            ratio = mean / oracle_err if oracle_err > 0 else float('inf')
+            print(f"  σ={noise_lvl:>4} dB:  {mean:>8.2f} m   ({ratio:.2f}x oracle)")
+    
+    # Key insights
+    print("\n" + "-" * 50)
+    print("KEY INSIGHTS:")
+    
+    if 'predicted' in results:
+        pred_err = results['predicted']['mean']
+        pred_ratio = pred_err / oracle_err
+        if pred_ratio < 1.5:
+            print(f"  ✓ Stage 1 predictions are EFFECTIVE ({pred_ratio:.2f}x oracle)")
+        else:
+            print(f"  ⚠ Stage 1 predictions need improvement ({pred_ratio:.2f}x oracle)")
+    
+    if 'shuffled' in results:
+        shuf_err = results['shuffled']['mean']
+        shuf_ratio = shuf_err / oracle_err
+        print(f"  ✓ RSSI spatial correlation is CRITICAL ({shuf_ratio:.1f}x degradation when shuffled)")
+    
+    print(f"\n✓ Detailed results saved to: {output_dir}/")
+    return 0
+
+
+def run_model_ablation_cmd(args, loc_config: Config) -> int:
+    """
+    Run Model Architecture Ablation Study.
+    
+    Proves: Pure PL sufficient for open_sky, APBM needed for urban.
+    Compares: Pure Physics (Path Loss) vs APBM (Physics + NN) by environment.
+    """
+    from ablation import run_model_architecture_ablation
+    
+    if not args.csv:
+        print("❌ Error: --input/--csv is required for model ablation")
+        print("   Use combined dataset with multiple environments")
+        return 1
+    
+    output_dir = args.output_dir or "results/model_ablation"
+    
+    print_header("MODEL ARCHITECTURE ABLATION STUDY")
+    print("Thesis Question: When does the NN component help?")
+    print("\nModel Architectures:")
+    print("  • Pure PL: RSSI = P₀ - 10γ·log₁₀(d)  [physics only]")
+    print("  • APBM:    RSSI = w_PL·f_PL + w_NN·f_NN  [physics + neural]")
+    print(f"\nEnvironments: {', '.join(args.environments)}")
+    
+    verbose = not args.quiet
+    
+    results = run_model_architecture_ablation(
+        input_csv=args.csv,
+        output_dir=output_dir,
+        environments=args.environments,
+        n_trials=args.n_trials,
+        verbose=verbose
+    )
+    
+    # Print thesis conclusions
+    print_header("THESIS CONCLUSIONS: MODEL ARCHITECTURE")
+    
+    print(f"\n{'Environment':<12} {'Pure PL':<15} {'APBM':<15} {'Winner':<10} {'NN Benefit'}")
+    print("-" * 65)
+    
+    for env in args.environments:
+        if env not in results or not results[env]:
+            continue
+        
+        env_results = results[env]
+        pl_err = env_results.get('pure_pl', {}).get('mean', float('inf'))
+        apbm_err = env_results.get('apbm', {}).get('mean', float('inf'))
+        
+        winner = 'Pure PL' if pl_err <= apbm_err else 'APBM'
+        nn_benefit = (pl_err - apbm_err) / pl_err * 100 if pl_err > 0 else 0
+        
+        print(f"{env:<12} {pl_err:>8.2f} m      {apbm_err:>8.2f} m      {winner:<10} {nn_benefit:>+6.1f}%")
+    
+    # Key insights
+    print("\n" + "-" * 65)
+    print("KEY INSIGHTS:")
+    
+    for env in args.environments:
+        if env not in results or not results[env]:
+            continue
+        
+        env_results = results[env]
+        pl_err = env_results.get('pure_pl', {}).get('mean', float('inf'))
+        apbm_err = env_results.get('apbm', {}).get('mean', float('inf'))
+        
+        if env == 'open_sky' and pl_err <= apbm_err * 1.1:
+            print(f"  ✓ {env.upper()}: Simple physics sufficient (γ ≈ 2, free-space)")
+        elif env == 'urban' and apbm_err < pl_err:
+            improvement = (pl_err - apbm_err) / pl_err * 100
+            print(f"  ✓ {env.upper()}: NN captures multipath/NLOS ({improvement:.1f}% improvement)")
+        elif env == 'suburban':
+            if apbm_err < pl_err:
+                print(f"  ✓ {env.upper()}: Mixed propagation, NN helps with local variations")
+            else:
+                print(f"  ✓ {env.upper()}: Physics model handles moderate complexity")
+    
+    print(f"\n✓ Detailed results saved to: {output_dir}/")
+    return 0
+
+
+def run_all_ablation_cmd(args, loc_config: Config) -> int:
+    """Run all thesis ablation studies."""
+    from ablation import run_all_ablations
+    
+    if not args.csv:
+        print("❌ Error: --input/--csv is required for ablation studies")
+        return 1
+    
+    output_dir = args.output_dir or "results/ablation"
+    
+    print_header("ALL THESIS ABLATION STUDIES")
+    
+    verbose = not args.quiet
+    
+    results = run_all_ablations(
+        input_csv=args.csv,
+        output_dir=output_dir,
+        n_trials=args.n_trials,
+        verbose=verbose
+    )
+    
+    print_header("ALL ABLATION STUDIES COMPLETE")
+    print(f"\n✓ Results saved to: {output_dir}/")
+    print(f"   ├── rssi_ablation/")
+    print(f"   ├── model_ablation/")
+    print(f"   └── summary.json")
+    
+    return 0
+
+
+# =============================================================================
+# MAIN ENTRY POINT
+# =============================================================================
+
+def main() -> int:
+    """Main entry point."""
     args = parse_args()
     
-    # Determine verbosity
-    verbose = not args.quiet
-    if args.verbose:
-        verbose = True
+    # Load or create configs
+    if args.config:
+        loc_config = Config.from_yaml(args.config)
+        rssi_config = RSSIConfig()
+    else:
+        loc_config = Config()
+        rssi_config = RSSIConfig()
     
-    # Update config
-    loc_config = update_config_from_args(args)
-    rssi_config = RSSIConfig()
+    # Update configs from CLI arguments
+    loc_config = update_config_from_args(args, loc_config)
+    rssi_config = update_rssi_config_from_args(args, rssi_config)
     
-    # Override RSSI config if needed
-    if args.output_dir:
-        rssi_config.results_dir = args.output_dir
-    
-    # Ensure output directory exists
+    # Ensure output directories exist
     if args.output_dir:
         ensure_dir(args.output_dir)
     
-    # Set FL algorithms
-    if args.algo:
-        loc_config.fl_algorithms = args.algo
-    if args.partition:
-        loc_config.partition_strategy = args.partition
+    # Set random seed
+    if args.seed:
+        set_seed(args.seed)
     
     try:
-        # ============================================================
-        # NEW: RSSI SOURCE ABLATION (Thesis)
-        # Proves: Stage 1 RSSI predictions matter for localization
-        # ============================================================
-        if args.rssi_ablation:
-            from ablation import run_rssi_source_ablation
-            
-            if not args.csv:
-                print("❌ Error: --input/--csv is required for RSSI ablation")
-                print("   Use stage1_rssi_output.csv or stage2_input.csv")
-                return 1
-            
-            output_dir = args.output_dir or "results/rssi_ablation"
-            
-            print("\n" + "="*70)
-            print("RSSI SOURCE ABLATION (Thesis)")
-            print("Proves: Stage 1 RSSI predictions enable accurate localization")
-            print("="*70)
-            
-            results = run_rssi_source_ablation(
-                input_csv=args.csv,
-                output_dir=output_dir,
-                env=args.env,
-                n_trials=args.ablation_trials,
-                verbose=verbose
-            )
-            
-            # Print key thesis metrics
-            print("\n" + "="*70)
-            print("THESIS METRICS")
-            print("="*70)
-            
-            oracle_err = results['oracle']['mean']
-            
-            if 'predicted' in results:
-                pred_err = results['predicted']['mean']
-                pred_ratio = pred_err / oracle_err
-                print(f"\n✓ Stage 1 Performance: {pred_ratio:.2f}x Oracle")
-                
-                if pred_ratio < 1.5:
-                    print("  → Stage 1 predictions are EFFECTIVE!")
-            
-            shuf_err = results['shuffled']['mean']
-            shuf_ratio = shuf_err / oracle_err
-            print(f"\n✓ RSSI Importance: Shuffled is {shuf_ratio:.1f}x worse than Oracle")
-            
-            if shuf_ratio > 2.0:
-                print("  → RSSI quality SIGNIFICANTLY affects localization!")
-                if 'predicted' in results:
-                    improvement = (shuf_err - results['predicted']['mean']) / shuf_err * 100
-                    print(f"  → Stage 1 provides {improvement:.1f}% improvement over random RSSI")
-            
-            print(f"\n✓ Results saved to: {output_dir}/")
-            return 0
+        # =====================================================================
+        # ROUTE TO APPROPRIATE HANDLER
+        # =====================================================================
         
-        # ============================================================
-        # NEW: MODEL ARCHITECTURE ABLATION (Thesis)
-        # Proves: Pure PL wins in open_sky, APBM wins in urban
-        # ============================================================
-        elif args.model_ablation:
-            from ablation import run_model_architecture_ablation
-            
-            if not args.csv:
-                print("❌ Error: --input/--csv is required for model ablation")
-                print("   Use combined_data_v2.csv (dataset with all environments)")
-                return 1
-            
-            output_dir = args.output_dir or "results/model_ablation"
-            
-            print("\n" + "="*70)
-            print("MODEL ARCHITECTURE ABLATION (Thesis)")
-            print("Proves: Pure PL wins open_sky, APBM wins urban")
-            print("="*70)
-            
-            results = run_model_architecture_ablation(
-                input_csv=args.csv,
-                output_dir=output_dir,
-                environments=args.environments,
-                n_trials=args.ablation_trials,
-                verbose=verbose
-            )
-            
-            # Print thesis conclusions
-            print("\n" + "="*70)
-            print("THESIS CONCLUSIONS")
-            print("="*70)
-            
-            for env in args.environments:
-                if env not in results or not results[env]:
-                    continue
-                
-                env_errors = {k: v['mean'] for k, v in results[env].items()}
-                best = min(env_errors, key=env_errors.get)
-                
-                print(f"\n{env.upper()}:")
-                print(f"  Best model: {best.upper()} ({env_errors[best]:.2f}m)")
-                
-                if env == 'open_sky' and best == 'pure_pl':
-                    print("  → Simple physics sufficient (γ≈2)")
-                elif env == 'urban' and best == 'apbm':
-                    pl_err = env_errors.get('pure_pl', float('inf'))
-                    improvement = (pl_err - env_errors['apbm']) / pl_err * 100
-                    print(f"  → NN component provides {improvement:.1f}% improvement")
-                    print("  → Captures multipath/NLOS effects")
-            
-            print(f"\n✓ Results saved to: {output_dir}/")
-            return 0
+        if args.full_pipeline:
+            return run_full_pipeline_cmd(args, loc_config, rssi_config)
         
-        # ============================================================
-        # NEW: ALL ABLATIONS (Thesis)
-        # ============================================================
-        elif args.all_ablation:
-            from ablation import run_all_ablations
-            
-            if not args.csv:
-                print("❌ Error: --input/--csv is required for ablation studies")
-                return 1
-            
-            output_dir = args.output_dir or "results/ablation"
-            
-            print("\n" + "="*70)
-            print("ALL THESIS ABLATION STUDIES")
-            print("="*70)
-            
-            results = run_all_ablations(
-                input_csv=args.csv,
-                output_dir=output_dir,
-                n_trials=args.ablation_trials,
-                verbose=verbose
-            )
-            
-            print(f"\n✓ All ablation results saved to: {output_dir}/")
-            return 0
-        
-        # ============================================================
-        # LEGACY: COMPONENT ABLATION
-        # ============================================================
-        elif args.component_ablation:
-            from ablation import run_component_ablation_study
-            
-            if not args.csv:
-                print("❌ Error: --input/--csv is required for component ablation")
-                return 1
-            
-            output_dir = args.output_dir or "results/component_ablation"
-            
-            print("\n" + "="*70)
-            print("COMPONENT ABLATION STUDY (Legacy)")
-            print("Pure PL vs Pure NN vs APBM")
-            print("="*70)
-            
-            results = run_component_ablation_study(
-                input_csv=args.csv,
-                output_dir=output_dir,
-                n_trials=args.ablation_trials,
-                config=loc_config,
-                verbose=verbose
-            )
-            
-            print("\n" + "="*70)
-            print("COMPONENT ABLATION COMPLETE")
-            print("="*70)
-            
-            for model_key in ['pure_pl', 'true_pure_nn', 'geometry_aware_nn', 'apbm', 'apbm_residual']:
-                if model_key in results:
-                    r = results[model_key]
-                    print(f"{model_key:<18}: {r['mean']:.2f} ± {r['std']:.2f} m")
-            
-            print(f"\n✓ Results saved to: {output_dir}/")
-            return 0
-        
-        # ============================================================
-        # LEGACY: RSSI ABLATION (Comprehensive V2)
-        # ============================================================
-        elif args.ablation or args.comprehensive_ablation:
-            from ablation import run_comprehensive_rssi_ablation
-            
-            if not args.csv:
-                print("❌ Error: --input/--csv is required for RSSI ablation")
-                return 1
-            
-            output_dir = args.output_dir or "results/rssi_ablation"
-            
-            print("\n" + "="*70)
-            print("COMPREHENSIVE RSSI ABLATION STUDY (Legacy V2)")
-            print("Baseline, Noise, Bias, Scale, Density, Geometry")
-            print("="*70)
-            
-            results = run_comprehensive_rssi_ablation(
-                input_csv=args.csv,
-                output_dir=output_dir,
-                n_trials=args.ablation_trials,
-                noise_levels=args.noise_levels,
-                config=loc_config,
-                verbose=verbose
-            )
-            
-            print("\n" + "="*70)
-            print("COMPREHENSIVE RSSI ABLATION COMPLETE")
-            print("="*70)
-            print(f"\n✓ Results saved to: {output_dir}/")
-            return 0
-        
-        # ============================================================
-        # FULL PIPELINE: Stage 1 + Stage 2
-        # ============================================================
-        elif args.full_pipeline:
-            from pipeline import run_full_pipeline
-            
-            if not args.csv:
-                print("❌ Error: --input/--csv is required for full pipeline")
-                return 1
-            
-            if args.augment_stage2 and verbose:
-                print(f"\n📊 Stage 2 augmentation enabled:")
-                print(f"   Factor: {args.augment_factor}x")
-                print(f"   Radius: {args.augment_radius}m")
-                print(f"   Gamma: {args.augment_gamma}")
-            
-            results = run_full_pipeline(
-                stage1_input=args.csv,
-                stage2_output_dir=loc_config.results_dir,
-                rssi_config=rssi_config,
-                loc_config=loc_config,
-                run_fl=not args.centralized_only,
-                verbose=verbose,
-                augment_stage2=args.augment_stage2,
-                augment_factor=args.augment_factor
-            )
-            
-        # ============================================================
-        # STAGE 1 ONLY: RSSI Estimation
-        # ============================================================
         elif args.stage1_only:
-            from pipeline import run_stage1_rssi_estimation
-            
-            if not args.csv:
-                print("❌ Error: --input/--csv is required for Stage 1")
-                return 1
-            
-            results = run_stage1_rssi_estimation(
-                input_csv=args.csv,
-                config=rssi_config,
-                verbose=verbose
-            )
-            
-            print(f"\n✓ Stage 1 complete!")
-            print(f"  MAE: {results['metrics']['mae']:.3f} dB")
-            print(f"  Output: {results['output_csv']}")
-            
-        # ============================================================
-        # STAGE 2 ONLY (or default): Localization
-        # ============================================================
+            return run_stage1_cmd(args, rssi_config)
+        
+        elif args.stage2_only:
+            return run_stage2_cmd(args, loc_config)
+        
+        elif args.rssi_ablation:
+            return run_rssi_ablation_cmd(args, loc_config)
+        
+        elif args.model_ablation:
+            return run_model_ablation_cmd(args, loc_config)
+        
+        elif args.all_ablation:
+            return run_all_ablation_cmd(args, loc_config)
+        
         else:
-            from pipeline import run_stage2_localization
-            
-            run_centralized = not args.fl_only
-            run_fl = not args.centralized_only
-            
-            results = run_stage2_localization(
-                input_csv=loc_config.csv_path,
-                config=loc_config,
-                run_fl=run_fl,
-                verbose=verbose
-            )
-            
-            # Final summary
-            print("\n" + "="*60)
-            print("EXPERIMENT COMPLETED SUCCESSFULLY")
-            print("="*60)
-            
-            if results['centralized']:
-                print(f"\nCentralized: {results['centralized']['loc_err']:.2f}m error")
-            
-            if results['federated']:
-                print("\nFederated Learning:")
-                for algo, res in results['federated'].items():
-                    print(f"  {algo.upper()}: {res['best_loc_error']:.2f}m error")
-        
-        print(f"\n✓ Results saved to: {loc_config.results_dir}/")
-        return 0
-        
+            # Default: Stage 2 if input provided, else show help
+            if args.csv:
+                print("No mode specified, defaulting to --stage2-only")
+                return run_stage2_cmd(args, loc_config)
+            else:
+                print("Usage: python main.py [MODE] --input FILE [OPTIONS]")
+                print("\nModes:")
+                print("  --full-pipeline   Stage 1 (RSSI) + Stage 2 (Localization)")
+                print("  --stage1-only     RSSI estimation from AGC/CN0")
+                print("  --stage2-only     Localization from RSSI predictions")
+                print("  --rssi-ablation   RSSI source ablation study")
+                print("  --model-ablation  Model architecture ablation study")
+                print("\nRun 'python main.py --help' for full options.")
+                return 1
+    
     except FileNotFoundError as e:
         print(f"\n❌ File not found: {e}")
-        print("Please check the CSV path.")
         return 1
     
     except ImportError as e:
         print(f"\n❌ Import error: {e}")
-        print("Ensure all required modules are in the same directory.")
+        print("Ensure all required modules are available.")
         return 1
+    
+    except KeyboardInterrupt:
+        print("\n\n⚠ Interrupted by user")
+        return 130
     
     except Exception as e:
         print(f"\n❌ Error: {e}")
@@ -713,4 +721,4 @@ def main():
 
 
 if __name__ == "__main__":
-    exit(main())
+    sys.exit(main())

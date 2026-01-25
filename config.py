@@ -3,23 +3,7 @@ Configuration Module for Jammer Localization
 =============================================
 
 Centralized hyperparameters and experiment settings using dataclass.
-Supports YAML configuration loading for reproducible experiments.
 
-Two configuration classes:
-- RSSIConfig: Stage 1 (RSSI estimation from AGC/CN0)
-- Config: Stage 2 (Localization from RSSI)
-
-FIXES APPLIED for proper FL performance ranking (SCAFFOLD > FedProx ≈ FedAvg on non-IID):
-- FedProx mu reduced to fair value (0.01)
-- Theta aggregation uses geometric_median for robustness
-- FL warmup rounds increased for SCAFFOLD control variate buildup
-- Global rounds increased to give SCAFFOLD time to converge
-- Early stopping patience increased
-
-CRITICAL FIX (January 2026):
-- SCAFFOLD was showing MSE↓ but loc_error constant (θ frozen)
-- Root cause: Single LR caused NN to learn faster than θ
-- Fix: Hybrid SCAFFOLD with separate θ optimizer (5x LR, no control variates)
 """
 
 from dataclasses import dataclass, field

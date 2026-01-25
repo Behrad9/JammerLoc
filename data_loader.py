@@ -9,10 +9,6 @@ Handles:
 - Dataset creation
 - Client partitioning for federated learning
 
-Key design choice (IMPORTANT):
-- This loader uses a *neutral* ENU frame by default (origin is lat0/lon0, typically the median receiver position).
-- It does NOT re-center coordinates to the true jammer location.
-  (We still compute distance-to-jammer in ENU if jammer_lat/jammer_lon are provided, to support distance partitioning.)
 """
 
 from __future__ import annotations

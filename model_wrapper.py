@@ -8,8 +8,6 @@ Handles edge cases like:
 - Near-field path loss singularities
 - Safe forward methods
 
-The original BatchNorm concerns are outdated - model.py now uses LayerNorm
-which works fine with any batch size. We still handle dropout for batch=1.
 """
 
 import torch

@@ -6,20 +6,6 @@ End-to-end pipeline combining:
 - Stage 1: RSSI Estimation from AGC/CN0 observables
 - Stage 2: Jammer Localization from estimated RSSI
 
-ORACLE-FREE METHODOLOGY (January 2026):
-=======================================
-All model selection is based on validation loss (val_loss) ONLY.
-Localization error (loc_error) is tracked for reporting but NEVER used
-for training decisions, early stopping, or model selection.
-
-This ensures deployable models that don't rely on knowing the true
-jammer position during training.
-
-MODIFICATIONS:
-- Device-based FL partitioning support
-- Oracle-free early stopping (val_loss only)
-- SCAFFOLD with control variates on NN + w parameters
-- Consistent divergence threshold (3.0) across all FL algorithms
 """
 
 import os
