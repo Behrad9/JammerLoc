@@ -10,7 +10,7 @@
 
 ---
 
-## 📋 Table of Contents
+##  Table of Contents
 
 - [Overview](#overview)
 - [Pipeline Architecture](#pipeline-architecture)
@@ -108,7 +108,7 @@ GNSS jamming poses a significant threat to critical infrastructure. This work ad
 
 ```bash
 # Clone repository
-git clone https://github.com/[username]/jamloc.git
+git clone https://github.com/behrad9/jamloc.git
 cd jamloc
 
 # Create virtual environment (recommended)
