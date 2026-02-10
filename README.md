@@ -141,13 +141,13 @@ tqdm>=4.62.0
 python main.py --full-pipeline --input combined_data.csv --env urban
 
 # Run Stage 1 only (RSSI estimation)
-python main.py --stage1-only --input raw_gnss_data.csv
+python main.py --stage1-only --input combined_data.csv
 
 # Run Stage 2 only (localization from RSSI predictions)
-python main.py --stage2-only --input rssi_predictions.csv
+python main.py --stage2-only --input stage2_input.csv
 
 # Run with federated learning
-python main.py --stage2-only --input data.csv --algo fedavg fedprox scaffold
+python main.py --stage2-only --stage2_input.csv --algo fedavg fedprox scaffold
 ```
 
 ---
