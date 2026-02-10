@@ -63,7 +63,7 @@ P0_INIT_ENV: Dict[str, float] = {
     'mixed': -32.0,
 }
 
-
+#helper functions
 def get_jammer_location(environment: str) -> tuple:
     """Get jammer lat/lon for a specific environment."""
     if environment not in JAMMER_LOCATIONS:
@@ -246,7 +246,7 @@ class RSSIConfig:
     validate_distance_every: int = 10
 
     # Data
-    csv_path: str = "combined_data.csv"
+    csv_path: str = "lab_wired.csv"
     checkpoint_dir: str = "checkpoints_rssi"
 
     # Splitting
@@ -355,7 +355,7 @@ class Config:
     env_column: str = "env"
 
     # ==================== Data ====================
-    csv_path: str = "combined_data.csv"
+    csv_path: str = "lab_wired.csv"
     required_cols: List[str] = field(default_factory=lambda: ["lat", "lon", "jammed"])
     optional_cols: List[str] = field(default_factory=lambda: ["building_density", "local_signal_variance"])
     optional_features: List[str] = field(default_factory=lambda: ["building_density", "local_signal_variance"])
@@ -399,7 +399,7 @@ class Config:
     input_dim: int = 4
     hidden_layers: List[int] = field(default_factory=lambda: [512, 256, 128, 64, 1])
     nonlinearity: str = "leaky_relu"
-    dropout: float = 0.3
+    dropout: float = 0.2
     physics_bias: float = 2.0  # Initial w_PL / w_NN ratio
 
     # Physics model initialization
@@ -425,7 +425,7 @@ class Config:
     min_delta: float = 0.005
 
     # Loss weighting
-    peak_weight_alpha: float = 3.0
+    peak_weight_alpha: float = 2.0
 
     # ==================== Physics Regularization ====================
     theta_l2_reg: float = 0.0
@@ -446,7 +446,7 @@ class Config:
     min_samples_per_client: int = 10
 
     # Data partitioning - distance creates strong non-IID (SCAFFOLD's advantage)
-    partition_strategy: str = "random"  # Options: random, geographic, signal_strength, device, distance
+    partition_strategy: str = "geographic"  # Options: random, geographic, signal_strength, device, distance
 
     # FL training - more rounds for SCAFFOLD to converge
     local_epochs: int = 3

@@ -1,10 +1,10 @@
-
 #Stage 1 Plotting Module for RSSI Estimation (Thesis-Quality)
+# MODIFIED: Computes metrics on TEST SET ONLY for proper thesis reporting
 
 import os
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -100,6 +100,7 @@ COLORS = {
     'cyan': '#66CCEE',          # Cyan
     'gray': '#666666',
     'light_gray': '#BBBBBB',
+    'train': '#CCCCCC',         # Light gray for training points
 }
 
 CMAP_SEQUENTIAL = 'viridis'
@@ -118,6 +119,35 @@ def save_figure(fig, path_base: str, formats: List[str] = ['png', 'pdf']):
     return saved[0]
 
 
+def get_test_mask(df: pd.DataFrame, test_indices: Optional[Union[np.ndarray, List[int]]] = None) -> np.ndarray:
+    """
+    Get boolean mask for test samples.
+    
+    Priority:
+    1. Explicit test_indices parameter
+    2. 'is_test' column in df
+    3. 'split' column == 'test' in df
+    4. All True (use all data as fallback)
+    """
+    if test_indices is not None:
+        mask = np.zeros(len(df), dtype=bool)
+        for idx in test_indices:
+            if isinstance(idx, int) and 0 <= idx < len(df):
+                mask[idx] = True
+            elif idx in df.index:
+                loc = df.index.get_loc(idx)
+                if isinstance(loc, int):
+                    mask[loc] = True
+        return mask
+    elif 'is_test' in df.columns:
+        return df['is_test'].astype(bool).values
+    elif 'split' in df.columns:
+        return (df['split'] == 'test').values
+    else:
+        # Fallback: use all data
+        return np.ones(len(df), dtype=bool)
+
+
 # ============================================================================
 # MAIN PLOTTING FUNCTION
 # ============================================================================
@@ -129,10 +159,37 @@ def generate_stage1_plots(
     history: Dict = None,
     detection_results: Dict = None,
     model_params: Dict = None,
+    test_indices: Optional[Union[np.ndarray, List[int]]] = None,
     verbose: bool = True,
     export_pdf: bool = True
 ) -> Dict[str, str]:
-    """Generate all Stage 1 thesis-quality plots."""
+    """
+    Generate all Stage 1 thesis-quality plots.
+    
+    IMPORTANT: When test_indices is provided, metrics are computed on TEST SET ONLY.
+    This ensures proper thesis reporting without data leakage.
+    
+    Parameters:
+    -----------
+    df : DataFrame
+        Full dataset with predictions
+    output_dir : str
+        Directory for saving plots
+    env : str
+        Environment name for titles
+    history : Dict, optional
+        Training history with 'train_loss', 'val_loss'
+    detection_results : Dict, optional
+        Detection metrics (accuracy, precision, recall, f1)
+    model_params : Dict, optional
+        Model parameters
+    test_indices : array-like, optional
+        Indices of test samples. If None, checks for 'is_test'/'split' columns.
+    verbose : bool
+        Print progress messages
+    export_pdf : bool
+        Also export PDF format
+    """
     if not HAS_MATPLOTLIB:
         if verbose:
             print("⚠ matplotlib not available")
@@ -143,10 +200,18 @@ def generate_stage1_plots(
     formats = ['png', 'pdf'] if export_pdf else ['png']
     saved_plots = {}
     
+    # Get test mask
+    test_mask = get_test_mask(df, test_indices)
+    n_test = test_mask.sum()
+    n_total = len(df)
+    
     if verbose:
         print(f"\n{'='*60}")
         print(f"GENERATING STAGE 1 PLOTS — {env.upper()}")
         print(f"{'='*60}")
+        print(f"Total samples: {n_total}, Test samples: {n_test}")
+        if n_test < n_total and n_test > 0:
+            print(f"  ✓ Metrics computed on TEST SET ONLY ({n_test} samples)")
     
     # Find columns
     pred_col = next((c for c in ['RSSI_pred_cal', 'RSSI_pred', 'RSSI_pred_final'] 
@@ -160,19 +225,19 @@ def generate_stage1_plots(
     
     # Generate plots
     if gt_col:
-        path = plot_pred_vs_actual(df, gt_col, pred_col, output_dir, env, formats)
+        path = plot_pred_vs_actual(df, gt_col, pred_col, output_dir, env, formats, test_mask)
         if path:
             saved_plots['pred_vs_actual'] = path
             if verbose: print(f"✓ Prediction accuracy plot")
     
     if gt_col:
-        path = plot_residuals(df, gt_col, pred_col, output_dir, env, formats)
+        path = plot_residuals(df, gt_col, pred_col, output_dir, env, formats, test_mask)
         if path:
             saved_plots['residuals'] = path
             if verbose: print(f"✓ Residual analysis plot")
     
     if 'device' in df.columns and gt_col:
-        path = plot_device_performance(df, gt_col, pred_col, output_dir, env, formats)
+        path = plot_device_performance(df, gt_col, pred_col, output_dir, env, formats, test_mask)
         if path:
             saved_plots['device_performance'] = path
             if verbose: print(f"✓ Device performance plot")
@@ -184,14 +249,14 @@ def generate_stage1_plots(
             if verbose: print(f"✓ Training curves plot")
     
     if detection_results and 'jammed' in df.columns:
-        path = plot_detection(df, detection_results, output_dir, env, formats)
+        path = plot_detection(df, detection_results, output_dir, env, formats, test_mask)
         if path:
             saved_plots['detection'] = path
             if verbose: print(f"✓ Detection performance plot")
     
     if gt_col:
         path = plot_summary(df, gt_col, pred_col, output_dir, env, 
-                           detection_results, formats)
+                           detection_results, formats, test_mask)
         if path:
             saved_plots['summary'] = path
             if verbose: print(f"✓ Summary dashboard")
@@ -206,46 +271,88 @@ def generate_stage1_plots(
 # INDIVIDUAL PLOT FUNCTIONS
 # ============================================================================
 
-def plot_pred_vs_actual(df, gt_col, pred_col, output_dir, env, formats):
-    """Scatter plot with regression and statistics."""
+def plot_pred_vs_actual(df, gt_col, pred_col, output_dir, env, formats, 
+                        test_mask: np.ndarray = None):
+    """
+    Scatter plot with regression and statistics.
+    
+    Shows test data prominently, training data faded in background.
+    Metrics computed on TEST SET ONLY.
+    """
     try:
         fig, ax = plt.subplots(figsize=(7, 7))
         
-        y_true = df[gt_col].dropna().values
-        y_pred = df.loc[df[gt_col].notna(), pred_col].values
-        mask = ~np.isnan(y_pred)
-        y_true, y_pred = y_true[mask], y_pred[mask]
+        # Get all valid data
+        valid_mask = df[gt_col].notna() & df[pred_col].notna()
+        df_valid = df[valid_mask].copy()
         
-        # Metrics
-        mae = np.mean(np.abs(y_true - y_pred))
-        rmse = np.sqrt(np.mean((y_true - y_pred)**2))
-        ss_res = np.sum((y_true - y_pred)**2)
-        ss_tot = np.sum((y_true - np.mean(y_true))**2)
-        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
-        bias = np.mean(y_pred - y_true)
+        y_true_all = df_valid[gt_col].values
+        y_pred_all = df_valid[pred_col].values
         
-        # Density plot for large datasets
-        if len(y_true) > 500:
-            hb = ax.hexbin(y_true, y_pred, gridsize=40, cmap='Blues', 
-                          mincnt=1, linewidths=0.2)
+        # Apply test mask to valid data
+        if test_mask is not None:
+            test_mask_valid = test_mask[valid_mask.values]
+        else:
+            test_mask_valid = np.ones(len(df_valid), dtype=bool)
+        
+        # Separate test and train
+        y_true_test = y_true_all[test_mask_valid]
+        y_pred_test = y_pred_all[test_mask_valid]
+        y_true_train = y_true_all[~test_mask_valid]
+        y_pred_train = y_pred_all[~test_mask_valid]
+        
+        has_split = len(y_true_train) > 0 and len(y_true_test) > 0
+        
+        # Compute metrics on TEST SET ONLY
+        if len(y_true_test) > 0:
+            mae = np.mean(np.abs(y_true_test - y_pred_test))
+            rmse = np.sqrt(np.mean((y_true_test - y_pred_test)**2))
+            ss_res = np.sum((y_true_test - y_pred_test)**2)
+            ss_tot = np.sum((y_true_test - np.mean(y_true_test))**2)
+            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+            bias = np.mean(y_pred_test - y_true_test)
+            n_metrics = len(y_true_test)
+        else:
+            # Fallback if no test mask
+            mae = np.mean(np.abs(y_true_all - y_pred_all))
+            rmse = np.sqrt(np.mean((y_true_all - y_pred_all)**2))
+            ss_res = np.sum((y_true_all - y_pred_all)**2)
+            ss_tot = np.sum((y_true_all - np.mean(y_true_all))**2)
+            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+            bias = np.mean(y_pred_all - y_true_all)
+            n_metrics = len(y_true_all)
+        
+        # Plot training data (faded background) if we have split
+        if has_split and len(y_true_train) > 0:
+            ax.scatter(y_true_train, y_pred_train, alpha=0.15, s=15, 
+                      c=COLORS['train'], edgecolors='none', label='Train', zorder=1)
+        
+        # Plot test data (prominent)
+        y_true_plot = y_true_test if len(y_true_test) > 0 else y_true_all
+        y_pred_plot = y_pred_test if len(y_true_test) > 0 else y_pred_all
+        
+        if len(y_true_plot) > 500:
+            hb = ax.hexbin(y_true_plot, y_pred_plot, gridsize=40, cmap='Blues', 
+                          mincnt=1, linewidths=0.2, zorder=2)
             plt.colorbar(hb, ax=ax, label='Count', shrink=0.8)
         else:
-            ax.scatter(y_true, y_pred, alpha=0.5, s=25, c=COLORS['primary'],
-                      edgecolors='white', linewidths=0.3)
+            label = 'Test' if has_split else None
+            ax.scatter(y_true_plot, y_pred_plot, alpha=0.6, s=30, c=COLORS['primary'],
+                      edgecolors='white', linewidths=0.3, label=label, zorder=2)
         
         # Reference lines
         margin = 5
-        lims = [min(y_true.min(), y_pred.min()) - margin,
-                max(y_true.max(), y_pred.max()) + margin]
+        lims = [min(y_true_all.min(), y_pred_all.min()) - margin,
+                max(y_true_all.max(), y_pred_all.max()) + margin]
         ax.plot(lims, lims, 'k-', lw=2, label='Perfect prediction', zorder=5)
         
-        # Regression line
-        if HAS_SCIPY:
-            slope, intercept, r_val, _, se = stats.linregress(y_true, y_pred)
+        # Regression line on TEST data
+        if HAS_SCIPY and len(y_true_plot) > 2:
+            slope, intercept, r_val, _, se = stats.linregress(y_true_plot, y_pred_plot)
             x_fit = np.linspace(lims[0], lims[1], 100)
             y_fit = slope * x_fit + intercept
             ax.plot(x_fit, y_fit, color=COLORS['secondary'], lw=2, ls='--',
-                   label=f'Fit (R²={r_val**2:.3f})')
+                   label=f'Fit (R²={r_val**2:.3f})', zorder=4)
         
         ax.set_xlim(lims)
         ax.set_ylim(lims)
@@ -253,12 +360,13 @@ def plot_pred_vs_actual(df, gt_col, pred_col, output_dir, env, formats):
         ax.set_ylabel('Predicted RSSI (dBm)')
         ax.set_aspect('equal')
         
-        # Stats box
-        stats_text = (f'MAE = {mae:.2f} dB\n'
+        # Stats box - labeled as TEST SET metrics
+        header = 'TEST SET\n' if has_split else ''
+        stats_text = (f'{header}MAE = {mae:.2f} dB\n'
                      f'RMSE = {rmse:.2f} dB\n'
                      f'R² = {r2:.3f}\n'
                      f'Bias = {bias:+.2f} dB\n'
-                     f'N = {len(y_true):,}')
+                     f'N = {n_metrics:,}')
         props = dict(boxstyle='round,pad=0.5', facecolor='white', 
                     edgecolor='gray', alpha=0.9)
         ax.text(0.05, 0.95, stats_text, transform=ax.transAxes, fontsize=10,
@@ -270,17 +378,38 @@ def plot_pred_vs_actual(df, gt_col, pred_col, output_dir, env, formats):
         plt.tight_layout()
         return save_figure(fig, os.path.join(output_dir, f's1_pred_actual_{env}'), formats)
     except Exception as e:
-        print(f"  Error: {e}")
+        print(f"  Error in pred_vs_actual: {e}")
+        import traceback
+        traceback.print_exc()
         plt.close()
         return None
 
 
-def plot_residuals(df, gt_col, pred_col, output_dir, env, formats):
-    """Residual histogram and Q-Q plot."""
+def plot_residuals(df, gt_col, pred_col, output_dir, env, formats,
+                   test_mask: np.ndarray = None):
+    """
+    Residual histogram and Q-Q plot.
+    
+    Computed on TEST SET ONLY.
+    """
     try:
         fig, axes = plt.subplots(1, 2, figsize=(12, 5))
         
-        residuals = (df[pred_col] - df[gt_col]).dropna().values
+        # Get valid residuals
+        valid_mask = df[gt_col].notna() & df[pred_col].notna()
+        residuals_all = (df.loc[valid_mask, pred_col] - df.loc[valid_mask, gt_col]).values
+        
+        # Apply test mask
+        if test_mask is not None:
+            test_mask_valid = test_mask[valid_mask.values]
+            residuals = residuals_all[test_mask_valid]
+        else:
+            residuals = residuals_all
+        
+        if len(residuals) == 0:
+            residuals = residuals_all  # Fallback
+        
+        n_samples = len(residuals)
         
         # Histogram
         ax = axes[0]
@@ -297,7 +426,7 @@ def plot_residuals(df, gt_col, pred_col, output_dir, env, formats):
         ax.axvline(0, color='black', linestyle='--', lw=1.5)
         ax.set_xlabel('Residual (Predicted − Actual) [dB]')
         ax.set_ylabel('Probability Density')
-        ax.set_title('(a) Residual Distribution', fontweight='bold')
+        ax.set_title(f'(a) Residual Distribution (N={n_samples})', fontweight='bold')
         
         # Q-Q plot
         ax = axes[1]
@@ -314,22 +443,33 @@ def plot_residuals(df, gt_col, pred_col, output_dir, env, formats):
         plt.tight_layout()
         return save_figure(fig, os.path.join(output_dir, f's1_residuals_{env}'), formats)
     except Exception as e:
-        print(f"  Error: {e}")
+        print(f"  Error in residuals: {e}")
         plt.close()
         return None
 
 
-def plot_device_performance(df, gt_col, pred_col, output_dir, env, formats):
-    """Per-device MAE visualization."""
+def plot_device_performance(df, gt_col, pred_col, output_dir, env, formats,
+                            test_mask: np.ndarray = None):
+    """
+    Per-device MAE visualization.
+    
+    Computed on TEST SET ONLY.
+    """
     try:
+        # Filter to test set
+        if test_mask is not None:
+            df_eval = df[test_mask].copy()
+        else:
+            df_eval = df.copy()
+        
         # Compute metrics
         metrics = []
-        for dev in df['device'].unique():
-            mask = df['device'] == dev
-            y_t = df.loc[mask, gt_col].values
-            y_p = df.loc[mask, pred_col].values
+        for dev in df_eval['device'].unique():
+            mask = df_eval['device'] == dev
+            y_t = df_eval.loc[mask, gt_col].values
+            y_p = df_eval.loc[mask, pred_col].values
             valid = ~(np.isnan(y_t) | np.isnan(y_p))
-            if valid.sum() > 10:
+            if valid.sum() > 5:  # Minimum samples
                 mae = np.mean(np.abs(y_t[valid] - y_p[valid]))
                 metrics.append({'device': str(dev)[:12], 'mae': mae, 'n': valid.sum()})
         
@@ -365,14 +505,15 @@ def plot_device_performance(df, gt_col, pred_col, output_dir, env, formats):
         ax.set_xticklabels([m['device'] for m in metrics], rotation=45, ha='right')
         ax.set_xlabel('Device')
         ax.set_ylabel('Sample Count')
-        ax.set_title('(b) Sample Distribution', fontweight='bold')
+        ax.set_title('(b) Test Sample Distribution', fontweight='bold')
         
-        fig.suptitle(f'Per-Device Performance — {env.replace("_", " ").title()}',
+        title_suffix = ' [Test Set]' if test_mask is not None else ''
+        fig.suptitle(f'Per-Device Performance — {env.replace("_", " ").title()}{title_suffix}',
                     fontsize=14, fontweight='bold', y=1.02)
         plt.tight_layout()
         return save_figure(fig, os.path.join(output_dir, f's1_devices_{env}'), formats)
     except Exception as e:
-        print(f"  Error: {e}")
+        print(f"  Error in device_performance: {e}")
         plt.close()
         return None
 
@@ -428,13 +569,24 @@ def plot_training(history, output_dir, env, formats):
         return None
 
 
-def plot_detection(df, detection_results, output_dir, env, formats):
-    """Detection performance metrics."""
+def plot_detection(df, detection_results, output_dir, env, formats,
+                   test_mask: np.ndarray = None):
+    """
+    Detection performance metrics.
+    
+    Confusion matrix computed on TEST SET ONLY.
+    """
     try:
         fig, axes = plt.subplots(1, 2, figsize=(11, 5))
         
-        y_true = df['jammed'].values
-        y_pred = df.get('jammed_pred', pd.Series([0]*len(df))).values
+        # Filter to test set for confusion matrix
+        if test_mask is not None:
+            df_eval = df[test_mask].copy()
+        else:
+            df_eval = df.copy()
+        
+        y_true = df_eval['jammed'].values
+        y_pred = df_eval.get('jammed_pred', pd.Series([0]*len(df_eval))).values
         
         # Confusion matrix
         ax = axes[0]
@@ -458,9 +610,10 @@ def plot_detection(df, detection_results, output_dir, env, formats):
         ax.set_yticklabels(['Clean', 'Jammed'])
         ax.set_xlabel('Predicted')
         ax.set_ylabel('Actual')
-        ax.set_title('(a) Confusion Matrix', fontweight='bold')
+        title = f'(a) Confusion Matrix (N={total})'
+        ax.set_title(title, fontweight='bold')
         
-        # Metrics bars
+        # Metrics bars - use passed detection_results 
         ax = axes[1]
         names = ['Accuracy', 'Precision', 'Recall', 'F1']
         values = [detection_results.get(k.lower(), 0) for k in names]
@@ -487,21 +640,39 @@ def plot_detection(df, detection_results, output_dir, env, formats):
         return None
 
 
-def plot_summary(df, gt_col, pred_col, output_dir, env, detection_results, formats):
-    """Comprehensive summary figure."""
+def plot_summary(df, gt_col, pred_col, output_dir, env, detection_results, formats,
+                 test_mask: np.ndarray = None):
+    """
+    Comprehensive summary figure.
+    
+    All metrics computed on TEST SET ONLY.
+    """
     try:
         fig = plt.figure(figsize=(14, 9))
         gs = fig.add_gridspec(2, 3, hspace=0.35, wspace=0.35)
         
-        y_true = df[gt_col].dropna().values
-        y_pred = df.loc[df[gt_col].notna(), pred_col].values
-        mask = ~np.isnan(y_pred)
-        y_true, y_pred = y_true[mask], y_pred[mask]
+        # Get valid data with test mask
+        valid_mask = df[gt_col].notna() & df[pred_col].notna()
+        
+        if test_mask is not None:
+            eval_mask = valid_mask & pd.Series(test_mask, index=df.index)
+        else:
+            eval_mask = valid_mask
+        
+        y_true = df.loc[eval_mask, gt_col].values
+        y_pred = df.loc[eval_mask, pred_col].values
+        
+        if len(y_true) == 0:
+            y_true = df.loc[valid_mask, gt_col].values
+            y_pred = df.loc[valid_mask, pred_col].values
         
         # Metrics
         mae = np.mean(np.abs(y_true - y_pred))
         rmse = np.sqrt(np.mean((y_true - y_pred)**2))
-        r2 = 1 - np.sum((y_true - y_pred)**2) / np.sum((y_true - np.mean(y_true))**2)
+        ss_tot = np.sum((y_true - np.mean(y_true))**2)
+        r2 = 1 - np.sum((y_true - y_pred)**2) / ss_tot if ss_tot > 0 else 0
+        
+        has_split = test_mask is not None and test_mask.sum() < len(df)
         
         # (a) Pred vs Actual
         ax = fig.add_subplot(gs[0, 0])
@@ -529,7 +700,8 @@ def plot_summary(df, gt_col, pred_col, output_dir, env, detection_results, forma
         # (c) Metrics text
         ax = fig.add_subplot(gs[0, 2])
         ax.axis('off')
-        text = f"STAGE 1 METRICS\n{'='*22}\n\n"
+        header = "TEST SET METRICS" if has_split else "STAGE 1 METRICS"
+        text = f"{header}\n{'='*22}\n\n"
         text += f"MAE:  {mae:.2f} dB\nRMSE: {rmse:.2f} dB\nR²:   {r2:.3f}\n\n"
         text += f"Samples: {len(y_true):,}\n"
         if 'device' in df.columns:
@@ -554,22 +726,25 @@ def plot_summary(df, gt_col, pred_col, output_dir, env, detection_results, forma
         # (e) Per-device (if available)
         ax = fig.add_subplot(gs[1, 1])
         if 'device' in df.columns:
-            dev_mae = df.groupby('device').apply(
+            df_eval = df[eval_mask]
+            dev_mae = df_eval.groupby('device').apply(
                 lambda x: np.mean(np.abs(x[pred_col] - x[gt_col]))
             ).sort_values()
-            colors = [COLORS['success'] if v < 4 else COLORS['warning'] if v < 6 
-                     else COLORS['secondary'] for v in dev_mae.values]
-            ax.barh(range(len(dev_mae)), dev_mae.values, color=colors, alpha=0.8)
-            ax.set_yticks(range(len(dev_mae)))
-            ax.set_yticklabels([str(d)[:10] for d in dev_mae.index], fontsize=8)
-            ax.set_xlabel('MAE (dB)')
+            if len(dev_mae) > 0:
+                colors = [COLORS['success'] if v < 4 else COLORS['warning'] if v < 6 
+                         else COLORS['secondary'] for v in dev_mae.values]
+                ax.barh(range(len(dev_mae)), dev_mae.values, color=colors, alpha=0.8)
+                ax.set_yticks(range(len(dev_mae)))
+                ax.set_yticklabels([str(d)[:10] for d in dev_mae.index], fontsize=8)
+                ax.set_xlabel('MAE (dB)')
         ax.set_title('(e) Device MAE', fontweight='bold')
         
         # (f) Detection (if available)
         ax = fig.add_subplot(gs[1, 2])
         if detection_results:
             names = ['Acc', 'Prec', 'Rec', 'F1']
-            vals = [detection_results.get(n.lower() if n != 'Acc' else 'accuracy', 0) for n in names]
+            key_map = {'Acc': 'accuracy', 'Prec': 'precision', 'Rec': 'recall', 'F1': 'f1'}
+            vals = [detection_results.get(key_map[n], 0) for n in names]
             colors = [COLORS['primary'], COLORS['success'], COLORS['purple'], COLORS['warning']]
             bars = ax.bar(names, [v*100 for v in vals], color=colors, alpha=0.85)
             for bar, v in zip(bars, vals):
@@ -585,17 +760,31 @@ def plot_summary(df, gt_col, pred_col, output_dir, env, detection_results, forma
         return save_figure(fig, os.path.join(output_dir, f's1_summary_{env}'), formats)
     except Exception as e:
         print(f"  Error: {e}")
+        import traceback
+        traceback.print_exc()
         plt.close()
         return None
 
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('input_csv')
-    parser.add_argument('--output-dir', '-o', default='plots')
-    parser.add_argument('--env', '-e', default='urban')
+    parser = argparse.ArgumentParser(description='Generate Stage 1 plots (metrics on test set only)')
+    parser.add_argument('input_csv', help='Input CSV with predictions')
+    parser.add_argument('--output-dir', '-o', default='plots', help='Output directory')
+    parser.add_argument('--env', '-e', default='urban', help='Environment name')
+    parser.add_argument('--test-ratio', type=float, default=0.15,
+                       help='Fraction of data to treat as test set (default: 0.15)')
     args = parser.parse_args()
     
     df = pd.read_csv(args.input_csv)
-    generate_stage1_plots(df, args.output_dir, args.env, verbose=True)
+    
+    # Create test mask (last N% of samples)
+    n_test = int(len(df) * args.test_ratio)
+    if n_test > 0:
+        test_indices = list(range(len(df) - n_test, len(df)))
+        print(f"Using last {n_test} samples ({args.test_ratio*100:.0f}%) as test set")
+    else:
+        test_indices = None
+    
+    generate_stage1_plots(df, args.output_dir, args.env, 
+                         test_indices=test_indices, verbose=True)

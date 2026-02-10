@@ -1,0 +1,35 @@
+{
+  "_meta": {
+    "best_marker": "deployable_only",
+    "oracle_keys": [
+      "pure_pl_preest"
+    ],
+    "oracle_note": "pure_pl_preest (Pure PL pre-est.) is excluded from best-marker because it is an oracle-style reference."
+  },
+  "lab_wired": {
+    "pure_nn": {
+      "mean": 0.2710719704627991,
+      "std": 0.05412029102444649,
+      "ci_95": 0.04743852667955176,
+      "name": "Pure NN"
+    },
+    "pure_pl_preest": {
+      "mean": 0.0,
+      "std": 0.0,
+      "ci_95": 0.0,
+      "name": "Pure PL (pre-est.)"
+    },
+    "pure_pl_joint": {
+      "mean": 0.0,
+      "std": 0.0,
+      "ci_95": 0.0,
+      "name": "Pure PL (joint)"
+    },
+    "apbm": {
+      "mean": 0.0,
+      "std": 0.0,
+      "ci_95": 0.0,
+      "name": "APBM (Net_augmented)"
+    }
+  }
+}

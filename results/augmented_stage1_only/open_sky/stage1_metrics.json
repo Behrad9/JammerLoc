@@ -1,0 +1,16 @@
+{
+  "metrics": {
+    "mae": 1.4964155743982746,
+    "mse": 2.722702792077835,
+    "rmse": 1.6500614510004876,
+    "huber": 1.0228658258036258,
+    "r2": 0.8848396423560363
+  },
+  "det_metrics": {
+    "accuracy": 0.8686131386861314,
+    "precision": 0.3793103448275862,
+    "recall": 1.0,
+    "f1": 0.55
+  },
+  "output_csv": ".\\results\\augmented_stage1_only\\open_sky\\rssi_predictions.csv"
+}

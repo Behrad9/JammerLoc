@@ -357,8 +357,20 @@ def run_stage1_cmd(args, rssi_config: RSSIConfig) -> int:
     
     verbose = not args.quiet
     
+    # FIX: Use user-specified output directory if provided
+    output_csv = None
+    output_dir = args.output_dir
+    
+    if output_dir:
+        ensure_dir(output_dir)
+        output_csv = os.path.join(output_dir, "rssi_predictions.csv")
+        # Also update rssi_config to use this directory for checkpoints/plots
+        rssi_config.results_dir = output_dir
+        print(f"Output directory: {output_dir}")
+    
     results = run_stage1_rssi_estimation(
         input_csv=args.csv,
+        output_csv=output_csv,  # FIXED: Pass output_csv to function
         config=rssi_config,
         verbose=verbose,
         generate_plots=not args.no_plots
@@ -373,16 +385,31 @@ def run_stage1_cmd(args, rssi_config: RSSIConfig) -> int:
     print(f"  RMSE: {metrics.get('rmse', 'N/A'):.3f} dB")
     print(f"  R²:   {metrics.get('r2', 'N/A'):.3f}")
     
-    if 'det_metrics' in results:
+    if 'det_metrics' in results and results['det_metrics'] is not None:
         det = results['det_metrics']
         print(f"\nDetection Metrics:")
         print(f"  Accuracy:  {det.get('accuracy', 'N/A'):.3f}")
         print(f"  Precision: {det.get('precision', 'N/A'):.3f}")
         print(f"  Recall:    {det.get('recall', 'N/A'):.3f}")
     
-    output_csv = results.get('output_csv', 'rssi_predictions.csv')
-    print(f"\n✓ Output CSV: {output_csv}")
+    # Report the actual output location
+    actual_output_csv = results.get('output_csv', output_csv or 'rssi_predictions.csv')
+    print(f"\n✓ Output CSV: {actual_output_csv}")
     print(f"  Columns: RSSI_pred_raw, RSSI_pred_cal, RSSI_pred_final, RSSI_pred_gated")
+    
+    # Also save metrics to JSON in output directory
+    if output_dir:
+        metrics_path = os.path.join(output_dir, "stage1_metrics.json")
+        try:
+            with open(metrics_path, 'w') as f:
+                json.dump({
+                    'metrics': metrics,
+                    'det_metrics': results.get('det_metrics'),
+                    'output_csv': actual_output_csv
+                }, f, indent=2, default=str)
+            print(f"✓ Metrics saved to: {metrics_path}")
+        except Exception as e:
+            print(f"⚠ Could not save metrics: {e}")
     
     return 0
 

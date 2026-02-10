@@ -1122,10 +1122,16 @@ class GNSSDataEDA:
                     log_d = np.log10(distances[valid_mask])
                     rssi_valid = rssi[valid_mask]
                     
-                    slope, intercept, r_value, p_value, std_err = stats.linregress(log_d, rssi_valid)
-                    r_squared = r_value**2
-                    gamma_est = -slope / 10
-                    P0_est = intercept
+                    try:
+                        slope, intercept, r_value, p_value, std_err = stats.linregress(log_d, rssi_valid)
+                        r_squared = r_value**2
+                        gamma_est = -slope / 10
+                        P0_est = intercept
+                    except ValueError as e:
+                        print(f"   ⚠ Could not compute linear regression for {env}: {e}")
+                        r_squared = None
+                        gamma_est = None
+                        P0_est = None
             
             # Store results
             all_results[env] = {
@@ -1249,12 +1255,16 @@ class GNSSDataEDA:
                     ax4.plot(d_fit, rssi_fit, 'r-', linewidth=2, 
                             label=f'Fit: γ={gamma_est:.2f}, R²={r_squared:.3f}')
             
-            ax4.set_xlabel('Distance from Jammer (m)', fontsize=11)
-            ax4.set_ylabel(f'{rssi_col} (dBm)', fontsize=11)
-            ax4.set_xscale('log')
-            ax4.set_title(f'RSSI vs Distance (R² = {r_squared:.4f})', fontsize=12, fontweight='bold')
-            ax4.legend()
-            ax4.grid(True, alpha=0.3, which='both')
+                ax4.set_xlabel('Distance from Jammer (m)', fontsize=11)
+                ax4.set_ylabel(f'{rssi_col} (dBm)', fontsize=11)
+                ax4.set_xscale('log')
+                ax4.set_title(f'RSSI vs Distance (R² = {r_squared:.4f})', fontsize=12, fontweight='bold')
+                ax4.legend()
+                ax4.grid(True, alpha=0.3, which='both')
+            else:
+                ax4.text(0.5, 0.5, 'No valid RSSI data or\nregression failed', ha='center', va='center',
+                        transform=ax4.transAxes, fontsize=12)
+                ax4.set_title('RSSI vs Distance (N/A)', fontsize=12, fontweight='bold')
             
             plt.suptitle(f'Localization Geometry Analysis: {env.upper()} Environment',
                         fontsize=14, fontweight='bold', y=1.02)
@@ -1510,7 +1520,7 @@ class GNSSDataEDA:
 
 # =============== MAIN EXECUTION ==========================
 
-def run_eda(csv_path='combined_data_urban.csv', analyses='all', save_plots=True, output_dir=None):
+def run_eda(csv_path='combined_data_fixed.csv', analyses='all', save_plots=True, output_dir=None):
   
     
     eda = GNSSDataEDA(csv_path, save_plots=save_plots, output_dir=output_dir)
@@ -1545,7 +1555,7 @@ if __name__ == "__main__":
     import sys
     
     # Get CSV path from command line or use default
-    csv_file = sys.argv[1] if len(sys.argv) > 1 else 'combined_data_urban.csv'
+    csv_file = sys.argv[1] if len(sys.argv) > 1 else 'combined_data_fixed.csv'
     
     # Optional: disable plot saving
     save_plots = True
@@ -1579,7 +1589,7 @@ if __name__ == "__main__":
         
         print(f"\nTo run specific analyses in Jupyter:")
         print(">>> from comprehensive_eda import GNSSDataEDA")
-        print(">>> eda = GNSSDataEDA('combined_data_urban.csv')")
+        print(">>> eda = GNSSDataEDA('combined_data_fixed.csv')")
         print(">>> eda.jamming_analysis()  # Run specific analysis")
         
     except FileNotFoundError:

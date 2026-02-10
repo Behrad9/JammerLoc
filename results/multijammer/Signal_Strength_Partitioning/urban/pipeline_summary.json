@@ -5,10 +5,10 @@
     "r2": 0.6410844034055689
   },
   "stage2_localization": {
-    "centralized_error_m": 0.7867625951766968,
+    "centralized_error_m": 0.7515692114830017,
     "centralized_position": [
-      -6.191324234008789,
-      -3.0480926036834717
+      -6.230624675750732,
+      -3.014838695526123
     ],
     "federated": {
       "fedavg": {

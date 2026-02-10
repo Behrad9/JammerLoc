@@ -255,6 +255,25 @@ def run_stage1_rssi_estimation(
         # Get training history if available
         history = result.get('history', None)
         
+        # NEW: Get test indices for proper metric computation
+        # The training pipeline stores test indices in result
+        test_indices = result.get('test_indices', None)
+        if test_indices is None and 'test_mask' in result:
+            # Convert mask to indices
+            test_mask = result['test_mask']
+            test_indices = list(np.where(test_mask)[0])
+        
+        # Fallback: compute test indices from split ratio if not available
+        if test_indices is None:
+            test_split = getattr(config, 'test_split', 0.15)
+            n_total = len(df_output)
+            n_test = int(n_total * test_split)
+            if n_test > 0:
+                # Assume last n_test samples are test set (standard split)
+                test_indices = list(range(n_total - n_test, n_total))
+                if verbose:
+                    print(f"  Using last {n_test} samples as test set for plot metrics")
+        
         stage1_plots = generate_stage1_plots(
             df=df_output,
             output_dir=plot_dir,
@@ -262,6 +281,7 @@ def run_stage1_rssi_estimation(
             history=history,
             detection_results=detection_results,
             model_params=model_params,
+            test_indices=test_indices,  # NEW: Pass test indices
             verbose=verbose
         )
         result['plots'] = stage1_plots
@@ -645,6 +665,26 @@ def run_stage2_localization(
         plot_dir = os.path.join(config.results_dir, "stage2_plots")
         env_name = getattr(config, 'environment', 'unknown')
         
+        # NEW: Get test indices for proper metric computation in plots
+        test_indices = None
+        test_dataset = test_loader.dataset
+        if hasattr(test_dataset, 'indices'):
+            # It's a Subset - get the indices
+            test_indices = list(test_dataset.indices)
+        elif hasattr(test_dataset, 'dataset') and hasattr(test_dataset.dataset, 'indices'):
+            # Nested subset
+            test_indices = list(test_dataset.dataset.indices)
+        
+        # Fallback: compute from split ratio if indices not available
+        if test_indices is None:
+            test_split = getattr(config, 'test_split', 0.15)
+            n_total = len(df)
+            n_test = int(n_total * test_split)
+            if n_test > 0:
+                test_indices = list(range(n_total - n_test, n_total))
+                if verbose:
+                    print(f"  Using last {n_test} samples as test set for plot metrics")
+        
         stage2_plots = generate_stage2_plots(
             df=df,
             centralized_result=results['centralized'],
@@ -652,6 +692,7 @@ def run_stage2_localization(
             output_dir=plot_dir,
             env=env_name,
             true_jammer=tuple(true_theta) if true_theta is not None else None,
+            test_indices=test_indices,  # NEW: Pass test indices
             verbose=verbose
         )
         results['plots'] = stage2_plots

@@ -912,16 +912,23 @@ def train_rssi_pipeline(
     
     # Evaluate detection if ground truth available
     if "jammed" in df_test_det.columns:
-        det_metrics = compute_detection_metrics(
-            df_test_det["jammed"].values, 
-            df_test_det["jammed_pred"].values
-        )
-        if verbose:
-            print(f"\nDetection Performance:")
-            print(f"  Accuracy:  {det_metrics['accuracy']:.1%}")
-            print(f"  Precision: {det_metrics['precision']:.1%}")
-            print(f"  Recall:    {det_metrics['recall']:.1%}")
-            print(f"  F1:        {det_metrics['f1']:.1%}")
+        # Filter out NaN values in jammed column
+        valid_mask = ~df_test_det["jammed"].isna()
+        if valid_mask.sum() > 0:
+            det_metrics = compute_detection_metrics(
+                df_test_det.loc[valid_mask, "jammed"].values, 
+                df_test_det.loc[valid_mask, "jammed_pred"].values
+            )
+            if verbose:
+                print(f"\nDetection Performance:")
+                print(f"  Accuracy:  {det_metrics['accuracy']:.1%}")
+                print(f"  Precision: {det_metrics['precision']:.1%}")
+                print(f"  Recall:    {det_metrics['recall']:.1%}")
+                print(f"  F1:        {det_metrics['f1']:.1%}")
+        else:
+            if verbose:
+                print("\n⚠ No valid jammed labels for detection evaluation")
+            det_metrics = None
     else:
         det_metrics = None
     

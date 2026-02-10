@@ -1,0 +1,16 @@
+{
+  "metrics": {
+    "mae": 3.2857797113027267,
+    "mse": 21.20343521493729,
+    "rmse": 4.604718798682205,
+    "huber": 2.8317436109838328,
+    "r2": 0.9566874209674556
+  },
+  "det_metrics": {
+    "accuracy": 0.8586956521739131,
+    "precision": 0.832258064516129,
+    "recall": 1.0,
+    "f1": 0.9084507042253521
+  },
+  "output_csv": ".\\results\\combined\\suburban\\rssi_predictions.csv"
+}

@@ -1,0 +1,16 @@
+{
+  "metrics": {
+    "mae": 4.764868262431089,
+    "mse": 40.739949091029644,
+    "rmse": 6.382785370904276,
+    "huber": 4.292596501551823,
+    "r2": 0.6410844034055689
+  },
+  "det_metrics": {
+    "accuracy": 0.9133333333333333,
+    "precision": 0.8839285714285714,
+    "recall": 1.0,
+    "f1": 0.9383886255924171
+  },
+  "output_csv": ".\\results\\combined\\urban\\rssi_predictions.csv"
+}

@@ -1,0 +1,16 @@
+{
+  "metrics": {
+    "mae": 3.0256598028586734,
+    "mse": 20.573790183829654,
+    "rmse": 4.535834011935363,
+    "huber": 2.5590808937003184,
+    "r2": 0.9805780215168386
+  },
+  "det_metrics": {
+    "accuracy": 0.9037433155080213,
+    "precision": 0.8791946308724832,
+    "recall": 1.0,
+    "f1": 0.9357142857142857
+  },
+  "output_csv": ".\\results\\combined\\lab_wired\\rssi_predictions.csv"
+}

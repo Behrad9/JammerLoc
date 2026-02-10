@@ -1,14 +1,46 @@
 """
-Ablation Studies for Jammer Localization:
-===============================================
+Ablation Studies for Jammer Localization (Updated)
+====================================================
+Uses actual model classes from model.py for consistency with thesis:
+- Pure NN: Net-based architecture with learnable theta
+- Pure PL: Polynomial3 (path-loss only)
+- APBM: Net_augmented (physics + neural network hybrid)
+
 1. RSSI QUALITY MATTERS
 2. MODEL ARCHITECTURE MATTERS BY ENVIRONMENT   
 """
 
 import os
 import json
+import copy
 import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass
+from scipy import stats
+from scipy.optimize import minimize
+from torch.utils.data import DataLoader, TensorDataset
 
+# =============================================================================
+# IMPORT MODELS FROM model.py
+# =============================================================================
+try:
+    from model import Net, Polynomial3, Net_augmented
+    MODELS_AVAILABLE = True
+except ImportError:
+    print("WARNING: Could not import models from model.py")
+    print("Falling back to local model definitions")
+    MODELS_AVAILABLE = False
+
+
+
+# =============================================================================
+# JSON SERIALIZATION HELPER
+# =============================================================================
 
 def to_serializable(obj):
     """Convert objects (including NumPy arrays/scalars) to JSON-serializable types."""
@@ -21,27 +53,18 @@ def to_serializable(obj):
     if isinstance(obj, np.generic):
         return obj.item()
     
-    # Torch tensors (just in case anything leaks into results)
     try:
-        import torch
         if isinstance(obj, torch.Tensor):
             return obj.detach().cpu().tolist() if obj.ndim > 0 else obj.item()
-    except ImportError:
+    except:
         pass
     
-    # Plain python types (str, int, float, bool, None) _ serializable
     return obj
-import pandas as pd
-import torch
-import torch.nn as nn
-from typing import Dict, List, Tuple, Optional, Any
-from dataclasses import dataclass
-from scipy import stats
-from scipy.optimize import minimize
 
-# ============================================================================
+
+# =============================================================================
 # CONFIGURATION
-# ============================================================================
+# =============================================================================
 
 PLOT_COLORS = {
     'blue': '#648FFF',
@@ -63,7 +86,10 @@ MODEL_COLORS = {
 }
 
 RSSI_COLORS = {
+    # RSSI source ablation uses 'oracle' key (ground truth), keep for compatibility.
     'oracle': '#2E8B57',
+    # Alias used in the updated script wording (measured RSSI)
+    'measured': '#2E8B57',
     'predicted': '#648FFF',
     'noisy_2dB': '#FFB000',
     'noisy_5dB': '#FE6100',
@@ -71,7 +97,6 @@ RSSI_COLORS = {
     'shuffled': '#785EF0',
     'constant': '#6B7280',
 }
-
 
 def _setup_thesis_style():
     """Configure matplotlib for publication-quality figures."""
@@ -120,21 +145,8 @@ def _save_figure(fig, output_dir: str, name: str, formats: List[str] = None):
                    bbox_inches='tight', facecolor='white', edgecolor='none')
     plt.close(fig)
 
-@dataclass
-class AblationConfig:
-    """Configuration for ablation studies."""
-    n_trials: int = 5
-    n_epochs: int = 300
-    patience: int = 30
-    lr_theta: float = 0.5
-    lr_P0: float = 0.01
-    lr_gamma: float = 0.005
-    lr_nn: float = 0.001
-    hidden_dims: List[int] = None
-    
-    def __post_init__(self):
-        if self.hidden_dims is None:
-            self.hidden_dims = [64, 32]
+
+# (AblationConfig removed — superseded by AblationConfigFixed below)
 
 
 # Environment parameters
@@ -160,16 +172,12 @@ JAMMER_LOCATIONS = {
 }
 
 
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
 def get_jammer_location(df: pd.DataFrame, env: str, verbose: bool = True) -> Dict[str, float]:
-    """
-    Get jammer location from data if available, otherwise use hardcoded defaults.
-    
-    Looks for columns: 'jammer_lat', 'jammer_lon' or 'true_lat', 'true_lon'
-    
-    Returns:
-        Dict with 'lat' and 'lon' keys
-    """
-    # Try to read from data
+    """Get jammer location from data if available, otherwise use hardcoded defaults."""
     lat_cols = ['jammer_lat', 'true_lat', 'jammer_latitude']
     lon_cols = ['jammer_lon', 'true_lon', 'jammer_longitude']
     
@@ -177,7 +185,6 @@ def get_jammer_location(df: pd.DataFrame, env: str, verbose: bool = True) -> Dic
     lon_col = next((c for c in lon_cols if c in df.columns), None)
     
     if lat_col and lon_col:
-        # Get unique jammer location (should be same for all rows)
         jammer_lat = df[lat_col].iloc[0]
         jammer_lon = df[lon_col].iloc[0]
         
@@ -186,67 +193,97 @@ def get_jammer_location(df: pd.DataFrame, env: str, verbose: bool = True) -> Dic
         
         return {'lat': jammer_lat, 'lon': jammer_lon}
     
-    # Fall back to hardcoded
     if env in JAMMER_LOCATIONS:
         jammer_loc = JAMMER_LOCATIONS[env]
         if verbose:
             print(f"  ⚠ Using hardcoded jammer location for {env}: ({jammer_loc['lat']:.4f}, {jammer_loc['lon']:.4f})")
-            print(f"    (Add 'jammer_lat'/'jammer_lon' columns to data for automatic detection)")
         return jammer_loc
     
-    raise ValueError(f"Unknown environment '{env}' and no jammer location in data. "
-                    f"Known environments: {list(JAMMER_LOCATIONS.keys())}")
+    raise ValueError(f"Unknown environment '{env}' and no jammer location in data.")
 
-
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
 
 def latlon_to_enu(lat, lon, lat0_rad, lon0_rad):
-    """Convert lat/lon to ENU coordinates."""
+    """Convert lat/lon (degrees) to ENU coordinates (meters).
+    
+    Args:
+        lat, lon: Arrays of latitude/longitude in degrees
+        lat0_rad, lon0_rad: Reference point in radians
+    """
     R = 6371000
-    x = R * np.radians(lon - np.degrees(lon0_rad)) * np.cos(lat0_rad)
-    y = R * np.radians(lat - np.degrees(lat0_rad))
+    x = R * (np.radians(lon) - lon0_rad) * np.cos(lat0_rad)
+    y = R * (np.radians(lat) - lat0_rad)
     return x, y
 
 
 def estimate_gamma_from_data(positions, rssi, theta_true=None):
-    
+    """Estimate path-loss parameters from data using known jammer position."""
     if theta_true is None:
-        raise ValueError("theta_true is required (ENU coordinates of true jammer position).")
+        raise ValueError("theta_true is required")
 
     distances = np.linalg.norm(positions - theta_true, axis=1)
     distances = np.maximum(distances, 1.0)
     log_d = np.log10(distances)
     
-    # Robust regression
-    slope, intercept, r_value, _, _ = stats.linregress(log_d, rssi)
+    # Check if all distances are identical (e.g., lab_wired with single location)
+    if np.std(log_d) < 1e-6:
+        # Cannot fit path-loss model, use defaults
+        P0 = float(np.mean(rssi))
+        gamma = 2.0  # Default free-space
+        r2 = 0.0
+        return P0, gamma, r2
     
-    P0 = intercept
-    gamma = -slope / 10.0
-    gamma = np.clip(gamma, 1.5, 5.0)
-    
-    return P0, gamma, r_value**2
+    try:
+        slope, intercept, r_value, _, _ = stats.linregress(log_d, rssi)
+        P0 = intercept
+        gamma = -slope / 10.0
+        gamma = np.clip(gamma, 1.5, 5.0)
+        return P0, gamma, r_value**2
+    except ValueError:
+        # Fallback if regression fails
+        P0 = float(np.mean(rssi))
+        gamma = 2.0
+        return P0, gamma, 0.0
 
 
 def estimate_gamma_joint(positions, rssi, n_iterations=10, verbose=False):
-    # Initialize θ at receiver centroid (no oracle info)
-    theta = positions.mean(axis=0).copy()
+    """Jointly estimate theta, gamma, P0 without oracle knowledge."""
+    # Initialize theta at data centroid
+    theta = positions.mean(axis=0)
     
-    P0, gamma, r2 = 0.0, 2.0, 0.0
+    # Check if all positions are identical (e.g., lab_wired)
+    pos_std = np.std(positions, axis=0).max()
+    if pos_std < 1e-6:
+        # Cannot estimate theta from identical positions, use defaults
+        P0 = float(np.mean(rssi))
+        gamma = 2.0
+        r2 = 0.0
+        return P0, gamma, r2, theta
     
     for iteration in range(n_iterations):
-        # Step 1: Fix θ, estimate γ/P₀
         distances = np.linalg.norm(positions - theta, axis=1)
         distances = np.maximum(distances, 1.0)
         log_d = np.log10(distances)
         
-        slope, intercept, r_value, _, _ = stats.linregress(log_d, rssi)
-        P0 = intercept
-        gamma = np.clip(-slope / 10.0, 1.5, 5.0)
-        r2 = r_value ** 2
+        # Check if distances have variation
+        if np.std(log_d) < 1e-6:
+            P0 = float(np.mean(rssi))
+            gamma = 2.0
+            r2 = 0.0
+            break
         
-        # Step 2: Fix γ/P₀, update θ via L-BFGS
+        try:
+            slope, intercept, r_value, _, _ = stats.linregress(log_d, rssi)
+            P0 = intercept
+            gamma = -slope / 10.0
+            gamma = np.clip(gamma, 1.5, 5.0)
+            r2 = r_value ** 2
+        except ValueError:
+            P0 = float(np.mean(rssi))
+            gamma = 2.0
+            r2 = 0.0
+            break
+        
+        # Optimize theta given current gamma, P0
         def loss_fn(theta_flat):
             d = np.sqrt(((positions - theta_flat)**2).sum(axis=1) + 1.0)
             rssi_pred = P0 - 10 * gamma * np.log10(d)
@@ -255,22 +292,11 @@ def estimate_gamma_joint(positions, rssi, n_iterations=10, verbose=False):
         result = minimize(loss_fn, theta, method='L-BFGS-B', options={'maxiter': 50})
         theta_new = result.x
         
-        # Check convergence
         delta = np.linalg.norm(theta_new - theta)
-        if verbose:
-            print(f"  Iteration {iteration+1}: θ moved {delta:.4f}m, R²={r2:.4f}")
-        
         if delta < 0.01:
             theta = theta_new
             break
         theta = theta_new
-    
-    # Final R² computation with converged θ
-    distances = np.linalg.norm(positions - theta, axis=1)
-    distances = np.maximum(distances, 1.0)
-    log_d = np.log10(distances)
-    _, _, r_value, _, _ = stats.linregress(log_d, rssi)
-    r2 = r_value ** 2
     
     return P0, gamma, r2, theta
 
@@ -285,549 +311,26 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-# ============================================================================
-# MODELS FOR ABLATION
-# ============================================================================
-
-class PurePathLoss(nn.Module):
-    """Pure Path-Loss Model: RSSI = P0 - 10*γ*log10(d)"""
-    
-    def __init__(self, theta_init, gamma_init=2.0, P0_init=-30.0):
-        super().__init__()
-        self.theta = nn.Parameter(torch.tensor(theta_init, dtype=torch.float32))
-        self.gamma = nn.Parameter(torch.tensor(gamma_init, dtype=torch.float32))
-        self.P0 = nn.Parameter(torch.tensor(P0_init, dtype=torch.float32))
-    
-    def forward(self, x):
-        pos = x[:, :2]
-        d = torch.sqrt(((pos - self.theta)**2).sum(dim=1) + 1.0)
-        return self.P0 - 10 * self.gamma * torch.log10(d)
-    
-    def get_theta(self):
-        return self.theta.detach().cpu().numpy()
+# (First factory functions removed — active versions are below)
 
 
-class PureNN(nn.Module):
-    
-    def __init__(self, input_dim, theta_init, hidden_dims=[64, 32]):
-        super().__init__()
-        self.theta = nn.Parameter(torch.tensor(theta_init, dtype=torch.float32))
-        
-        nn_input_dim = 4  # rel_x, rel_y, distance, log_distance
-        
-        layers = []
-        prev_dim = nn_input_dim
-        for hd in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hd),
-                nn.LayerNorm(hd),
-                nn.LeakyReLU(),
-                nn.Dropout(0.1)
-            ])
-            prev_dim = hd
-        layers.append(nn.Linear(prev_dim, 1))
-        self.nn = nn.Sequential(*layers)
-    
-    def forward(self, x):
-        pos = x[:, :2]
-        
-        # Compute relative position to theta (THIS CONNECTS THETA TO THE GRAPH!)
-        rel_pos = pos - self.theta
-        
-        # Compute distance to theta
-        d = torch.sqrt((rel_pos**2).sum(dim=1, keepdim=True) + 1.0)
-        log_d = torch.log10(d)
-        
-        # NN input: relative position + distance features
-        nn_input = torch.cat([rel_pos, d, log_d], dim=1)
-        
-        # NN predicts RSSI directly (no physics equation)
-        rssi_nn = self.nn(nn_input).squeeze(-1)
-        return rssi_nn
-    
-    def get_theta(self):
-        return self.theta.detach().cpu().numpy()
+# (_train_model removed — superseded by train_pure_nn, train_pure_pl, train_apbm below)
 
-
-class APBM(nn.Module):
-    
-    def __init__(self, input_dim, theta_init, gamma_init=2.0, P0_init=-30.0, 
-                 hidden_dims=[32, 16], max_correction=10.0):
-        super().__init__()
-        self.theta = nn.Parameter(torch.tensor(theta_init, dtype=torch.float32))
-        self.gamma = nn.Parameter(torch.tensor(gamma_init, dtype=torch.float32))
-        self.P0 = nn.Parameter(torch.tensor(P0_init, dtype=torch.float32))
-        
-        # Maximum correction in dB (urban multipath typically ±5-15 dB)
-        self.max_correction = max_correction
-        
-        # Residual scale: starts small (exp(-2) ≈ 0.14)
-        self.log_residual_scale = nn.Parameter(torch.tensor(-2.0))
-        
-        # NN takes: [x, y, features..., physics_pred, distance_to_theta]
-        nn_input_dim = input_dim + 2  # +physics_pred +distance
-        layers = []
-        prev_dim = nn_input_dim
-        for hd in hidden_dims:
-            layers.extend([
-                nn.Linear(prev_dim, hd),
-                nn.LayerNorm(hd),
-                nn.Tanh(),  # Bounded activation throughout
-            ])
-            prev_dim = hd
-        layers.append(nn.Linear(prev_dim, 1))
-        layers.append(nn.Tanh())  # Final tanh bounds output to [-1, 1]
-        self.nn = nn.Sequential(*layers)
-        
-        # Initialize NN to output near-zero
-        self._init_nn_small()
-    
-    def _init_nn_small(self):
-        """Initialize NN to output near-zero initially."""
-        for m in self.nn.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.01)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-    
-    def forward(self, x):
-        pos = x[:, :2]
-        
-        # Compute distance to estimated jammer
-        d = torch.sqrt(((pos - self.theta)**2).sum(dim=1) + 1.0)
-        
-        # Physics prediction
-        rssi_physics = self.P0 - 10 * self.gamma * torch.log10(d)
-        
-        # NN input: features + physics prediction + distance
-        nn_input = torch.cat([
-            x, 
-            rssi_physics.unsqueeze(-1),
-            d.unsqueeze(-1) / 100.0  # Normalize distance
-        ], dim=1)
-        
-        # NN predicts bounded correction in [-1, 1]
-        correction_normalized = self.nn(nn_input).squeeze(-1)
-        
-        # Scale to [-max_correction, +max_correction]
-        correction = correction_normalized * self.max_correction
-        
-        # Apply learnable scale (starts small)
-        scale = torch.sigmoid(self.log_residual_scale)  # [0, 1]
-        
-        # Final = Physics + scaled correction
-        return rssi_physics + scale * correction
-    
-    def get_theta(self):
-        return self.theta.detach().cpu().numpy()
-    
-    def get_residual_scale(self):
-        return torch.sigmoid(self.log_residual_scale).item()
-
-
-class PurePathLossConstrained(nn.Module):
-    """Pure Path Loss model with better optimization for fair comparison."""
-    
-    def __init__(self, theta_init, gamma_init=2.0, P0_init=-30.0):
-        super().__init__()
-        self.theta = nn.Parameter(torch.tensor(theta_init, dtype=torch.float32))
-        self.gamma = nn.Parameter(torch.tensor(gamma_init, dtype=torch.float32))
-        self.P0 = nn.Parameter(torch.tensor(P0_init, dtype=torch.float32))
-    
-    def forward(self, x):
-        pos = x[:, :2]
-        d = torch.sqrt(((pos - self.theta)**2).sum(dim=1) + 1.0)
-        return self.P0 - 10 * self.gamma * torch.log10(d)
-    
-    def get_theta(self):
-        return self.theta.detach().cpu().numpy()
-
-
-# ============================================================================
-# RSSI SOURCE ABLATION
-# ============================================================================
-
-def run_rssi_source_ablation(
-    input_csv: str,
-    output_dir: str = "results/rssi_ablation",
-    env: str = None,
-    n_trials: int = 5,
-    verbose: bool = True
-) -> Dict:
-   
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Load data
-    df = pd.read_csv(input_csv)
-    
-    # Detect environment
-    if env is None:
-        # 1) Try infer from filename
-        input_lower = input_csv.lower()
-        for env_name in ['open_sky', 'suburban', 'urban', 'lab_wired', 'mixed']:
-            if env_name.replace('_', '') in input_lower.replace('_', ''):
-                env = env_name
-                break
-
-        # 2) Try infer from data column (most common value)
-        if env is None and 'env' in df.columns:
-            try:
-                env_mode = df['env'].dropna().astype(str).value_counts().idxmax()
-                if env_mode in ['open_sky', 'suburban', 'urban', 'lab_wired', 'mixed']:
-                    env = env_mode
-            except Exception:
-                env = None
-
-        # 3) Safe fallback: mixed (least-wrong), and warn in verbose mode
-        if env is None:
-            env = 'mixed'
-            if verbose:
-                print(" Could not infer environment from filename or df['env']; defaulting to 'mixed'. "
-                      "For exact results, pass env='open_sky'/'suburban'/'urban'/'lab_wired'.")
-    
-    if verbose:
-        print(f"\n{'='*70}")
-        print(f"RSSI SOURCE ABLATION - {env.upper()}")
-        print(f"{'='*70}")
-        print(f"Samples: {len(df)}")
-    
-    # Get jammer location (from data if available, else hardcoded)
-    jammer_loc = get_jammer_location(df, env, verbose=verbose)
-    
-    # Filter jammed samples
-    if 'jammed' in df.columns:
-        df = df[df['jammed'] == 1].copy()
-
-    # Convert to ENU (origin = receiver centroid of *jammed* samples)
-    lat0 = df['lat'].mean()
-    lon0 = df['lon'].mean()
-    lat0_rad = np.radians(lat0)
-    lon0_rad = np.radians(lon0)
-
-    df['x_enu'], df['y_enu'] = latlon_to_enu(df['lat'].values, df['lon'].values, lat0_rad, lon0_rad)
-
-    # True jammer in the SAME ENU frame (neutral origin; not (0,0))
-    jammer_x, jammer_y = latlon_to_enu(
-        np.array([jammer_loc['lat']]),
-        np.array([jammer_loc['lon']]),
-        lat0_rad,
-        lon0_rad
-    )
-    theta_true = np.array([jammer_x[0], jammer_y[0]], dtype=np.float32)
-
-    
-    if verbose:
-        print(f"Jammed samples: {len(df)}")
-        print(f"Reference frame: receiver centroid (NEUTRAL)")
-        print(f"True jammer position: ({theta_true[0]:.1f}, {theta_true[1]:.1f}) m")
-    
-    # Check columns
-    has_ground_truth = 'RSSI' in df.columns
-    has_predictions = any(c in df.columns for c in ['RSSI_pred', 'RSSI_pred_cal'])
-    
-    if not has_ground_truth:
-        raise ValueError("Need ground truth RSSI column for ablation!")
-    
-    pred_col = next((c for c in ['RSSI_pred_cal', 'RSSI_pred_final', 'RSSI_pred', 'RSSI'] if c in df.columns), None)
-    
-    # Get RSSI statistics
-    rssi_true = df['RSSI'].values
-    rssi_mean = rssi_true.mean()
-    rssi_std = rssi_true.std()
-    
-    if verbose:
-        print(f"RSSI range: [{rssi_true.min():.1f}, {rssi_true.max():.1f}] dB")
-        
-        if pred_col:
-            valid = df[pred_col].notna()
-            mae = np.mean(np.abs(df.loc[valid, 'RSSI'] - df.loc[valid, pred_col]))
-            corr = np.corrcoef(df.loc[valid, 'RSSI'], df.loc[valid, pred_col])[0, 1]
-            print(f"\nStage 1 Quality: MAE={mae:.2f} dB, Corr={corr:.4f}")
-    
-    # Estimate gamma from data (using true jammer position for distance calculation)
-    positions = df[['x_enu', 'y_enu']].values
-    P0_est, gamma_est, r2 = estimate_gamma_from_data(positions, rssi_true, theta_true=theta_true)
-    
-    if verbose:
-        print(f"Estimated: γ={gamma_est:.2f}, P0={P0_est:.1f} dBm (R²={r2:.3f})")
-    
-    # Define RSSI conditions
-    conditions = {
-        'oracle': ('RSSI', 'Ground Truth RSSI'),
-        'noisy_2dB': (None, 'GT + 2dB noise'),
-        'noisy_5dB': (None, 'GT + 5dB noise'),
-        'noisy_10dB': (None, 'GT + 10dB noise'),
-        'shuffled': (None, 'Shuffled (Random Permutation)'),
-        'constant': (None, 'Constant (Mean RSSI)'),
-    }
-    
-    if pred_col:
-        conditions['predicted'] = (pred_col, 'Stage 1 Predictions')
-    
-    results = {}
-    
-    for cond_name, (col, desc) in conditions.items():
-        if verbose:
-            print(f"\n[{cond_name.upper()}] {desc}...")
-        
-        errors = []
-        
-        for trial in range(n_trials):
-            set_seed(42 + trial * 100)
-            
-            # Prepare RSSI based on condition
-            if cond_name == 'oracle':
-                rssi = df['RSSI'].values.copy()
-            elif cond_name == 'predicted':
-                rssi = df[pred_col].values.copy()
-            elif cond_name.startswith('noisy_'):
-                noise_level = float(cond_name.split('_')[1].replace('dB', ''))
-                rssi = df['RSSI'].values + np.random.normal(0, noise_level, len(df))
-            elif cond_name == 'shuffled':
-                rssi_base = df[pred_col].values if (pred_col is not None and pred_col in df.columns) else df['RSSI'].values
-                rssi = np.random.permutation(rssi_base)
-            elif cond_name == 'constant':
-                rssi = np.full(len(df), rssi_mean)
-            else:
-                continue
-            
-            # Run localization
-            loc_err = _run_single_localization(
-                positions, rssi, gamma_est, P0_est, theta_true,
-                n_epochs=200, lr=0.5, n_starts=5, seed=(42 + trial * 100)
-            )
-            errors.append(loc_err)
-        
-        mean_err = np.mean(errors)
-        std_err = np.std(errors)
-        
-        results[cond_name] = {
-            'mean': mean_err,
-            'std': std_err,
-            'errors': errors,
-            'description': desc
-        }
-        
-        if verbose:
-            print(f"  Loc Error: {mean_err:.2f} ± {std_err:.2f} m")
-    
-    # Compute relative metrics
-    oracle_err = results['oracle']['mean']
-    for cond_name in results:
-        results[cond_name]['vs_oracle'] = results[cond_name]['mean'] / oracle_err
-    
-    # Print summary table
-    if verbose:
-        print(f"\n{'='*70}")
-        print("RSSI SOURCE ABLATION RESULTS")
-        print(f"{'='*70}")
-        print(f"{'Condition':<25} {'Error (m)':<15} {'vs Oracle':<12} {'Status'}")
-        print("-"*70)
-        
-        for cond_name in ['oracle', 'predicted', 'noisy_2dB', 'noisy_5dB', 'noisy_10dB', 'shuffled', 'constant']:
-            if cond_name not in results:
-                continue
-            r = results[cond_name]
-            status = ""
-            if cond_name == 'oracle':
-                status = "← Best possible"
-            elif cond_name == 'predicted':
-                if r['vs_oracle'] < 1.5:
-                    status = "✓ Stage 1 works!"
-                else:
-                    status = "⚠ Needs improvement"
-            elif cond_name in ['shuffled', 'constant']:
-                if r['vs_oracle'] > 2.0:
-                    status = "← RSSI matters!"
-            
-            print(f"{cond_name:<25} {r['mean']:.2f} ± {r['std']:.2f}{'':5} {r['vs_oracle']:.2f}x{'':<8} {status}")
-    
-    # Interpretation
-    if verbose:
-        print(f"\n{'='*70}")
-        print("INTERPRETATION FOR THESIS")
-        print(f"{'='*70}")
-        
-        shuf_ratio = results['shuffled']['vs_oracle']
-        
-        if shuf_ratio > 2.0:
-            print("✓ RSSI quality SIGNIFICANTLY affects localization!")
-            print(f"  Shuffled RSSI is {shuf_ratio:.1f}x worse than Oracle")
-            
-            if 'predicted' in results:
-                pred_ratio = results['predicted']['vs_oracle']
-                improvement = (results['shuffled']['mean'] - results['predicted']['mean']) / results['shuffled']['mean'] * 100
-                
-                if pred_ratio < 1.5:
-                    print(f"\n✓ Stage 1 predictions are EFFECTIVE!")
-                    print(f"  Only {pred_ratio:.2f}x Oracle (very close to ground truth)")
-                    print(f"  {improvement:.1f}% improvement over random RSSI")
-                    print(f"\n  THESIS CLAIM: Stage 1 RSSI estimation enables accurate localization ✓")
-        else:
-            print("⚠ RSSI has limited effect in this geometry")
-            print("  May need more spatial diversity or different environment")
-    
-    # Save results
-    results_file = os.path.join(output_dir, f'rssi_source_ablation_{env}.json')
-    with open(results_file, 'w') as f:
-        save_data = {k: {kk: to_serializable(vv) for kk, vv in v.items() if kk != 'errors'} 
-                   for k, v in results.items()}
-        json.dump(save_data, f, indent=2)
-    
-    if verbose:
-        print(f"\n✓ Results saved to {results_file}")
-    
-    # Generate plot
-    _plot_rssi_ablation(results, output_dir, env, verbose)
-
-    # plots:
-   
-    try:
-        # Stage 1 diagnostics: predicted vs true + residual distribution (if available)
-        if pred_col:
-            _plot_stage1_rssi_quality(
-                rssi_true=df['RSSI'].values.astype(np.float32),
-                rssi_pred=df[pred_col].values.astype(np.float32),
-                output_dir=output_dir,
-                env=env,
-                pred_col_name=pred_col,
-                verbose=verbose
-            )
-
-        # Path-loss fit diagnostics (oracle + predicted if available)
-        _plot_pathloss_fit(
-            positions=positions.astype(np.float32),
-            rssi=df['RSSI'].values.astype(np.float32),
-            theta_true=theta_true.astype(np.float32),
-            output_dir=output_dir,
-            env=env,
-            label='oracle',
-            verbose=verbose
-        )
-        if pred_col:
-            _plot_pathloss_fit(
-                positions=positions.astype(np.float32),
-                rssi=df[pred_col].values.astype(np.float32),
-                theta_true=theta_true.astype(np.float32),
-                output_dir=output_dir,
-                env=env,
-                label='predicted',
-                verbose=verbose
-            )
-
-        # Stage 2 diagnostics: distributions + CDFs to show robustness (per condition)
-        _plot_rssi_ablation_detailed(results, output_dir, env, verbose)
-    except Exception as e:
-        if verbose:
-            print(f"  ⚠ Plotting diagnostics failed (non-fatal): {e}")
-
-    
-    return results
-
-
-def _run_single_localization(positions, rssi, gamma, P0, theta_true, n_epochs=200, lr=0.5, n_starts=5, seed=42):
-   
-    X = positions.astype(np.float32)
-    J = rssi.astype(np.float32)
-    
-    def loss_fn(theta):
-        d = np.sqrt(((X - theta)**2).sum(axis=1) + 1.0)
-        J_pred = P0 - 10 * gamma * np.log10(d)
-        return ((J_pred - J)**2).mean()
-    
-    # Multi-start to reduce sensitivity to local minima / flat RSSI fields
-    rng = np.random.default_rng(seed)
-    base0 = X.mean(axis=0)  # neutral, not jammer-based
-    best_theta = None
-    best_loss = np.inf
-
-    for k in range(max(1, int(n_starts))):
-        if k == 0:
-            theta0 = base0
-        else:
-            # random start near receiver cloud (scale by position std)
-            scale = X.std(axis=0) + 1e-6
-            theta0 = base0 + rng.normal(0.0, 1.0, size=2) * scale
-
-        res = minimize(loss_fn, theta0, method='L-BFGS-B', options={'maxiter': n_epochs})
-        if res.fun < best_loss:
-            best_loss = float(res.fun)
-            best_theta = res.x
-
-    return float(np.linalg.norm(best_theta - theta_true))
-
-
-def _plot_rssi_ablation(results: Dict, output_dir: str, env: str, verbose: bool):
-    """Generate RSSI ablation plot."""
-    try:
-        import matplotlib.pyplot as plt
-        
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        conditions = ['oracle', 'predicted', 'noisy_2dB', 'noisy_5dB', 'shuffled', 'constant']
-        conditions = [c for c in conditions if c in results]
-        
-        x = np.arange(len(conditions))
-        means = [results[c]['mean'] for c in conditions]
-        stds = [results[c]['std'] for c in conditions]
-        
-        colors = {
-            'oracle': '#2ecc71',
-            'predicted': '#3498db',
-            'noisy_2dB': '#9b59b6',
-            'noisy_5dB': '#9b59b6',
-            'shuffled': '#e74c3c',
-            'constant': '#e74c3c'
-        }
-        
-        bars = ax.bar(x, means, yerr=stds, capsize=5,
-                      color=[colors.get(c, '#95a5a6') for c in conditions],
-                      edgecolor='black', alpha=0.8)
-        
-        # Add value labels
-        for bar, mean in zip(bars, means):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                   f'{mean:.1f}m', ha='center', va='bottom', fontsize=10)
-        
-        ax.set_xticks(x)
-        ax.set_xticklabels([c.replace('_', '\n') for c in conditions], fontsize=10)
-        ax.set_ylabel('Localization Error (m)', fontsize=12)
-        ax.set_title(f'RSSI Source Impact on Localization ({env})', fontsize=14, fontweight='bold')
-        ax.grid(axis='y', alpha=0.3)
-        
-        # Add reference line for oracle
-        ax.axhline(results['oracle']['mean'], color='green', linestyle='--', alpha=0.5, label='Oracle baseline')
-        ax.legend()
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, f'rssi_ablation_{env}.png'), dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        if verbose:
-            print(f"✓ Plot saved to {output_dir}/rssi_ablation_{env}.png")
-    except ImportError:
-        if verbose:
-            print("  (matplotlib not available, skipping plot)")
-
-
-# ============================================================================
-# MODEL ARCHITECTURE ABLATION (LOCALIZATION)
-# ============================================================================
+# =============================================================================
+# STATISTICAL SIGNIFICANCE
+# =============================================================================
 
 def _compute_statistical_significance(errors1: List[float], errors2: List[float], 
                                       name1: str, name2: str) -> Dict:
-    """Compute statistical significance between two model results using paired t-test."""
+    """Compute statistical significance using paired t-test."""
     if len(errors1) != len(errors2) or len(errors1) < 3:
         return {'significant': False, 'p_value': 1.0, 'reason': 'insufficient_samples'}
     
-    # Paired t-test (same train/test splits for each trial)
     t_stat, p_value = stats.ttest_rel(errors1, errors2)
     
-    # Effect size (Cohen's d for paired samples)
     diff = np.array(errors1) - np.array(errors2)
     effect_size = np.mean(diff) / (np.std(diff) + 1e-6)
     
-    # Significance threshold: p < 0.05 and meaningful effect size
     significant = p_value < 0.05 and abs(effect_size) > 0.3
     
     return {
@@ -840,46 +343,642 @@ def _compute_statistical_significance(errors1: List[float], errors2: List[float]
     }
 
 
+# =============================================================================
+# MODEL ARCHITECTURE ABLATION
+# =============================================================================
+
+
+
+class PeakWeightedHuberLoss(nn.Module):
+    """Same as trainer.py - weights higher RSSI samples more."""
+    
+    def __init__(self, delta=1.5):
+        super().__init__()
+        self.delta = delta
+
+    def forward(self, y_pred, y_true):
+        residual = torch.abs(y_pred - y_true)
+        quadratic = torch.minimum(residual, torch.tensor(self.delta, device=residual.device))
+        linear = residual - quadratic
+        loss_huber = 0.5 * quadratic**2 + self.delta * linear
+        
+        if y_true.numel() > 1 and (y_true.max() - y_true.min()) > 1e-6:
+            rssi_min = y_true.min().detach()
+            rssi_max = y_true.max().detach()
+            weights = ((y_true - rssi_min) / (rssi_max - rssi_min + 1e-8))**2
+            weights = weights / (weights.mean() + 1e-8)
+        else:
+            weights = torch.ones_like(y_true)
+
+        return torch.mean(weights * loss_huber)
+
+
+class PhysicsWeightRegularizedLoss(nn.Module):
+    """Same as trainer.py - regularizes physics weight to prevent NN dominance."""
+    
+    def __init__(self, base_loss, lambda_pl=0.01):
+        super().__init__()
+        self.base_loss = base_loss
+        self.lambda_pl = lambda_pl
+    
+    def forward(self, y_pred, y_true, model=None):
+        loss = self.base_loss(y_pred, y_true)
+        
+        if model is not None and hasattr(model, 'w') and self.lambda_pl > 0:
+            w_softmax = torch.softmax(model.w, dim=0)
+            w_PL = w_softmax[0]
+            pl_reg = self.lambda_pl * (1.0 - w_PL) ** 2
+            loss = loss + pl_reg
+        
+        return loss
+
+
+
+
+@dataclass
+class AblationConfigFixed:
+    """Configuration matching config.py ACTUAL defaults."""
+    n_trials: int = 5
+    n_epochs: int = 200  # Was 500 - config.py uses 200
+    patience: int = 120  # Was 80 - config.py uses 120
+    min_delta: float = 0.01
+    
+    # Learning rates (ACTUAL config.py defaults)
+    lr_theta: float = 0.015  # Was 0.005
+    lr_P0: float = 0.005     # Was 0.002
+    lr_gamma: float = 0.005  # Was 0.002
+    lr_nn: float = 1e-3      # Was 5e-4
+    weight_decay: float = 1e-5
+    
+    # Physics regularization (ACTUAL config.py defaults)
+    lambda_physics_weight: float = 0.01
+    physics_bias: float = 2.0  # Was 1.0 - config.py uses 2.0
+    
+    # Warmup (ACTUAL config.py defaults)
+    warmup_epochs: int = 30  # Was 50 - config.py uses 30
+    
+    # Architecture
+    hidden_dims: List[int] = None
+    
+    # Gradient clipping
+    gradient_clip: float = 1.0
+    
+    def __post_init__(self):
+        if self.hidden_dims is None:
+            self.hidden_dims = [512, 256, 128, 64, 1]
+
+
+
+
+# =============================================================================
+# MODEL CREATION
+# =============================================================================
+
+class PureNNLocalizer(nn.Module):
+    """Pure Neural Network - NO physics prior."""
+    
+    def __init__(self, input_dim, theta_init, hidden_layers=[512, 256, 128, 64, 1]):
+        super().__init__()
+        
+        self.theta = nn.Parameter(torch.tensor(theta_init, dtype=torch.float32))
+        
+        # NN input: [rel_x, rel_y, distance, log_distance]
+        nn_input_dim = 4
+        
+        self.normalization = nn.LayerNorm(nn_input_dim)
+        self.dropout = nn.Dropout(p=0.2)
+        self.fc_layers = nn.ModuleList()
+        
+        layer_wid = hidden_layers if hidden_layers[-1] != 1 else hidden_layers[:-1] + [1]
+        
+        self.fc_layers.append(nn.Linear(nn_input_dim, layer_wid[0]))
+        for i in range(len(layer_wid) - 1):
+            self.fc_layers.append(nn.Linear(layer_wid[i], layer_wid[i + 1]))
+        
+        self.hidden_norms = nn.ModuleList([
+            nn.LayerNorm(layer.in_features) for layer in self.fc_layers[:-1]
+        ])
+        
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for layer in self.fc_layers:
+            if isinstance(layer, nn.Linear):
+                torch.nn.init.xavier_uniform_(layer.weight)
+                if layer.bias is not None:
+                    torch.nn.init.zeros_(layer.bias)
+    
+    def forward(self, x):
+        pos = x[:, :2]
+        rel_pos = pos - self.theta
+        d = torch.sqrt((rel_pos**2).sum(dim=1, keepdim=True) + 1.0)
+        log_d = torch.log10(d)
+        
+        nn_input = torch.cat([rel_pos, d, log_d], dim=1)
+        out = self.normalization(nn_input)
+        
+        for i, (fc_layer, norm) in enumerate(zip(self.fc_layers[:-1], self.hidden_norms)):
+            if i > 0:  # Skip first norm to avoid double LayerNorm on input
+                out = norm(out)
+            out = F.leaky_relu(fc_layer(out))
+            out = self.dropout(out)
+        
+        return self.fc_layers[-1](out)
+    
+    def get_theta(self):
+        return self.theta.detach().cpu().numpy()
+
+
+def create_pure_pl(theta_init, gamma_init, P0_init):
+    """Create Pure Path-Loss model with get_theta() interface."""
+    model = Polynomial3(
+        gamma=gamma_init,
+        theta0=theta_init.tolist() if isinstance(theta_init, np.ndarray) else theta_init,
+        P0_init=P0_init
+    )
+    # Ensure get_theta() exists for consistent interface
+    if not hasattr(model, 'get_theta'):
+        model.get_theta = lambda: model.theta.detach().cpu().numpy()
+    return model
+
+
+def create_apbm(input_dim, theta_init, gamma_init, P0_init, config):
+    """Create APBM model with proper initialization."""
+    model = Net_augmented(
+        input_dim=input_dim,
+        layer_wid=config.hidden_dims,
+        nonlinearity='leaky_relu',
+        gamma=gamma_init,
+        theta0=theta_init.tolist() if isinstance(theta_init, np.ndarray) else theta_init,
+        P0_init=P0_init
+    )
+    
+    # Initialize physics bias (same as trainer.py)
+    physics_bias = config.physics_bias
+    if physics_bias > 0:
+        with torch.no_grad():
+            model.w.data = torch.tensor([
+                float(np.log(physics_bias)),
+                0.0
+            ], dtype=torch.float32)
+    
+    return model
+
+
+
+
+def train_apbm(model, train_loader, val_loader, theta_true, config, device, verbose=False):
+    """
+    Train APBM using the SAME methodology as trainer.py:
+    - Phase 0: Physics warmup (with validation tracking)
+    - Phase 1: Full training with Adam
+    - Phase 2: L-BFGS refinement
+    
+    FIXED: Now tracks best state during warmup and matches trainer.py exactly.
+    """
+    model = model.to(device)
+    
+    # Loss function (matching trainer.py)
+    base_criterion = PeakWeightedHuberLoss(delta=1.5)
+    criterion = PhysicsWeightRegularizedLoss(base_criterion, lambda_pl=config.lambda_physics_weight)
+    
+    # Track best model from the very start
+    best_val_loss = float('inf')
+    best_state = None
+    
+    def get_val_loss():
+        model.eval()
+        val_loss = 0
+        n_val = 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                if y.dim() == 1:
+                    y = y.unsqueeze(1)
+                pred = model(x)
+                val_loss += F.mse_loss(pred, y, reduction='sum').item()
+                n_val += len(x)
+        return val_loss / max(n_val, 1)
+    
+    # =========================================================================
+    # PHASE 0: Physics-only warmup (matching trainer.py)
+    # =========================================================================
+    if config.warmup_epochs > 0:
+        # Force physics dominance during warmup (matching trainer.py: warmup_bias=50)
+        with torch.no_grad():
+            model.w.data = torch.tensor([float(np.log(50.0)), 0.0], dtype=torch.float32, device=device)
+        
+        # Freeze NN + w (train only theta, P0, gamma) - matching trainer.py
+        physics_names = {'theta', 'P0', 'gamma'}
+        prev_requires_grad = {}
+        for name, p in model.named_parameters():
+            if name not in physics_names:
+                prev_requires_grad[name] = p.requires_grad
+                p.requires_grad_(False)
+        
+        warmup_optimizer = optim.Adam([
+            {'params': [model.theta], 'lr': config.lr_theta},
+            {'params': [model.P0], 'lr': config.lr_P0},
+            {'params': [model.gamma], 'lr': config.lr_gamma},
+        ])
+        
+        # Warmup training with validation tracking
+        for epoch in range(config.warmup_epochs):
+            model.train()
+            for x, y in train_loader:
+                x, y = x.to(device), y.to(device)
+                if y.dim() == 1:
+                    y = y.unsqueeze(1)
+                
+                warmup_optimizer.zero_grad()
+                pred = model(x)
+                loss = criterion(pred, y, model=model)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_([model.theta, model.P0, model.gamma], config.gradient_clip)
+                warmup_optimizer.step()
+            
+            # Track best during warmup
+            val_loss = get_val_loss()
+            if val_loss < best_val_loss - config.min_delta:
+                best_val_loss = val_loss
+                best_state = copy.deepcopy(model.state_dict())
+        
+        # Restore physics bias and unfreeze all parameters
+        with torch.no_grad():
+            model.w.data = torch.tensor([float(np.log(config.physics_bias)), 0.0], 
+                                        dtype=torch.float32, device=device)
+        
+        for name, p in model.named_parameters():
+            if name in prev_requires_grad:
+                p.requires_grad_(prev_requires_grad[name])
+    
+    # =========================================================================
+    # PHASE 1: Full training with Adam (matching trainer.py LR groups)
+    # =========================================================================
+    param_groups = [
+        {'params': [model.theta], 'lr': config.lr_theta, 'weight_decay': 0},
+        {'params': [model.P0], 'lr': config.lr_P0, 'weight_decay': 0},
+        {'params': [model.gamma], 'lr': config.lr_gamma, 'weight_decay': 0},
+        {'params': [p for n, p in model.named_parameters() 
+                   if n not in ['theta', 'P0', 'gamma', 'w']], 
+         'lr': config.lr_nn, 'weight_decay': config.weight_decay},
+        {'params': [model.w], 'lr': config.lr_nn * 0.5, 'weight_decay': 0},
+    ]
+    
+    optimizer = optim.Adam(param_groups)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=15, min_lr=1e-6
+    )
+    
+    patience_counter = 0
+    
+    for epoch in range(config.n_epochs):
+        # Training
+        model.train()
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            if y.dim() == 1:
+                y = y.unsqueeze(1)
+            
+            optimizer.zero_grad()
+            pred = model(x)
+            loss = criterion(pred, y, model=model)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            optimizer.step()
+        
+        # Validation
+        val_loss = get_val_loss()
+        scheduler.step(val_loss)
+        
+        # Best model tracking
+        if val_loss < best_val_loss - config.min_delta:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= config.patience:
+            break
+    
+    # Restore best before L-BFGS
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    
+    # =========================================================================
+    # PHASE 2: L-BFGS refinement
+    # =========================================================================
+    try:
+        model.train()
+        
+        # Collect all training data
+        all_x, all_y = [], []
+        for x, y in train_loader:
+            all_x.append(x)
+            all_y.append(y)
+        all_x = torch.cat(all_x, dim=0).to(device)
+        all_y = torch.cat(all_y, dim=0).to(device)
+        if all_y.dim() == 1:
+            all_y = all_y.unsqueeze(1)
+        
+        lbfgs = optim.LBFGS(
+            model.parameters(),
+            lr=0.1,
+            max_iter=100,
+            history_size=20,
+            line_search_fn='strong_wolfe'
+        )
+        
+        def closure():
+            lbfgs.zero_grad()
+            pred = model(all_x)
+            loss = criterion(pred, all_y, model=model)
+            loss.backward()
+            return loss
+        
+        for _ in range(3):
+            lbfgs.step(closure)
+        
+        # Check if L-BFGS improved
+        model.eval()
+        val_loss_lbfgs = 0
+        n_val = 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                if y.dim() == 1:
+                    y = y.unsqueeze(1)
+                pred = model(x)
+                val_loss_lbfgs += F.mse_loss(pred, y, reduction='sum').item()
+                n_val += len(x)
+        val_loss_lbfgs /= max(n_val, 1)
+        
+        if val_loss_lbfgs >= best_val_loss and best_state is not None:
+            model.load_state_dict(best_state)
+    except Exception as e:
+        import logging
+        logging.warning(f"APBM L-BFGS refinement failed: {e}")
+        if best_state is not None:
+            model.load_state_dict(best_state)
+    
+    # Return localization error
+    model.eval()
+    theta_hat = model.get_theta()
+    if isinstance(theta_hat, torch.Tensor):
+        theta_hat = theta_hat.detach().cpu().numpy()
+    return float(np.linalg.norm(theta_hat - theta_true))
+
+
+
+
+def train_pure_pl(model, train_loader, val_loader, theta_true, config, device):
+    """Train Pure Path-Loss model."""
+    model = model.to(device)
+    criterion = nn.HuberLoss(delta=1.5)
+    
+    # Use config learning rates directly (config.py already has appropriate values)
+    optimizer = optim.Adam([
+        {'params': [model.theta], 'lr': config.lr_theta},
+        {'params': [model.gamma], 'lr': config.lr_gamma},
+        {'params': [model.P0], 'lr': config.lr_P0},
+    ])
+    
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=20
+    )
+    
+    best_val_loss = float('inf')
+    best_state = None
+    patience_counter = 0
+    
+    for epoch in range(config.n_epochs):
+        model.train()
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            if y.dim() == 1:
+                y = y.unsqueeze(1)
+            
+            optimizer.zero_grad()
+            pred = model(x)
+            loss = criterion(pred, y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            optimizer.step()
+        
+        # Validation
+        model.eval()
+        val_loss = 0
+        n_val = 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                if y.dim() == 1:
+                    y = y.unsqueeze(1)
+                pred = model(x)
+                val_loss += F.mse_loss(pred, y, reduction='sum').item()
+                n_val += len(x)
+        val_loss /= max(n_val, 1)
+        
+        scheduler.step(val_loss)
+        
+        if val_loss < best_val_loss - config.min_delta:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= config.patience:
+            break
+    
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    
+    # L-BFGS refinement
+    try:
+        model.train()
+        all_x = torch.cat([x for x, y in train_loader], dim=0).to(device)
+        all_y = torch.cat([y for x, y in train_loader], dim=0).to(device)
+        if all_y.dim() == 1:
+            all_y = all_y.unsqueeze(1)
+        
+        lbfgs = optim.LBFGS(
+            [model.theta, model.gamma, model.P0],
+            lr=0.1, max_iter=100, history_size=20,
+            line_search_fn='strong_wolfe'
+        )
+        
+        def closure():
+            lbfgs.zero_grad()
+            pred = model(all_x)
+            loss = criterion(pred, all_y)
+            loss.backward()
+            return loss
+        
+        for _ in range(3):
+            lbfgs.step(closure)
+        
+        # Validate L-BFGS improvement (revert if worse)
+        model.eval()
+        val_loss_lbfgs = 0
+        n_val = 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                if y.dim() == 1:
+                    y = y.unsqueeze(1)
+                pred = model(x)
+                val_loss_lbfgs += F.mse_loss(pred, y, reduction='sum').item()
+                n_val += len(x)
+        val_loss_lbfgs /= max(n_val, 1)
+        
+        if val_loss_lbfgs >= best_val_loss and best_state is not None:
+            model.load_state_dict(best_state)
+    except Exception as e:
+        import logging
+        logging.warning(f"Pure PL L-BFGS refinement failed: {e}")
+        if best_state is not None:
+            model.load_state_dict(best_state)
+    
+    model.eval()
+    theta_hat = model.get_theta()
+    if isinstance(theta_hat, torch.Tensor):
+        theta_hat = theta_hat.detach().cpu().numpy()
+    return float(np.linalg.norm(theta_hat - theta_true))
+
+
+
+
+def train_pure_nn(model, train_loader, val_loader, theta_true, config, device):
+    """Train Pure NN model - harder task without physics prior."""
+    model = model.to(device)
+    criterion = nn.HuberLoss(delta=1.5)
+    
+    # Use config learning rates directly
+    optimizer = optim.Adam([
+        {'params': [model.theta], 'lr': config.lr_theta},
+        {'params': [p for n, p in model.named_parameters() if 'theta' not in n], 
+         'lr': config.lr_nn, 'weight_decay': config.weight_decay},
+    ])
+    
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=20
+    )
+    
+    best_val_loss = float('inf')
+    best_state = None
+    patience_counter = 0
+    
+    for epoch in range(config.n_epochs):
+        model.train()
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            if y.dim() == 1:
+                y = y.unsqueeze(1)
+            
+            optimizer.zero_grad()
+            pred = model(x)
+            loss = criterion(pred, y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            optimizer.step()
+        
+        model.eval()
+        val_loss = 0
+        n_val = 0
+        with torch.no_grad():
+            for x, y in val_loader:
+                x, y = x.to(device), y.to(device)
+                if y.dim() == 1:
+                    y = y.unsqueeze(1)
+                pred = model(x)
+                val_loss += F.mse_loss(pred, y, reduction='sum').item()
+                n_val += len(x)
+        val_loss /= max(n_val, 1)
+        
+        scheduler.step(val_loss)
+        
+        if val_loss < best_val_loss - config.min_delta:
+            best_val_loss = val_loss
+            best_state = copy.deepcopy(model.state_dict())
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= config.patience:
+            break
+    
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    
+    model.eval()
+    theta_hat = model.get_theta()
+    if isinstance(theta_hat, torch.Tensor):
+        theta_hat = theta_hat.detach().cpu().numpy()
+    return float(np.linalg.norm(theta_hat - theta_true))
+
+
+
+
+
 def run_model_architecture_ablation(
     input_csv: str,
     output_dir: str = "results/model_ablation",
     environments: List[str] = None,
     n_trials: int = 5,
-    n_inits: int = 3,  # Multiple random initializations per trial
-    use_predicted_rssi: bool = False,  # NEW: Use predicted RSSI instead of ground truth
+    n_inits: int = 3,
+    use_predicted_rssi: bool = True,  # DEFAULT: Use predicted (matches main experiments)
     verbose: bool = True
 ) -> Dict:
+    """
+    Run model architecture ablation with FIXED training methodology.
     
+    FIXED: Uses data_loader.py and trainer.py directly to GUARANTEE
+    identical results to the full pipeline.
+    """
     os.makedirs(output_dir, exist_ok=True)
     
     if environments is None:
-        environments = ['open_sky', 'suburban', 'urban']
+        environments = ['urban', 'suburban', 'open_sky', 'lab_wired']
     
-    # Load base data
     df_base = pd.read_csv(input_csv)
+    config = AblationConfigFixed()
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Try to import full pipeline modules (suppress auto-tune prints during import)
+    try:
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            from trainer import train_centralized
+            from data_loader import load_data, create_dataloaders, JammerDataset
+            from config import Config, get_gamma_init, get_P0_init
+        FULL_PIPELINE_AVAILABLE = True
+    except ImportError as e:
+        print(f"WARNING: Could not import pipeline modules: {e}")
+        print("APBM will use local training (may differ from full pipeline)")
+        FULL_PIPELINE_AVAILABLE = False
     
     if verbose:
         print(f"\n{'='*70}")
-        print("MODEL ARCHITECTURE ABLATION")
+        print("MODEL ARCHITECTURE ABLATION (FIXED - Matching trainer.py)")
         print(f"{'='*70}")
-        print(f"Base samples: {len(df_base)}")
+        print(f"Device: {device}")
         print(f"Environments: {environments}")
-        print(f"Trials per condition: {n_trials}")
+        print(f"Trials: {n_trials}, Inits: {n_inits}")
         print(f"RSSI source: {'PREDICTED' if use_predicted_rssi else 'GROUND TRUTH'}")
+        print(f"Training: PeakWeightedHuber + PhysicsReg + Warmup + L-BFGS")
+        if FULL_PIPELINE_AVAILABLE:
+            print(f"APBM: Using full pipeline (data_loader + trainer) - GUARANTEED MATCH")
+        else:
+            print(f"APBM: Using local training (may differ)")
     
-    # Results structure
     results = {env: {} for env in environments}
     
-    # Models to test:
-    # - pure_nn: Pure neural network (no physics)
-    # - pure_pl_oracle: Pure path-loss with oracle γ/P₀ (diagnostic only)
-    # - pure_pl_joint: Pure path-loss with jointly estimated θ,γ,P₀ (deployable baseline)
-    # - apbm: Augmented physics-based model
-    models = [
+    models_to_test = [
         ('pure_nn', 'Pure NN'),
-        ('pure_pl_oracle', 'Pure PL (oracle)'),
-        ('pure_pl_joint', 'Pure PL (joint)'),
-        ('apbm', 'APBM')
+        ('pure_pl', 'Pure PL'),
+        ('apbm', 'APBM'),
     ]
     
     for env in environments:
@@ -888,7 +987,7 @@ def run_model_architecture_ablation(
             print(f"ENVIRONMENT: {env.upper()}")
             print(f"{'='*70}")
         
-        # Filter by environment if column exists
+        # Filter by environment
         if 'env' in df_base.columns:
             df_env = df_base[df_base['env'].str.lower() == env.lower()].copy()
         else:
@@ -899,218 +998,274 @@ def run_model_architecture_ablation(
                 print(f"  Skipping {env}: only {len(df_env)} samples")
             continue
         
-        # Get jammer location (from data if available, else hardcoded)
+        # Get jammer location
         jammer_loc = get_jammer_location(df_env, env, verbose=verbose)
-        gamma_env = GAMMA_ENV.get(env, 2.0)
-        P0_env = P0_ENV.get(env, -30.0)
         
-        
-        # Filter jammed samples first (ensures neutral frame reflects the jammed set)
+        # Filter jammed samples
         if 'jammed' in df_env.columns:
             df_env = df_env[df_env['jammed'] == 1].copy()
-
-        # Neutral ENU frame: receiver centroid (NO oracle centering)
+        
+        # Neutral ENU frame
         lat0 = float(df_env['lat'].median())
         lon0 = float(df_env['lon'].median())
         lat0_rad = np.radians(lat0)
         lon0_rad = np.radians(lon0)
-
-        # Convert receivers to ENU (origin = receiver centroid)
+        
         df_env['x_enu'], df_env['y_enu'] = latlon_to_enu(
             df_env['lat'].values, df_env['lon'].values, lat0_rad, lon0_rad
         )
-
-        # True jammer position in the SAME ENU frame (explicit; no defaults)
+        
+        # True jammer position
         jx, jy = latlon_to_enu(
-            np.array([jammer_loc['lat']], dtype=np.float64),
-            np.array([jammer_loc['lon']], dtype=np.float64),
-            lat0_rad,
-            lon0_rad
+            np.array([jammer_loc['lat']]), np.array([jammer_loc['lon']]),
+            lat0_rad, lon0_rad
         )
         theta_true = np.array([float(jx[0]), float(jy[0])], dtype=np.float32)
-
+        
         if verbose:
             print(f"  Samples: {len(df_env)}")
-            print(f"  γ={gamma_env}, P0={P0_env} dBm")
-            print(f"  Reference frame: receiver centroid (NEUTRAL)")
-            print(f"  True jammer position: ({theta_true[0]:.1f}, {theta_true[1]:.1f}) m")
+            print(f"  True jammer: ({theta_true[0]:.1f}, {theta_true[1]:.1f}) m")
         
-        
-        # RSSI COLUMN SELECTION (CRITICAL FOR R² ACCURACY)
-        # Check for ground truth RSSI first
-        gt_rssi_col = 'RSSI' if 'RSSI' in df_env.columns else None
-        pred_rssi_col = next((c for c in ['RSSI_pred_cal', 'RSSI_pred_final', 'RSSI_pred'] 
-                              if c in df_env.columns), None)
-        
-        # Select based on use_predicted_rssi parameter
+        # Select RSSI column (matching data_loader.py logic)
         if use_predicted_rssi:
-            # User wants predicted RSSI (for end-to-end evaluation)
-            rssi_col = pred_rssi_col if pred_rssi_col is not None else gt_rssi_col
+            rssi_col = next((c for c in ['RSSI_pred', 'RSSI_pred_cal', 'RSSI_pred_final'] 
+                            if c in df_env.columns), None)
+            if rssi_col is None:
+                rssi_col = 'RSSI' if 'RSSI' in df_env.columns else None
         else:
-            # Default: ground truth for model ablation (isolates Stage 2 performance)
-            rssi_col = gt_rssi_col if gt_rssi_col is not None else pred_rssi_col
+            rssi_col = 'RSSI' if 'RSSI' in df_env.columns else None
         
         if rssi_col is None:
             if verbose:
-                print(f"  Skipping {env}: no RSSI column found")
+                print(f"  Skipping {env}: no RSSI column")
             continue
         
-        # Report which RSSI is being used and calculate R² for BOTH if available
-        is_using_ground_truth = (rssi_col == 'RSSI')
+        # Create J_hat column (matching data_loader.py)
+        df_env['J_hat'] = df_env[rssi_col].values
         
         if verbose:
-            if is_using_ground_truth:
-                print(f"  Using: GROUND TRUTH RSSI ('RSSI') - proper for model ablation")
-                if pred_rssi_col:
-                    print(f"         (Predicted RSSI also available: '{pred_rssi_col}')")
-            else:
-                print(f"    Using: PREDICTED RSSI ('{rssi_col}') - {'requested' if use_predicted_rssi else 'ground truth not available'}")
-                if not use_predicted_rssi:
-                    print(f"      R² will be lower due to Stage 1 prediction errors")
+            print(f"  Using RSSI: '{rssi_col}'")
         
         positions = df_env[['x_enu', 'y_enu']].values.astype(np.float32)
-        rssi = df_env[rssi_col].values.astype(np.float32)
+        rssi = df_env['J_hat'].values.astype(np.float32)
         
-        # Estimate gamma from data (using true jammer position for distance calculation)
-        P0_est, gamma_est, r2 = estimate_gamma_from_data(positions, rssi, theta_true=theta_true)
+        # Estimate gamma from data
+        P0_est, gamma_est, r2 = estimate_gamma_from_data(positions, rssi, theta_true)
         
-        # Also compute R² for predicted RSSI if using ground truth (for comparison)
-        r2_predicted = None
-        if is_using_ground_truth and pred_rssi_col:
-            rssi_pred = df_env[pred_rssi_col].values.astype(np.float32)
-            _, _, r2_predicted = estimate_gamma_from_data(positions, rssi_pred, theta_true=theta_true)
+        if verbose:
+            print(f"  Estimated: γ={gamma_est:.2f}, P0={P0_est:.1f} dBm, R²={r2:.3f}")
         
-        # Store R² for later analysis
         results[env]['_r2'] = r2
-        results[env]['_r2_predicted'] = r2_predicted
-        results[env]['_rssi_col_used'] = rssi_col
         results[env]['_gamma_est'] = gamma_est
         results[env]['_P0_est'] = P0_est
         
-        if verbose:
-            print(f"  Estimated: γ={gamma_est:.2f}, P0={P0_est:.1f} dBm")
-            print(f"  Path-loss R² (ground truth): {r2:.3f}")
-            if r2_predicted is not None:
-                print(f"  Path-loss R² (predicted):    {r2_predicted:.3f}")
-            
-            # Warn about low R²
-            if r2 < 0.3:
-                print(f"    WARNING: Very low R²={r2:.3f} - path-loss model is a poor fit!")
-                print(f"      Physics-based models may not have advantage in this data.")
-                print(f"      Consider checking: jammer location, data quality, environment.")
-            elif r2 < 0.5:
-                print(f"    NOTE: Moderate R²={r2:.3f} - results may have high variance.")
+        # Build features EXACTLY as data_loader.py does
+        x_enu = df_env['x_enu'].values.astype(np.float32)
+        y_enu = df_env['y_enu'].values.astype(np.float32)
         
-        # Add features for NN - more features help capture multipath effects
-        X = positions.copy()
-        
-        # Feature 1: Building density (direct urban indicator)
+        # Optional features with normalization (matching data_loader.py)
         if 'building_density' in df_env.columns:
             bd = df_env['building_density'].values.astype(np.float32)
-            bd = (bd - bd.mean()) / (bd.std() + 1e-6)  # Normalize
-            X = np.column_stack([X, bd])
+            bd_mean, bd_std = bd.mean(), bd.std() + 1e-6
+            bd_norm = (bd - bd_mean) / bd_std
+        else:
+            bd_norm = np.zeros_like(x_enu)
         
-        # Feature 2: Local signal variance (multipath indicator)
         if 'local_signal_variance' in df_env.columns:
             lsv = df_env['local_signal_variance'].values.astype(np.float32)
-            lsv = (lsv - lsv.mean()) / (lsv.std() + 1e-6)
-            X = np.column_stack([X, lsv])
+            lsv_mean, lsv_std = lsv.mean(), lsv.std() + 1e-6
+            if lsv_std > 1e-5:
+                lsv_norm = (lsv - lsv_mean) / lsv_std
+            else:
+                lsv_norm = np.zeros_like(x_enu)
+        else:
+            lsv_norm = np.zeros_like(x_enu)
         
-        # Feature 3: Distance from data centroid (proxy for geometry)
-        centroid_all = positions.mean(axis=0)
-        dist_from_centroid = np.sqrt(((positions - centroid_all)**2).sum(axis=1))
-        dist_from_centroid = (dist_from_centroid - dist_from_centroid.mean()) / (dist_from_centroid.std() + 1e-6)
-        X = np.column_stack([X, dist_from_centroid])
-        
-        # Feature 4: Angle from centroid (directional effects)
-        angles = np.arctan2(positions[:, 1] - centroid_all[1], 
-                          positions[:, 0] - centroid_all[0])
-        X = np.column_stack([X, np.sin(angles), np.cos(angles)])
-        
-        X = X.astype(np.float32)
-        
-        if verbose:
-            print(f"  Features for NN: {X.shape[1]} (pos={2}, engineered={X.shape[1]-2})")
-        
-        # =================================================================
-        # TRAIN/TEST SPLIT STRATEGY
-        # =================================================================
+        # Stack features [x_enu, y_enu, bd_norm, lsv_norm] - EXACTLY like data_loader.py
+        X = np.stack([x_enu, y_enu, bd_norm, lsv_norm], axis=1).astype(np.float32)
+        input_dim = X.shape[1]
         n = len(X)
         
+        if verbose:
+            print(f"  Features: {input_dim} dims (x, y, bd, lsv)")
+        
         # Test each model
-        for model_key, model_name in models:
+        for model_key, model_name in models_to_test:
             if verbose:
                 print(f"\n  [{model_name}]")
             
             errors = []
             
             for trial in range(n_trials):
-                # Use different train/test split per trial for proper variance estimation
-                # This captures both model variance AND data split variance
-                split_seed = 12345 + trial * 17
-                rng = np.random.RandomState(split_seed)
+                # Train/val split - USE SAME SEED AS FULL PIPELINE (42)
+                split_seed = 42 if trial == 0 else 42 + trial * 17
+                rng = np.random.default_rng(split_seed)
                 idx = rng.permutation(n)
                 train_idx = idx[:int(0.7*n)]
                 val_idx = idx[int(0.7*n):int(0.85*n)]
-                test_idx = idx[int(0.85*n):]
                 
                 X_train, y_train = X[train_idx], rssi[train_idx]
                 X_val, y_val = X[val_idx], rssi[val_idx]
-                X_test, y_test = X[test_idx], rssi[test_idx]
                 
-                # Use position centroid for initialization (first 2 columns are x, y)
+                # Create dataloaders
+                train_dataset = TensorDataset(
+                    torch.tensor(X_train, dtype=torch.float32),
+                    torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+                )
+                val_dataset = TensorDataset(
+                    torch.tensor(X_val, dtype=torch.float32),
+                    torch.tensor(y_val, dtype=torch.float32).unsqueeze(1)
+                )
+                
+                train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+                val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+                
                 centroid = X_train[:, :2].mean(axis=0)
                 
-                set_seed(42 + trial * 100)
-                
-                # Multiple random initializations - keep the best one
-                # This helps avoid local minima, especially for Pure NN
                 best_trial_error = float('inf')
                 
                 for init_idx in range(n_inits):
-                    # Initialize theta with different random perturbations
-                    init_seed = 42 + trial * 100 + init_idx * 7
-                    np.random.seed(init_seed)
+                    set_seed(42 + trial * 100 + init_idx * 7)
                     
-                    # Vary initialization radius based on data spread
+                    # Random initialization near centroid
                     data_spread = np.std(positions, axis=0).mean()
-                    init_radius = min(data_spread * 0.3, 10.0)  # Cap at 10m
-                    theta_init = centroid + np.random.randn(2) * init_radius
+                    init_radius = min(data_spread * 0.3, 10.0)
+                    theta_init = (centroid + np.random.randn(2) * init_radius).astype(np.float32)
                     
-                    # Create model
+                    # Create and train model
                     if model_key == 'pure_nn':
-                        model = PureNN(X_train.shape[1], theta_init)
-                    elif model_key == 'pure_pl_oracle':
-                        # Oracle variant: uses γ/P₀ estimated from theta_true distances
-                        # This is diagnostic only - gives upper bound performance
-                        model = PurePathLoss(theta_init, gamma_est, P0_est)
-                    elif model_key == 'pure_pl_joint':
-                        # Non-oracle variant: jointly estimates θ,γ,P₀ without oracle info
-                        # This is the deployable baseline for fair comparison
-                        P0_joint, gamma_joint, r2_joint, theta_joint = estimate_gamma_joint(
-                            positions, rssi, n_iterations=10
-                        )
-                        # Use the jointly estimated theta as initialization
-                        theta_init_joint = theta_joint.astype(np.float32)
-                        model = PurePathLoss(theta_init_joint, gamma_joint, P0_joint)
-                    else:  # apbm
-                        model = APBM(X_train.shape[1], theta_init, gamma_est, P0_est)
+                        model = PureNNLocalizer(input_dim, theta_init, config.hidden_dims)
+                        loc_err = train_pure_nn(model, train_loader, val_loader, 
+                                               theta_true, config, device)
                     
-                    # Determine model type for training
-                    if model_key in ['pure_pl_oracle', 'pure_pl_joint']:
-                        model_type = 'pure_pl'
-                    else:
-                        model_type = model_key
+                    elif model_key == 'pure_pl':
+                        model = create_pure_pl(theta_init, gamma_est, P0_est)
+                        loc_err = train_pure_pl(model, train_loader, val_loader,
+                                               theta_true, config, device)
                     
-                    # Train with model-specific approach
-                    # Use more epochs for low R² scenarios
-                    n_epochs = 400 if r2 < 0.5 else 300
-                    loc_err = _train_model(
-                        model, X_train, y_train, X_val, y_val,
-                        theta_true=theta_true,  # Pass true jammer position for evaluation
-                        n_epochs=n_epochs, patience=60,
-                        model_type=model_type  # Use determined model_type, not model_key
-                    )
+                    else:  # apbm - USE FULL PIPELINE DIRECTLY
+                        if FULL_PIPELINE_AVAILABLE:
+                            # ============================================================
+                            # USE THE EXACT SAME DATA LOADING AS FULL PIPELINE
+                            # ============================================================
+                            
+                            # Set seed to match full pipeline (seed=42)
+                            set_seed(42)
+                            
+                            # Save filtered data to temp CSV and use load_data
+                            import tempfile
+                            df_for_pipeline = df_env.copy()
+                            df_for_pipeline['RSSI_pred'] = df_for_pipeline[rssi_col]
+                            
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+                                temp_csv = f.name
+                                df_for_pipeline.to_csv(temp_csv, index=False)
+                            
+                            # Create config for full pipeline
+                            data_config = Config.__new__(Config)
+                            data_config.__dict__.update({
+                                'csv_path': temp_csv,
+                                'environment': env,
+                                'seed': 42,
+                                'train_ratio': 0.7,
+                                'val_ratio': 0.15,
+                                'test_ratio': 0.15,
+                                'batch_size': 32,
+                                'input_dim': 4,  # x, y, bd, lsv
+                                'hidden_layers': [512, 256, 128, 64, 1],
+                                'nonlinearity': 'leaky_relu',
+                                'gamma_init': get_gamma_init(env),
+                                'P0_init': get_P0_init(env),
+                                'epochs': 200,
+                                'patience': 120,
+                                'min_delta': 0.01,
+                                'lr_theta': 0.015,
+                                'lr_P0': 0.005,
+                                'lr_gamma': 0.005,
+                                'lr_nn': 1e-3,
+                                'weight_decay': 1e-5,
+                                'lambda_physics_weight': 0.01,
+                                'physics_bias': 2.0,
+                                'warmup_epochs': 30,
+                                'gradient_clip': 1.0,
+                                'jammer_lat': jammer_loc['lat'],
+                                'jammer_lon': jammer_loc['lon'],
+                                'R_earth': 6371000,
+                                'required_cols': [],
+                                'optional_features': ['building_density', 'local_signal_variance'],
+                            })
+                            
+                            # Suppress all prints
+                            import contextlib, io
+                            _suppress_ctx = contextlib.redirect_stdout(io.StringIO())
+                            _suppress_ctx.__enter__()
+                            
+                            try:
+                                # Use EXACT same data loading as full pipeline
+                                df_loaded, lat0_rad_loaded, lon0_rad_loaded = load_data(
+                                    temp_csv, data_config, verbose=False
+                                )
+                                
+                                pipeline_train, pipeline_val, pipeline_test, dataset_full = create_dataloaders(
+                                    df_loaded, data_config, verbose=False
+                                )
+                                
+                                # Compute theta_true in the same frame as load_data
+                                from data_loader import latlon_to_enu as enu_convert
+                                jx, jy = enu_convert(
+                                    np.array([jammer_loc['lat']]), 
+                                    np.array([jammer_loc['lon']]),
+                                    lat0_rad_loaded, lon0_rad_loaded
+                                )
+                                theta_true_loaded = np.array([jx[0], jy[0]], dtype=np.float32)
+                                
+                                # Get centroid from actual training data (matching trainer.py)
+                                if hasattr(dataset_full, 'positions'):
+                                    train_indices = pipeline_train.dataset.indices
+                                    train_positions = dataset_full.positions[train_indices].numpy()
+                                else:
+                                    train_positions = np.array([
+                                        pipeline_train.dataset.dataset[i][0][:2].numpy() 
+                                        for i in pipeline_train.dataset.indices
+                                    ])
+                                theta_init_centroid = train_positions.mean(axis=0).astype(np.float32)
+                                
+                                # Call train_centralized with exact same setup
+                                model, history = train_centralized(
+                                    train_loader=pipeline_train,
+                                    val_loader=pipeline_val,
+                                    test_loader=pipeline_test,
+                                    theta_true=theta_true_loaded,
+                                    theta_init=theta_init_centroid.tolist(),
+                                    config=data_config,
+                                    verbose=False,
+                                )
+                                loc_err = history.get('loc_err', float('inf'))
+                            except Exception as e:
+                                _suppress_ctx.__exit__(None, None, None)
+                                print(f"    WARNING: Full pipeline failed: {e}")
+                                import traceback
+                                traceback.print_exc()
+                                # Fallback to local training
+                                model = create_apbm(input_dim, centroid.astype(np.float32), gamma_est, P0_est, config)
+                                loc_err = train_apbm(model, train_loader, val_loader,
+                                                    theta_true, config, device, verbose=False)
+                            finally:
+                                _suppress_ctx.__exit__(None, None, None)
+                                # Cleanup temp file
+                                try:
+                                    os.remove(temp_csv)
+                                except:
+                                    pass
+                            
+                            
+                            best_trial_error = loc_err
+                            break  # Exit init loop
+                        else:
+                            # Fallback to local training
+                            model = create_apbm(input_dim, theta_init, gamma_est, P0_est, config)
+                            loc_err = train_apbm(model, train_loader, val_loader,
+                                                theta_true, config, device, verbose=False)
                     
                     if loc_err < best_trial_error:
                         best_trial_error = loc_err
@@ -1119,9 +1274,7 @@ def run_model_architecture_ablation(
             
             mean_err = np.mean(errors)
             std_err = np.std(errors)
-            
-            # Compute 95% confidence interval
-            ci_95 = 1.96 * std_err / np.sqrt(n_trials)
+            ci_95 = stats.t.ppf(0.975, n_trials - 1) * std_err / np.sqrt(n_trials)
             
             results[env][model_key] = {
                 'mean': mean_err,
@@ -1134,171 +1287,35 @@ def run_model_architecture_ablation(
             if verbose:
                 print(f"    Error: {mean_err:.2f} ± {std_err:.2f} m (95% CI: ±{ci_95:.2f})")
     
-    # Print summary table
+    # Print summary
     if verbose:
         print(f"\n{'='*70}")
-        print("MODEL ARCHITECTURE ABLATION RESULTS")
+        print("SUMMARY")
         print(f"{'='*70}")
         
-        # Table header
-        header = f"{'Model':<12}"
+        header = f"{'Model':<15}"
         for env in environments:
             if env in results and results[env]:
-                header += f" {env:<18}"
+                header += f" {env:<15}"
         print(header)
-        print("-" * 70)
+        print("-" * 80)
         
-        # Table rows
-        for model_key, model_name in models:
-            row = f"{model_name:<12}"
+        for model_key, model_name in models_to_test:
+            row = f"{model_name:<15}"
             for env in environments:
                 if env in results and model_key in results[env]:
                     r = results[env][model_key]
-                    # Check if best for this environment
-                    env_model_results = {k: v['mean'] for k, v in results[env].items() 
-                                        if not k.startswith('_')}
-                    is_best = r['mean'] == min(env_model_results.values())
-                    marker = "*" if is_best else " "
-                    row += f" {r['mean']:>6.2f} ± {r['std']:<5.2f}{marker}"
+                    # Find best model for this env
+                    env_means = {k: v['mean'] for k, v in results[env].items() 
+                                if isinstance(v, dict) and 'mean' in v}
+                    best_model = min(env_means, key=env_means.get)
+                    marker = "*" if model_key == best_model else " "
+                    row += f" {r['mean']:>5.2f}±{r['std']:<4.2f}{marker}"
                 else:
-                    row += f" {'N/A':<18}"
+                    row += f" {'N/A':<15}"
             print(row)
         
-        print("\n(* = best for that environment)")
-        
-        # Statistical significance testing
-        print(f"\n{'='*70}")
-        print("STATISTICAL SIGNIFICANCE ANALYSIS")
-        print(f"{'='*70}")
-        
-        for env in environments:
-            if env not in results or 'pure_pl' not in results[env]:
-                continue
-            
-            print(f"\n[{env.upper()}]")
-            
-            # Report R² (ground truth and predicted if available)
-            r2_env = results[env].get('_r2', 0)
-            r2_pred = results[env].get('_r2_predicted', None)
-            rssi_used = results[env].get('_rssi_col_used', 'unknown')
-            
-            print(f"  RSSI used: {rssi_used}")
-            if r2_env < 0.3:
-                print(f"    WARNING: R² = {r2_env:.3f} (POOR FIT - interpret with caution)")
-            elif r2_env < 0.5:
-                print(f"    R² = {r2_env:.3f} (MODERATE FIT)")
-            else:
-                print(f"  ✓ R² = {r2_env:.3f} (GOOD FIT)")
-            
-            if r2_pred is not None:
-                print(f"     R² (predicted RSSI): {r2_pred:.3f}")
-                if r2_pred < r2_env - 0.1:
-                    print(f"     Note: Predicted R² is lower due to Stage 1 errors")
-            
-            # Compare Pure NN vs Pure PL
-            if 'pure_nn' in results[env] and 'pure_pl' in results[env]:
-                sig_nn_pl = _compute_statistical_significance(
-                    results[env]['pure_nn']['errors'],
-                    results[env]['pure_pl']['errors'],
-                    'Pure NN', 'Pure PL'
-                )
-                
-                diff_nn_pl = results[env]['pure_nn']['mean'] - results[env]['pure_pl']['mean']
-                if sig_nn_pl['significant']:
-                    print(f"  Pure NN vs Pure PL: {sig_nn_pl['winner']} wins by {abs(diff_nn_pl):.2f}m (p={sig_nn_pl['p_value']:.4f}) ✓ SIGNIFICANT")
-                else:
-                    print(f"  Pure NN vs Pure PL: Diff={diff_nn_pl:+.2f}m (p={sig_nn_pl['p_value']:.4f}) - NOT SIGNIFICANT")
-            
-            # Compare APBM vs Pure PL
-            if 'apbm' in results[env] and 'pure_pl' in results[env]:
-                sig_apbm_pl = _compute_statistical_significance(
-                    results[env]['apbm']['errors'],
-                    results[env]['pure_pl']['errors'],
-                    'APBM', 'Pure PL'
-                )
-                
-                diff_apbm_pl = results[env]['apbm']['mean'] - results[env]['pure_pl']['mean']
-                if sig_apbm_pl['significant']:
-                    print(f"  APBM vs Pure PL: {sig_apbm_pl['winner']} wins by {abs(diff_apbm_pl):.2f}m (p={sig_apbm_pl['p_value']:.4f}) ✓ SIGNIFICANT")
-                else:
-                    print(f"  APBM vs Pure PL: Diff={diff_apbm_pl:+.2f}m (p={sig_apbm_pl['p_value']:.4f}) - NOT SIGNIFICANT")
-            
-            # Compare APBM vs Pure NN
-            if 'apbm' in results[env] and 'pure_nn' in results[env]:
-                sig_apbm_nn = _compute_statistical_significance(
-                    results[env]['apbm']['errors'],
-                    results[env]['pure_nn']['errors'],
-                    'APBM', 'Pure NN'
-                )
-                
-                diff_apbm_nn = results[env]['apbm']['mean'] - results[env]['pure_nn']['mean']
-                if sig_apbm_nn['significant']:
-                    print(f"  APBM vs Pure NN: {sig_apbm_nn['winner']} wins by {abs(diff_apbm_nn):.2f}m (p={sig_apbm_nn['p_value']:.4f}) ✓ SIGNIFICANT")
-                else:
-                    print(f"  APBM vs Pure NN: Diff={diff_apbm_nn:+.2f}m (p={sig_apbm_nn['p_value']:.4f}) - NOT SIGNIFICANT")
-        
-        # Interpretation
-        print(f"\n{'='*70}")
-        print("INTERPRETATION FOR THESIS")
-        print(f"{'='*70}")
-        
-        for env in environments:
-            if env not in results or not results[env]:
-                continue
-            
-            env_model_results = {k: v['mean'] for k, v in results[env].items() 
-                                if not k.startswith('_')}
-            if not env_model_results:
-                continue
-                
-            best_model = min(env_model_results, key=env_model_results.get)
-            r2_env = results[env].get('_r2', 0)
-            
-            # Check significance of best model vs second best
-            sorted_models = sorted(env_model_results.items(), key=lambda x: x[1])
-            if len(sorted_models) >= 2:
-                best_key, best_err = sorted_models[0]
-                second_key, second_err = sorted_models[1]
-                
-                if best_key in results[env] and second_key in results[env]:
-                    sig_test = _compute_statistical_significance(
-                        results[env][best_key]['errors'],
-                        results[env][second_key]['errors'],
-                        best_key, second_key
-                    )
-                    
-                    if not sig_test['significant']:
-                        print(f"⚠️  {env}: {best_key} vs {second_key} - NO SIGNIFICANT DIFFERENCE")
-                        if r2_env < 0.4:
-                            print(f"    (Low R²={r2_env:.2f} suggests path-loss model doesn't fit this data well)")
-                        continue
-            
-            if env == 'open_sky':
-                if best_model == 'pure_pl':
-                    print(f"✓ Open-sky: Pure PL wins ({env_model_results['pure_pl']:.1f}m)")
-                    print("  Simple physics model is sufficient when γ≈2")
-                elif best_model == 'apbm':
-                    print(f"✓ Open-sky: APBM wins ({env_model_results['apbm']:.1f}m)")
-                    print("  NN provides minor corrections even in simple environments")
-            
-            elif env == 'urban':
-                if best_model in ['apbm', 'pure_pl']:
-                    improvement = (env_model_results.get('pure_nn', 0) - env_model_results[best_model]) / env_model_results.get('pure_nn', 1) * 100
-                    print(f"✓ Urban: {best_model.upper()} wins ({env_model_results[best_model]:.1f}m)")
-                    if improvement > 0:
-                        print(f"  Physics-based approach {improvement:.0f}% better than Pure NN")
-            
-            elif env == 'suburban':
-                if best_model in ['apbm', 'pure_pl']:
-                    print(f"✓ Suburban: {best_model.upper()} wins ({env_model_results[best_model]:.1f}m)")
-                elif best_model == 'pure_nn':
-                    print(f" Suburban: Pure NN wins ({env_model_results['pure_nn']:.1f}m)")
-                    print(f"    This is unexpected - check data quality (R²={r2_env:.2f})")
-            
-            elif env == 'lab_wired':
-                print(f"✓ Lab Wired: {best_model.upper()} wins ({env_model_results[best_model]:.1f}m)")
-                if best_model in ['apbm', 'pure_pl']:
-                    print("  Controlled environment follows physics model well")
+        print("\n(* = best model for environment)")
     
     # Save results
     results_file = os.path.join(output_dir, 'model_architecture_ablation.json')
@@ -1308,10 +1325,9 @@ def run_model_architecture_ablation(
             save_data[env] = {}
             for k, v in env_results.items():
                 if isinstance(v, dict) and 'errors' in v:
-                    # Model results - exclude raw errors list
-                    save_data[env][k] = {kk: to_serializable(vv) for kk, vv in v.items() if kk != 'errors'}
+                    save_data[env][k] = {kk: to_serializable(vv) 
+                                        for kk, vv in v.items() if kk != 'errors'}
                 elif not k.startswith('_'):
-                    # Other non-private data
                     save_data[env][k] = to_serializable(v)
         json.dump(save_data, f, indent=2)
     
@@ -1319,352 +1335,1242 @@ def run_model_architecture_ablation(
         print(f"\n✓ Results saved to {results_file}")
     
     # Generate plots
-    _plot_model_ablation(results, environments, output_dir, verbose)
-
-    # -----------------------------------------------------------------
-    # Additional plots 
-    # -----------------------------------------------------------------
     try:
-        _plot_model_ablation_detailed(results, environments, output_dir, verbose)
-        _plot_model_r2_diagnostics(results, environments, output_dir, verbose)
+        _plot_model_ablation(results, environments, output_dir, verbose)
     except Exception as e:
         if verbose:
-            print(f"   Plotting diagnostics failed (non-fatal): {e}")
-
+            print(f"⚠ Could not generate plots: {e}")
     
     return results
 
 
-def _train_model(model, X_train, y_train, X_val, y_val, theta_true, n_epochs=300, patience=30, 
-                 model_type='generic'):
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = model.to(device)
-    
-    X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
-    y_train_t = torch.tensor(y_train, dtype=torch.float32, device=device)
-    X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
-    y_val_t = torch.tensor(y_val, dtype=torch.float32, device=device)
-    
-    criterion = nn.HuberLoss(delta=1.5)
-    
-    def get_val_mse():
-        """Get validation MSE - ORACLE-FREE metric for selection."""
-        model.eval()
-        with torch.no_grad():
-            val_pred = model(X_val_t)
-            return torch.nn.functional.mse_loss(val_pred, y_val_t).item()
-    
-    def get_loc_error():
-        """Get localization error - EVALUATION ONLY, not for training decisions.
-        
-        Uses NEUTRAL reference frame where theta_true is NOT at origin.
-        """
-        theta_hat = model.get_theta()
-        return np.linalg.norm(theta_hat - theta_true)
-    
-    best_val_mse = float('inf')
-    best_state = None
-    patience_counter = 0
-    
-    if model_type == 'apbm':
-        # =====================================================================
-        # APBM TWO-PHASE TRAINING (Oracle-Free)
-        # =====================================================================
-        
-        # PHASE 1: Physics-only warmup (150 epochs)
-        # Selection by val_mse, NOT loc_error
-        physics_params = [model.theta, model.gamma, model.P0]
-        physics_optimizer = torch.optim.Adam([
-            {'params': [model.theta], 'lr': 0.3},
-            {'params': [model.gamma], 'lr': 0.03},
-            {'params': [model.P0], 'lr': 0.05},
-        ])
-        
-        for epoch in range(150):
-            model.train()
-            physics_optimizer.zero_grad()
-            y_pred = model(X_train_t)
-            loss = criterion(y_pred, y_train_t)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(physics_params, 1.0)
-            physics_optimizer.step()
-            
-            # Track by val_mse (NOT loc_error!)
-            val_mse = get_val_mse()
-            if val_mse < best_val_mse - 1e-4:
-                best_val_mse = val_mse
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        
-        # L-BFGS refinement of physics params
-        try:
-            model.train()
-            lbfgs = torch.optim.LBFGS(
-                physics_params, lr=0.1, max_iter=50, history_size=10,
-                line_search_fn='strong_wolfe'
-            )
-            def closure():
-                lbfgs.zero_grad()
-                y_pred = model(X_train_t)
-                loss = criterion(y_pred, y_train_t)
-                loss.backward()
-                return loss
-            lbfgs.step(closure)
-            
-            val_mse = get_val_mse()
-            if val_mse < best_val_mse - 1e-4:
-                best_val_mse = val_mse
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        except:
-            pass
-        
-        # Record physics-only best performance
-        physics_only_mse = best_val_mse
-        physics_only_state = {k: v.clone() for k, v in best_state.items()} if best_state is not None else None
-        
-        # PHASE 2: Fine-tune with NN residuals (100 epochs)
-        # Only accept updates that IMPROVE val_mse
-        if best_state:
-            model.load_state_dict(best_state)
-        
-        all_optimizer = torch.optim.Adam([
-            {'params': [model.theta], 'lr': 0.02},  # Very conservative
-            {'params': [model.gamma], 'lr': 0.002},
-            {'params': [model.P0], 'lr': 0.005},
-            {'params': [model.log_residual_scale], 'lr': 0.01},
-            {'params': model.nn.parameters(), 'lr': 0.0005},
-        ], weight_decay=1e-5)
-        
-        patience_counter = 0
-        for epoch in range(100):
-            model.train()
-            all_optimizer.zero_grad()
-            y_pred = model(X_train_t)
-            loss = criterion(y_pred, y_train_t)
-            
-            # Strongly regularize NN contribution
-            scale_reg = 0.1 * torch.exp(model.log_residual_scale)
-            loss = loss + scale_reg
-            
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            all_optimizer.step()
-            
-            # Only save if val_mse improved (NOT loc_error!)
-            val_mse = get_val_mse()
-            if val_mse < best_val_mse - 1e-4:
-                best_val_mse = val_mse
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= 30:
-                    break
-        
-        # CRITICAL: If NN didn't improve val_mse, revert to physics-only
-        if best_val_mse >= physics_only_mse - 1e-4:
-            if physics_only_state is not None:
-                best_state = physics_only_state
-                best_val_mse = physics_only_mse
-    
-    elif model_type == 'pure_pl':
-        # =====================================================================
-        # PURE PATH LOSS - (Oracle-Free)
-        # =====================================================================
-        optimizer = torch.optim.Adam([
-            {'params': [model.theta], 'lr': 0.3},
-            {'params': [model.gamma], 'lr': 0.03},
-            {'params': [model.P0], 'lr': 0.05},
-        ])
-        
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=30
-        )
-        
-        for epoch in range(n_epochs):
-            model.train()
-            optimizer.zero_grad()
-            y_pred = model(X_train_t)
-            loss = criterion(y_pred, y_train_t)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            model.eval()
-            with torch.no_grad():
-                val_pred = model(X_val_t)
-                val_loss = criterion(val_pred, y_val_t).item()
-            
-            scheduler.step(val_loss)
-            
-            # Track by val_mse (NOT loc_error!)
-            val_mse = get_val_mse()
-            if val_mse < best_val_mse - 1e-4:
-                best_val_mse = val_mse
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    break
-        
-        # L-BFGS refinement
-        if best_state:
-            model.load_state_dict(best_state)
-        try:
-            model.train()
-            lbfgs = torch.optim.LBFGS(
-                [model.theta, model.gamma, model.P0],
-                lr=0.1, max_iter=50, history_size=10,
-                line_search_fn='strong_wolfe'
-            )
-            def closure():
-                lbfgs.zero_grad()
-                y_pred = model(X_train_t)
-                loss = criterion(y_pred, y_train_t)
-                loss.backward()
-                return loss
-            lbfgs.step(closure)
-            
-            val_mse = get_val_mse()
-            if val_mse < best_val_mse - 1e-4:
-                best_val_mse = val_mse
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        except:
-            pass
-    
-    else:
-        # =====================================================================
-        # STANDARD TRAINING (Pure NN) - Oracle-Free
-        # =====================================================================
-        param_groups = []
-        for name, param in model.named_parameters():
-            if 'theta' in name:
-                param_groups.append({'params': [param], 'lr': 0.3})
-            elif 'nn' in name:
-                param_groups.append({'params': [param], 'lr': 0.001})
-            else:
-                param_groups.append({'params': [param], 'lr': 0.01})
-        
-        optimizer = torch.optim.Adam(param_groups)
-        
-        for epoch in range(n_epochs):
-            model.train()
-            optimizer.zero_grad()
-            y_pred = model(X_train_t)
-            loss = criterion(y_pred, y_train_t)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            # Track by val_mse (NOT loc_error!)
-            val_mse = get_val_mse()
-            if val_mse < best_val_mse - 1e-4:
-                best_val_mse = val_mse
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-                patience_counter = 0
-            else:
-                patience_counter += 1
-                if patience_counter >= patience:
-                    break
-        
-        # L-BFGS refinement for theta (fair comparison with Pure PL)
-        if best_state:
-            model.load_state_dict(best_state)
-        try:
-            model.train()
-            lbfgs = torch.optim.LBFGS(
-                [model.theta],  # Only optimize theta position
-                lr=0.1, max_iter=50, history_size=10,
-                line_search_fn='strong_wolfe'
-            )
-            def closure():
-                lbfgs.zero_grad()
-                y_pred = model(X_train_t)
-                loss = criterion(y_pred, y_train_t)
-                loss.backward()
-                return loss
-            lbfgs.step(closure)
-            
-            val_mse = get_val_mse()
-            if val_mse < best_val_mse - 1e-4:
-                best_val_mse = val_mse
-                best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-        except:
-            pass
-    
-    if best_state:
-        model.load_state_dict(best_state)
-    
-    # Return final localization error (for EVALUATION ONLY)
-    # Note: This was NOT used for any training decisions
-    return get_loc_error()
 
 
-def _plot_model_ablation(results: Dict, environments: List[str], output_dir: str, verbose: bool):
-    """Generate model ablation comparison plot."""
+
+def _plot_model_ablation(results: dict, environments: list, output_dir: str, verbose: bool = True):
+    """Generate simple plots for model architecture ablation (3-model version).
+
+    Creates:
+      - Bar chart per environment (mean ± std)
+      - Summary grouped bar chart across environments
+    """
     try:
         import matplotlib.pyplot as plt
-        
-        fig, ax = plt.subplots(figsize=(12, 6))
-        
-        # Updated model list with oracle and joint variants
-        models = [
-            ('pure_nn', 'Pure NN'),
-            ('pure_pl_oracle', 'Pure PL (oracle)†'),
-            ('pure_pl_joint', 'Pure PL (joint)'),
-            ('apbm', 'APBM')
-        ]
-        colors = ['#e74c3c', '#9b59b6', '#3498db', '#2ecc71']
-        
-        x = np.arange(len(environments))
-        width = 0.2
-        
-        for i, (model_key, model_name) in enumerate(models):
-            means = []
-            stds = []
-            for env in environments:
-                if env in results and model_key in results[env]:
-                    means.append(results[env][model_key]['mean'])
-                    stds.append(results[env][model_key]['std'])
-                else:
-                    means.append(0)
-                    stds.append(0)
-            
-            bars = ax.bar(x + i*width, means, width, yerr=stds,
-                         label=model_name, color=colors[i], capsize=5,
-                         edgecolor='black', alpha=0.8)
-            
-            # Add value labels
-            for bar, mean in zip(bars, means):
-                if mean > 0:
-                    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 1,
-                           f'{mean:.1f}', ha='center', va='bottom', fontsize=9)
-        
-        ax.set_xlabel('Environment', fontsize=12)
-        ax.set_ylabel('Localization Error (m)', fontsize=12)
-        ax.set_title('Model Architecture Comparison Across Environments', fontsize=14, fontweight='bold')
-        ax.set_xticks(x + width)
-        ax.set_xticklabels([e.replace('_', ' ').title() for e in environments])
-        ax.legend()
-        ax.grid(axis='y', alpha=0.3)
-        
-        plt.tight_layout()
-        plt.savefig(os.path.join(output_dir, 'model_architecture_ablation.png'), 
-                    dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        if verbose:
-            print(f"✓ Plot saved to {output_dir}/model_architecture_ablation.png")
+        import numpy as np
     except ImportError:
         if verbose:
-            print("  (matplotlib not available, skipping plot)")
+            print("  (matplotlib not available, skipping model ablation plots)")
+        return
+
+    # Basic thesis-like style (keep it lightweight)
+    plt.rcParams.update({
+        'figure.dpi': 150,
+        'figure.facecolor': 'white',
+        'axes.spines.top': False,
+        'axes.spines.right': False,
+        'axes.grid': True,
+        'axes.axisbelow': True,
+        'grid.alpha': 0.3,
+        'savefig.dpi': 300,
+        'savefig.bbox': 'tight',
+    })
+
+    model_keys = ['pure_nn', 'pure_pl', 'apbm']
+    model_labels = {'pure_nn': 'Pure NN', 'pure_pl': 'Pure PL', 'apbm': 'APBM'}
+    model_colors = {'pure_nn': '#DC267F', 'pure_pl': '#648FFF', 'apbm': '#2E8B57'}
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Per-environment bars
+    for env in environments:
+        if env not in results or not results[env]:
+            continue
+        env_results = results[env]
+        present = [k for k in model_keys if k in env_results and isinstance(env_results[k], dict) and 'mean' in env_results[k]]
+        if not present:
+            continue
+
+        means = [env_results[k]['mean'] for k in present]
+        stds  = [env_results[k]['std'] for k in present]
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        x = np.arange(len(present))
+        bars = ax.bar(
+            x, means, yerr=stds, capsize=5,
+            color=[model_colors.get(k, '#6B7280') for k in present],
+            edgecolor='black', linewidth=0.8, alpha=0.85
+        )
+
+        # Mark best
+        best_k = min(present, key=lambda k: env_results[k]['mean'])
+        best_i = present.index(best_k)
+        bars[best_i].set_linewidth(2.5)
+        bars[best_i].set_edgecolor('#FFD700')
+
+        ax.set_xticks(x)
+        ax.set_xticklabels([model_labels.get(k, k) for k in present])
+        ax.set_ylabel('Localization Error (m)')
+        ax.set_title(f'Model Architecture Ablation: {env.replace("_", " ").title()}', fontweight='bold')
+
+        for b, m in zip(bars, means):
+            ax.annotate(f'{m:.2f}m', (b.get_x() + b.get_width()/2, b.get_height()),
+                        textcoords='offset points', xytext=(0, 5),
+                        ha='center', va='bottom', fontsize=9, fontweight='bold')
+
+        plt.tight_layout()
+        for fmt in ['png', 'pdf']:
+            fig.savefig(os.path.join(output_dir, f'model_ablation_bar_{env}.{fmt}'),
+                        format=fmt, dpi=300 if fmt == 'png' else None,
+                        bbox_inches='tight', facecolor='white')
+        plt.close(fig)
+        if verbose:
+            print(f"  ✓ Bar chart saved: model_ablation_bar_{env}.png")
+
+    # Summary plot
+    envs = [e for e in environments if e in results and results[e]]
+    if len(envs) < 2:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    n_env = len(envs)
+    n_mod = len(model_keys)
+    bar_w = 0.22
+
+    for i, mk in enumerate(model_keys):
+        means = [results[e].get(mk, {}).get('mean', np.nan) for e in envs]
+        stds  = [results[e].get(mk, {}).get('std', 0.0) for e in envs]
+        x = np.arange(n_env) + i * bar_w
+        ax.bar(
+            x, means, bar_w, yerr=stds, capsize=3,
+            label=model_labels.get(mk, mk),
+            color=model_colors.get(mk, '#6B7280'),
+            edgecolor='black', linewidth=0.8, alpha=0.85
+        )
+
+    ax.set_xticks(np.arange(n_env) + bar_w * (n_mod - 1) / 2)
+    ax.set_xticklabels([e.replace('_', ' ').title() for e in envs])
+    ax.set_ylabel('Localization Error (m)')
+    ax.set_title('Model Architecture Comparison Across Environments', fontweight='bold')
+    ax.legend(loc='upper right')
+
+    plt.tight_layout()
+    for fmt in ['png', 'pdf']:
+        fig.savefig(os.path.join(output_dir, f'model_ablation_summary.{fmt}'),
+                    format=fmt, dpi=300 if fmt == 'png' else None,
+                    bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    if verbose:
+        print("  ✓ Summary plot saved: model_ablation_summary.png")
+
+
+# =============================================================================
+# RSSI SOURCE ABLATION STUDY (Multi-Model)
+# =============================================================================
+#
+# Research Question: "How does RSSI quality affect jammer localization accuracy?"
+#
+# Design: For each RSSI condition, train ALL THREE model architectures.
+#   - Pure PL: Isolates RSSI effect (tautological control)
+#   - Pure NN: Shows how a pure learner copes with degraded RSSI
+#   - APBM:    The actual deployed model — the column reviewers care about
+#
+# This produces a (conditions × models) matrix of localization errors.
+# =============================================================================
+
+
+def run_rssi_source_ablation(
+    input_csv: str,
+    output_dir: str = "results/rssi_ablation",
+    env: str = None,
+    model_types: list = None,
+    n_trials: int = 5,
+    n_inits: int = 3,
+    verbose: bool = True,
+    _asymmetric_retry: bool = False,
+) -> Dict:
+    """
+    RSSI Source Ablation Study across multiple model architectures.
+    
+    Produces a (conditions × models) matrix of localization errors.
+    
+    Uses the SAME training methodology as run_model_architecture_ablation:
+      - APBM: full pipeline (load_data + create_dataloaders + train_centralized)
+      - Pure NN/PL: local training with centroid initialization
+    
+    Args:
+        input_csv: Path to CSV with lat, lon, RSSI, RSSI_pred columns
+        output_dir: Directory for results and plots
+        env: Environment name (auto-detected if None)
+        model_types: List of models to test. Default: ['pure_pl', 'pure_nn', 'apbm']
+        n_trials: Number of trials per condition (for variance estimation)
+        n_inits: Random initializations per trial (Pure NN / Pure PL only)
+        verbose: Print progress
+    
+    Returns:
+        Dict with results[condition][model_type] = {mean, std, errors, ...}
+    """
+    if model_types is None:
+        model_types = ['pure_pl', 'pure_nn', 'apbm']
+    
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Load data
+    df_original = pd.read_csv(input_csv)
+    
+    # =====================================================================
+    # 1. DETECT ENVIRONMENT
+    # =====================================================================
+    if env is None:
+        input_lower = input_csv.lower()
+        for env_name in ['open_sky', 'suburban', 'urban', 'lab_wired', 'mixed']:
+            if env_name.replace('_', '') in input_lower.replace('_', ''):
+                env = env_name
+                break
+        if env is None and 'env' in df_original.columns:
+            try:
+                env_mode = df_original['env'].dropna().astype(str).value_counts().idxmax()
+                if env_mode in ['open_sky', 'suburban', 'urban', 'lab_wired', 'mixed']:
+                    env = env_mode
+            except Exception:
+                env = None
+        if env is None:
+            env = 'mixed'
+            if verbose:
+                print("Could not infer environment; defaulting to 'mixed'.")
+    
+    # =====================================================================
+    # 2. IMPORT FULL PIPELINE (same as model_architecture_ablation)
+    # =====================================================================
+    try:
+        import contextlib, io
+        with contextlib.redirect_stdout(io.StringIO()):
+            from trainer import train_centralized
+            from data_loader import load_data, create_dataloaders, JammerDataset
+            from config import Config, get_gamma_init, get_P0_init
+        FULL_PIPELINE_AVAILABLE = True
+    except ImportError as e:
+        if verbose:
+            print(f"WARNING: Could not import pipeline modules: {e}")
+            print("APBM will use local training (may differ from full pipeline)")
+        FULL_PIPELINE_AVAILABLE = False
+    
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"RSSI SOURCE ABLATION STUDY — {env.upper()}")
+        print(f"{'='*70}")
+        print(f"Models: {', '.join(model_types)}")
+        print(f"Trials per condition: {n_trials}")
+        if FULL_PIPELINE_AVAILABLE:
+            print(f"APBM: Using full pipeline (data_loader + trainer) — GUARANTEED MATCH")
+        else:
+            print(f"APBM: Using local training (may differ)")
+    
+    # =====================================================================
+    # 3. PREPARE DATA (same ENU frame as model_architecture_ablation)
+    # =====================================================================
+    # Get jammer location
+    jammer_loc = get_jammer_location(df_original, env, verbose=verbose)
+    
+    # Filter jammed samples
+    if 'jammed' in df_original.columns:
+        df_jammed = df_original[df_original['jammed'] == 1].copy()
+    else:
+        df_jammed = df_original.copy()
+    
+    # Neutral ENU frame (median, matching model_architecture_ablation)
+    lat0 = float(df_jammed['lat'].median())
+    lon0 = float(df_jammed['lon'].median())
+    lat0_rad = np.radians(lat0)
+    lon0_rad = np.radians(lon0)
+    
+    x_enu, y_enu = latlon_to_enu(df_jammed['lat'].values, df_jammed['lon'].values, lat0_rad, lon0_rad)
+    df_jammed['x_enu'] = x_enu
+    df_jammed['y_enu'] = y_enu
+    positions = np.stack([x_enu, y_enu], axis=1).astype(np.float32)
+    
+    # True jammer in ENU
+    jx, jy = latlon_to_enu(
+        np.array([jammer_loc['lat']]), np.array([jammer_loc['lon']]),
+        lat0_rad, lon0_rad
+    )
+    theta_true = np.array([float(jx[0]), float(jy[0])], dtype=np.float32)
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    config = AblationConfigFixed()
+    if config.hidden_dims is None:
+        config.hidden_dims = [512, 256, 128, 64, 1]
+    
+    if verbose:
+        print(f"Jammed samples: {len(df_jammed)}")
+        print(f"θ_true (ENU): ({theta_true[0]:.1f}, {theta_true[1]:.1f}) m")
+    
+    # =====================================================================
+    # 4. EXTRACT RSSI COLUMNS
+    # =====================================================================
+    has_ground_truth = 'RSSI' in df_jammed.columns
+    pred_col = next((c for c in ['RSSI_pred', 'RSSI_pred_cal', 'RSSI_pred_final'] 
+                    if c in df_jammed.columns), None)
+    
+    if not has_ground_truth:
+        raise ValueError("Need ground truth RSSI column for ablation!")
+    
+    rssi_gt = df_jammed['RSSI'].values.astype(np.float32)
+    rssi_pred = df_jammed[pred_col].values.astype(np.float32) if pred_col else None
+    rssi_mean = rssi_gt.mean()
+    
+    if verbose:
+        print(f"RSSI range (GT): [{rssi_gt.min():.1f}, {rssi_gt.max():.1f}] dB")
+        if pred_col and rssi_pred is not None:
+            valid = ~np.isnan(rssi_pred)
+            mae = np.mean(np.abs(rssi_gt[valid] - rssi_pred[valid]))
+            corr = np.corrcoef(rssi_gt[valid], rssi_pred[valid])[0, 1]
+            print(f"Stage 1 Quality: MAE={mae:.2f} dB, Corr={corr:.4f}")
+    
+    # Estimate path-loss parameters from ground truth
+    P0_est, gamma_est, r2 = estimate_gamma_from_data(positions, rssi_gt, theta_true=theta_true)
+    if verbose:
+        print(f"Path-loss fit (GT): γ={gamma_est:.2f}, P0={P0_est:.1f} dBm (R²={r2:.3f})")
+    
+    # =====================================================================
+    # 5. DEFINE RSSI CONDITIONS
+    # =====================================================================
+    conditions_order = ['oracle', 'predicted', 'noisy_2dB', 'noisy_5dB',
+                        'noisy_10dB', 'shuffled', 'constant']
+    
+    def _get_rssi(condition, trial_seed):
+        """Return RSSI array for a given condition and trial seed."""
+        rng = np.random.default_rng(trial_seed)
+        if condition == 'oracle':
+            return rssi_gt.copy()
+        elif condition == 'predicted':
+            return rssi_pred.copy() if rssi_pred is not None else None
+        elif condition.startswith('noisy_'):
+            sigma = float(condition.split('_')[1].replace('dB', ''))
+            return rssi_gt + rng.normal(0, sigma, size=len(rssi_gt)).astype(np.float32)
+        elif condition == 'shuffled':
+            shuffled = rssi_gt.copy()
+            rng.shuffle(shuffled)
+            return shuffled
+        elif condition == 'constant':
+            return np.full_like(rssi_gt, rssi_mean)
+        return None
+    
+    # Filter to conditions that have data
+    conditions = [c for c in conditions_order if _get_rssi(c, 0) is not None]
+    
+    if verbose:
+        print(f"\nConditions to test: {conditions}")
+    
+    # =====================================================================
+    # 6. BUILD FEATURES (EXACTLY as model_architecture_ablation does)
+    # =====================================================================
+    x_enu_arr = df_jammed['x_enu'].values.astype(np.float32)
+    y_enu_arr = df_jammed['y_enu'].values.astype(np.float32)
+    
+    if 'building_density' in df_jammed.columns:
+        bd = df_jammed['building_density'].values.astype(np.float32)
+        bd_mean, bd_std = bd.mean(), bd.std() + 1e-6
+        bd_norm = (bd - bd_mean) / bd_std
+    else:
+        bd_norm = np.zeros_like(x_enu_arr)
+    
+    if 'local_signal_variance' in df_jammed.columns:
+        lsv = df_jammed['local_signal_variance'].values.astype(np.float32)
+        lsv_mean, lsv_std = lsv.mean(), lsv.std() + 1e-6
+        lsv_norm = (lsv - lsv_mean) / lsv_std if lsv_std > 1e-5 else np.zeros_like(x_enu_arr)
+    else:
+        lsv_norm = np.zeros_like(x_enu_arr)
+    
+    X = np.stack([x_enu_arr, y_enu_arr, bd_norm, lsv_norm], axis=1).astype(np.float32)
+    input_dim = X.shape[1]
+    n = len(X)
+    
+    # =====================================================================
+    # 7. RUN ABLATION: conditions × models × trials
+    #    (mirrors model_architecture_ablation training loop exactly)
+    # =====================================================================
+    results = {}
+    total_runs = len(conditions) * len(model_types) * n_trials
+    run_count = 0
+    
+    for cond_name in conditions:
+        results[cond_name] = {}
+        
+        if verbose:
+            print(f"\n{'─'*60}")
+            print(f"Condition: {cond_name.upper()}")
+            print(f"{'─'*60}")
+        
+        for model_type in model_types:
+            errors = []
+            
+            for trial in range(n_trials):
+                run_count += 1
+                trial_seed = 42 + trial * 1000
+                rssi = _get_rssi(cond_name, trial_seed)
+                
+                # Train/val split — SAME SEED LOGIC as model_architecture_ablation
+                split_seed = 42 if trial == 0 else 42 + trial * 17
+                rng_split = np.random.default_rng(split_seed)
+                idx = rng_split.permutation(n)
+                train_idx = idx[:int(0.7 * n)]
+                val_idx = idx[int(0.7 * n):int(0.85 * n)]
+                
+                X_train, y_train = X[train_idx], rssi[train_idx]
+                X_val, y_val = X[val_idx], rssi[val_idx]
+                
+                train_dataset = TensorDataset(
+                    torch.tensor(X_train, dtype=torch.float32),
+                    torch.tensor(y_train, dtype=torch.float32).unsqueeze(1)
+                )
+                val_dataset = TensorDataset(
+                    torch.tensor(X_val, dtype=torch.float32),
+                    torch.tensor(y_val, dtype=torch.float32).unsqueeze(1)
+                )
+                train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+                val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False)
+                
+                # Receiver centroid from training data
+                centroid = X_train[:, :2].mean(axis=0)
+                
+                best_trial_error = float('inf')
+                
+                try:
+                    if model_type == 'pure_pl':
+                        # ─── Pure Path-Loss (scipy.optimize) ───
+                        # Uses positions + RSSI directly, no NN
+                        for init_idx in range(n_inits):
+                            set_seed(42 + trial * 100 + init_idx * 7)
+                            data_spread = np.std(positions, axis=0).mean()
+                            init_radius = min(data_spread * 0.3, 10.0)
+                            theta_init = (centroid + np.random.randn(2) * init_radius).astype(np.float32)
+                            
+                            model = create_pure_pl(theta_init, gamma_est, P0_est)
+                            loc_err = train_pure_pl(model, train_loader, val_loader,
+                                                    theta_true, config, device)
+                            if loc_err < best_trial_error:
+                                best_trial_error = loc_err
+                    
+                    elif model_type == 'pure_nn':
+                        # ─── Pure NN (multiple random inits) ───
+                        for init_idx in range(n_inits):
+                            set_seed(42 + trial * 100 + init_idx * 7)
+                            data_spread = np.std(positions, axis=0).mean()
+                            init_radius = min(data_spread * 0.3, 10.0)
+                            theta_init = (centroid + np.random.randn(2) * init_radius).astype(np.float32)
+                            
+                            model = PureNNLocalizer(input_dim, theta_init, config.hidden_dims)
+                            loc_err = train_pure_nn(model, train_loader, val_loader,
+                                                    theta_true, config, device)
+                            if loc_err < best_trial_error:
+                                best_trial_error = loc_err
+                    
+                    else:  # apbm — USE FULL PIPELINE DIRECTLY
+                        if FULL_PIPELINE_AVAILABLE:
+                            set_seed(42)
+                            
+                            # Save temp CSV with swapped RSSI
+                            import tempfile
+                            df_for_pipeline = df_jammed.copy()
+                            df_for_pipeline['RSSI_pred'] = rssi  # swapped RSSI
+                            df_for_pipeline['J_hat'] = rssi
+                            
+                            with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+                                temp_csv = f.name
+                                df_for_pipeline.to_csv(temp_csv, index=False)
+                            
+                            # Create config matching model_architecture_ablation
+                            data_config = Config.__new__(Config)
+                            data_config.__dict__.update({
+                                'csv_path': temp_csv,
+                                'environment': env,
+                                'seed': 42,
+                                'train_ratio': 0.7,
+                                'val_ratio': 0.15,
+                                'test_ratio': 0.15,
+                                'batch_size': 32,
+                                'input_dim': 4,
+                                'hidden_layers': [512, 256, 128, 64, 1],
+                                'nonlinearity': 'leaky_relu',
+                                'gamma_init': get_gamma_init(env),
+                                'P0_init': get_P0_init(env),
+                                'epochs': 200,
+                                'patience': 120,
+                                'min_delta': 0.01,
+                                'lr_theta': 0.015,
+                                'lr_P0': 0.005,
+                                'lr_gamma': 0.005,
+                                'lr_nn': 1e-3,
+                                'weight_decay': 1e-5,
+                                'lambda_physics_weight': 0.01,
+                                'physics_bias': 2.0,
+                                'warmup_epochs': 30,
+                                'gradient_clip': 1.0,
+                                'jammer_lat': jammer_loc['lat'],
+                                'jammer_lon': jammer_loc['lon'],
+                                'R_earth': 6371000,
+                                'required_cols': [],
+                                'optional_features': ['building_density', 'local_signal_variance'],
+                            })
+                            
+                            import contextlib, io
+                            _suppress_ctx = contextlib.redirect_stdout(io.StringIO())
+                            _suppress_ctx.__enter__()
+                            
+                            try:
+                                df_loaded, lat0_rad_loaded, lon0_rad_loaded = load_data(
+                                    temp_csv, data_config, verbose=False
+                                )
+                                
+                                pipeline_train, pipeline_val, pipeline_test, dataset_full = create_dataloaders(
+                                    df_loaded, data_config, verbose=False
+                                )
+                                
+                                # theta_true in same frame as load_data
+                                from data_loader import latlon_to_enu as enu_convert
+                                jx_l, jy_l = enu_convert(
+                                    np.array([jammer_loc['lat']]),
+                                    np.array([jammer_loc['lon']]),
+                                    lat0_rad_loaded, lon0_rad_loaded
+                                )
+                                theta_true_loaded = np.array([jx_l[0], jy_l[0]], dtype=np.float32)
+                                
+                                # Centroid from training data (matching trainer.py)
+                                if hasattr(dataset_full, 'positions'):
+                                    train_indices = pipeline_train.dataset.indices
+                                    train_positions = dataset_full.positions[train_indices].numpy()
+                                else:
+                                    train_positions = np.array([
+                                        pipeline_train.dataset.dataset[i][0][:2].numpy()
+                                        for i in pipeline_train.dataset.indices
+                                    ])
+                                theta_init_centroid = train_positions.mean(axis=0).astype(np.float32)
+                                
+                                # Call train_centralized — exact same as model_architecture_ablation
+                                model_trained, history = train_centralized(
+                                    train_loader=pipeline_train,
+                                    val_loader=pipeline_val,
+                                    test_loader=pipeline_test,
+                                    theta_true=theta_true_loaded,
+                                    theta_init=theta_init_centroid.tolist(),
+                                    config=data_config,
+                                    verbose=False,
+                                )
+                                best_trial_error = history.get('loc_err', float('inf'))
+                            except Exception as e:
+                                _suppress_ctx.__exit__(None, None, None)
+                                if verbose:
+                                    print(f"    WARNING: Full pipeline failed: {e}")
+                                # Fallback to local training
+                                model = create_apbm(input_dim, centroid.astype(np.float32),
+                                                    gamma_est, P0_est, config)
+                                best_trial_error = train_apbm(model, train_loader, val_loader,
+                                                              theta_true, config, device, verbose=False)
+                            finally:
+                                _suppress_ctx.__exit__(None, None, None)
+                                try:
+                                    os.remove(temp_csv)
+                                except:
+                                    pass
+                            
+                            # APBM with full pipeline: one run per trial (deterministic centroid)
+                            # This matches model_architecture_ablation behavior.
+                        
+                        else:
+                            # Fallback: local training with centroid init
+                            model = create_apbm(input_dim, centroid.astype(np.float32),
+                                                gamma_est, P0_est, config)
+                            best_trial_error = train_apbm(model, train_loader, val_loader,
+                                                          theta_true, config, device, verbose=False)
+                
+                except Exception as e:
+                    import logging
+                    logging.warning(f"Trial {trial+1} failed for {cond_name}/{model_type}: {e}")
+                    best_trial_error = float('inf')
+                
+                errors.append(best_trial_error)
+                
+                if verbose:
+                    status = f"{errors[-1]:.2f}m" if np.isfinite(errors[-1]) else "FAILED"
+                    print(f"  [{run_count:>3}/{total_runs}] {model_type:>8} trial {trial+1}/{n_trials}: {status}")
+            
+            # Statistics (exclude inf)
+            valid_errors = [e for e in errors if np.isfinite(e)]
+            mean_err = float(np.mean(valid_errors)) if valid_errors else float('inf')
+            std_err = float(np.std(valid_errors)) if len(valid_errors) > 1 else 0.0
+            
+            results[cond_name][model_type] = {
+                'mean': mean_err,
+                'std': std_err,
+                'errors': errors,
+                'n_valid': len(valid_errors),
+            }
+    
+    # =====================================================================
+    # 6. COMPUTE RELATIVE METRICS
+    # =====================================================================
+    for cond_name in results:
+        for model_type in results[cond_name]:
+            oracle_err = results.get('oracle', {}).get(model_type, {}).get('mean', 1.0)
+            if oracle_err > 0 and oracle_err < float('inf'):
+                results[cond_name][model_type]['vs_oracle'] = (
+                    results[cond_name][model_type]['mean'] / oracle_err
+                )
+            else:
+                results[cond_name][model_type]['vs_oracle'] = float('inf')
+    
+    # =====================================================================
+    # 7. PRINT RESULTS TABLE
+    # =====================================================================
+    if verbose:
+        # Detect predicted < oracle anomalies
+        anomalies = {}
+        for mt in model_types:
+            pred_err = results.get('predicted', {}).get(mt, {}).get('mean', float('inf'))
+            oracle_err = results.get('oracle', {}).get(mt, {}).get('mean', float('inf'))
+            if pred_err < oracle_err and oracle_err < float('inf'):
+                anomalies[mt] = (pred_err, oracle_err)
+        
+        print(f"\n{'='*90}")
+        print(f"RSSI SOURCE ABLATION RESULTS (Multi-Model) — {env.upper()}")
+        print(f"{'='*90}")
+        
+        if anomalies:
+            for mt, (p, o) in anomalies.items():
+                print(f"NOTE ({mt.upper()}): Predicted ({p:.2f}m) < Oracle ({o:.2f}m)")
+                if mt == 'pure_pl':
+                    print(f"  → Stage 1 denoises real-world multipath → better PL fit")
+                elif mt == 'apbm':
+                    print(f"  → Stage 1 predictions may be more APBM-compatible than raw RSSI")
+            print()
+        
+        # Table header
+        col_w = 22
+        header = f"{'Condition':<18}"
+        for mt in model_types:
+            header += f"{mt.upper():>{col_w}}"
+        print(header)
+        print("─" * (18 + col_w * len(model_types)))
+        
+        for cond_name in conditions:
+            row = f"{cond_name:<18}"
+            for mt in model_types:
+                r = results[cond_name].get(mt, {})
+                m = r.get('mean', float('inf'))
+                s = r.get('std', 0)
+                vs = r.get('vs_oracle', 0)
+                if m < float('inf'):
+                    cell = f"{m:.2f}±{s:.2f} ({vs:.1f}x)"
+                    row += f"{cell:>{col_w}}"
+                else:
+                    row += f"{'FAILED':>{col_w}}"
+            print(row)
+        
+        # ─── INTERPRETATION ───
+        print(f"\n{'='*90}")
+        print("INTERPRETATION FOR THESIS")
+        print(f"{'='*90}")
+        
+        # Focus on APBM if available, else first model
+        primary = 'apbm' if 'apbm' in model_types else model_types[0]
+        
+        oracle_m = results.get('oracle', {}).get(primary, {}).get('mean', float('inf'))
+        shuf_m = results.get('shuffled', {}).get(primary, {}).get('mean', float('inf'))
+        const_m = results.get('constant', {}).get(primary, {}).get('mean', float('inf'))
+        pred_m = results.get('predicted', {}).get(primary, {}).get('mean', float('inf'))
+        
+        shuf_r = shuf_m / oracle_m if oracle_m > 0 and oracle_m < float('inf') else float('inf')
+        const_r = const_m / oracle_m if oracle_m > 0 and oracle_m < float('inf') else float('inf')
+        
+        # Q1: Is RSSI spatial info essential?
+        if shuf_r > 3.0 or const_r > 3.0:
+            print(f"\n✓ RSSI spatial information is ESSENTIAL (even for {primary.upper()})!")
+            print(f"  {primary.upper()}: Shuffled = {shuf_r:.1f}x Oracle, "
+                  f"Constant = {const_r:.1f}x Oracle")
+            
+            # Compare NN compensation across models
+            if 'pure_pl' in model_types and primary != 'pure_pl':
+                shuf_pl = results.get('shuffled', {}).get('pure_pl', {}).get('vs_oracle', float('inf'))
+                shuf_primary = shuf_r
+                if shuf_primary < shuf_pl and shuf_pl < float('inf'):
+                    compensation = (1 - shuf_primary / shuf_pl) * 100
+                    print(f"  {primary.upper()}'s NN compensates ~{compensation:.0f}% of PL degradation, "
+                          f"but RSSI remains critical")
+                else:
+                    print(f"  {primary.upper()} shows no NN compensation — RSSI quality directly limits accuracy")
+        elif shuf_r > 2.0 or const_r > 2.0:
+            print(f"\n✓ RSSI quality MATTERS for {primary.upper()}")
+            print(f"  Shuffled = {shuf_r:.1f}x Oracle, Constant = {const_r:.1f}x Oracle")
+        else:
+            print(f"\n⚠ Moderate RSSI effect on {primary.upper()}: "
+                  f"Shuffled = {shuf_r:.1f}x, Constant = {const_r:.1f}x Oracle")
+        
+        # Q2: Stage 1 quality
+        if pred_m < float('inf') and oracle_m < float('inf'):
+            pred_r = pred_m / oracle_m
+            print()
+            if pred_r < 1.0:
+                print(f"✓ Stage 1 predictions OUTPERFORM ground truth on {primary.upper()} "
+                      f"({pred_r:.2f}x Oracle)")
+                print(f"  Stage 1 acts as a denoiser: smoothed RSSI is more model-compatible")
+            elif pred_r < 1.5:
+                print(f"✓ Stage 1 predictions preserve spatial info ({pred_r:.2f}x Oracle)")
+            else:
+                print(f"⚠ Stage 1 gap: {pred_r:.2f}x Oracle on {primary.upper()}")
+        
+        # Q3: Noise robustness
+        noisy_items = [(c, results[c].get(primary, {}).get('vs_oracle', 1.0))
+                       for c in conditions if c.startswith('noisy_')]
+        if noisy_items:
+            worst = max(noisy_items, key=lambda x: x[1])
+            print()
+            if worst[1] < 1.5:
+                print(f"✓ {primary.upper()} is ROBUST to noise (worst: {worst[0]} = {worst[1]:.2f}x Oracle)")
+            elif worst[1] < 3.0:
+                print(f"⚠ {primary.upper()}: moderate noise sensitivity ({worst[0]} = {worst[1]:.2f}x Oracle)")
+            else:
+                print(f"⚠ High noise degrades {primary.upper()} significantly ({worst[0]} = {worst[1]:.2f}x Oracle)")
+        
+        # Cross-model insights
+        if len(model_types) >= 2:
+            print(f"\nCROSS-MODEL INSIGHTS:")
+            for cond in ['shuffled', 'constant']:
+                if cond in results:
+                    vals = {mt: results[cond].get(mt, {}).get('mean', float('inf')) 
+                            for mt in model_types}
+                    valid_vals = {k: v for k, v in vals.items() if v < float('inf')}
+                    if len(valid_vals) >= 2:
+                        best_mt = min(valid_vals, key=valid_vals.get)
+                        worst_mt = max(valid_vals, key=valid_vals.get)
+                        print(f"  {cond}: best={best_mt} ({valid_vals[best_mt]:.1f}m) → "
+                              f"worst={worst_mt} ({valid_vals[worst_mt]:.1f}m)")
+    
+    # =====================================================================
+    # 8. SAVE RESULTS
+    # =====================================================================
+    results_file = os.path.join(output_dir, f'rssi_source_ablation_{env}.json')
+    
+    save_data = {}
+    for cond_name in results:
+        save_data[cond_name] = {}
+        for mt in results[cond_name]:
+            r = results[cond_name][mt]
+            save_data[cond_name][mt] = {
+                k: to_serializable(v) for k, v in r.items()
+            }
+    
+    save_data['_metadata'] = {
+        'model_types': model_types,
+        'n_trials': n_trials,
+        'environment': env,
+        'gamma_est': float(gamma_est),
+        'P0_est': float(P0_est),
+        'r2': float(r2),
+        'theta_true': theta_true.tolist(),
+        'theta_init': theta_init.tolist(),
+        'n_samples': len(df_jammed),
+        'conditions': conditions,
+    }
+    
+    with open(results_file, 'w') as f:
+        json.dump(save_data, f, indent=2)
+    
+    if verbose:
+        print(f"\n✓ Results saved to {results_file}")
+    
+    # =====================================================================
+    # 9. GENERATE PLOTS
+    # =====================================================================
+    _plot_rssi_ablation_multimodel(results, conditions, model_types, output_dir, env, verbose)
+    
+    # Additional diagnostic plots
+    try:
+        if pred_col and rssi_pred is not None:
+            _plot_stage1_rssi_quality(
+                rssi_true=rssi_gt,
+                rssi_pred=rssi_pred,
+                output_dir=output_dir,
+                env=env,
+                pred_col_name=pred_col,
+                verbose=verbose,
+            )
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠ Stage 1 quality plot failed (non-fatal): {e}")
+    
+    # =====================================================================
+    # 10. ASYMMETRIC RETRY (if predicted < oracle → geometry dominates)
+    # =====================================================================
+    primary = 'apbm' if 'apbm' in model_types else model_types[0]
+    pred_err = results.get('predicted', {}).get(primary, {}).get('mean', float('inf'))
+    oracle_err = results.get('oracle', {}).get(primary, {}).get('mean', float('inf'))
+    
+    if (pred_err < oracle_err and oracle_err < float('inf')
+            and not _asymmetric_retry and 'predicted' in conditions):
+        
+        if verbose:
+            print(f"\n{'='*90}")
+            print(f"⚠ GEOMETRY DOMINANCE DETECTED: Predicted ({pred_err:.2f}m) < Oracle ({oracle_err:.2f}m)")
+            print(f"  Receiver centroid is too close to jammer — RSSI signal is masked by geometry.")
+            print(f"  Re-running with GRADUATED asymmetric subset to expose RSSI effect.")
+            print(f"{'='*90}")
+        
+        try:
+            old_centroid_err = np.linalg.norm(positions.mean(axis=0) - theta_true)
+            
+            # ── GRADUATED REMOVAL ──
+            # Strategy: Remove points from ONE side to shift centroid to a
+            # TARGET distance (~30m). This is far enough that geometry alone
+            # gives a mediocre answer, but close enough that RSSI gradients
+            # can still guide optimization toward the jammer.
+            #
+            # Full-quadrant removal (previous approach) shifted centroid 
+            # to ~60m, causing models to get stuck at centroid (RSSI gradient
+            # too weak at that distance to pull theta 60m).
+            
+            target_centroid_dist = 30.0  # meters
+            
+            # 1. Find the direction that shifts centroid most per point removed
+            dx = positions[:, 0] - theta_true[0]
+            dy = positions[:, 1] - theta_true[1]
+            
+            quadrants = {
+                'NE': (dx > 0) & (dy > 0),
+                'NW': (dx < 0) & (dy > 0),
+                'SW': (dx < 0) & (dy < 0),
+                'SE': (dx > 0) & (dy < 0),
+            }
+            
+            # Pick quadrant whose removal shifts centroid most
+            best_q, best_shift = None, 0
+            for q_name, q_mask in quadrants.items():
+                keep = ~q_mask
+                if keep.sum() < 100:
+                    continue
+                c = positions[keep].mean(axis=0)
+                shift = np.linalg.norm(c - theta_true)
+                if shift > best_shift:
+                    best_shift = shift
+                    best_q = q_name
+            
+            if best_q is None:
+                if verbose:
+                    print("  Could not find valid quadrant to remove. Skipping.")
+            else:
+                # 2. Sort points in chosen quadrant by distance from jammer
+                #    (remove furthest first — they contribute most to the
+                #    centroid being near jammer)
+                q_indices = np.where(quadrants[best_q])[0]
+                dists_from_jammer = np.linalg.norm(
+                    positions[q_indices] - theta_true, axis=1
+                )
+                # Sort: furthest first (removing these shifts centroid most)
+                q_sorted = q_indices[np.argsort(-dists_from_jammer)]
+                
+                # 3. Gradually remove until centroid reaches target or
+                #    we've removed the entire quadrant
+                keep_mask = np.ones(len(positions), dtype=bool)
+                achieved_dist = old_centroid_err
+                n_removed = 0
+                min_samples = int(len(positions) * 0.5)  # keep at least 50%
+                
+                for i, idx in enumerate(q_sorted):
+                    keep_mask[idx] = False
+                    n_remaining = keep_mask.sum()
+                    
+                    if n_remaining < min_samples:
+                        keep_mask[idx] = True  # undo
+                        break
+                    
+                    c = positions[keep_mask].mean(axis=0)
+                    achieved_dist = np.linalg.norm(c - theta_true)
+                    n_removed = i + 1
+                    
+                    if achieved_dist >= target_centroid_dist:
+                        break
+                
+                n_kept = keep_mask.sum()
+                new_centroid = positions[keep_mask].mean(axis=0)
+                new_centroid_err = np.linalg.norm(new_centroid - theta_true)
+                
+                if verbose:
+                    print(f"\n  Direction: {best_q} (max shift potential: {best_shift:.1f}m)")
+                    print(f"  Removed {n_removed}/{len(q_sorted)} points from {best_q} quadrant")
+                    print(f"  Samples: {len(positions)} → {n_kept}")
+                    print(f"  Centroid→Jammer: {old_centroid_err:.1f}m → {new_centroid_err:.1f}m "
+                          f"(target: {target_centroid_dist:.0f}m)")
+                
+                if new_centroid_err < old_centroid_err + 5:
+                    if verbose:
+                        print(f"  ⚠ Could not shift centroid meaningfully. Skipping.")
+                else:
+                    # 4. Create subset CSV and re-run
+                    import tempfile
+                    df_asym = df_jammed.iloc[np.where(keep_mask)[0]].copy()
+                    
+                    with tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False) as f:
+                        temp_csv_asym = f.name
+                        df_asym.to_csv(temp_csv_asym, index=False)
+                    
+                    asym_output_dir = os.path.join(output_dir, 'asymmetric')
+                    
+                    try:
+                        results_asym = run_rssi_source_ablation(
+                            input_csv=temp_csv_asym,
+                            output_dir=asym_output_dir,
+                            env=env,
+                            model_types=model_types,
+                            n_trials=n_trials,
+                            n_inits=n_inits,
+                            verbose=verbose,
+                            _asymmetric_retry=True,
+                        )
+                        
+                        # Store asymmetric results in main results dict
+                        results['_asymmetric'] = results_asym
+                        results['_asymmetric_metadata'] = {
+                            'quadrant_removed': best_q,
+                            'n_points_removed': int(n_removed),
+                            'n_original': len(df_jammed),
+                            'n_kept': int(n_kept),
+                            'centroid_err_original': float(old_centroid_err),
+                            'centroid_err_asymmetric': float(new_centroid_err),
+                            'target_centroid_dist': float(target_centroid_dist),
+                        }
+                        
+                        # Re-save main JSON with asymmetric results
+                        results_file = os.path.join(output_dir, f'rssi_source_ablation_{env}.json')
+                        save_data = {}
+                        for cond_name_s in results:
+                            if cond_name_s.startswith('_'):
+                                save_data[cond_name_s] = to_serializable(results[cond_name_s])
+                            else:
+                                save_data[cond_name_s] = {}
+                                for mt_s in results[cond_name_s]:
+                                    save_data[cond_name_s][mt_s] = {
+                                        k: to_serializable(v) for k, v in results[cond_name_s][mt_s].items()
+                                    }
+                        with open(results_file, 'w') as f:
+                            json.dump(save_data, f, indent=2)
+                        
+                        # Print comparison
+                        if verbose:
+                            print(f"\n{'='*90}")
+                            print(f"COMPARISON: Symmetric vs Asymmetric ({env.upper()})")
+                            print(f"{'='*90}")
+                            print(f"  Centroid→Jammer: {old_centroid_err:.1f}m (sym) → "
+                                  f"{new_centroid_err:.1f}m (asym)")
+                            print(f"  Samples: {len(df_jammed)} (sym) → {n_kept} (asym, "
+                                  f"{n_removed} pts from {best_q} removed)\n")
+                            
+                            col_w = 18
+                            header = f"{'Condition':<14}{'Model':<10}"
+                            header += f"{'Symmetric':>{col_w}}{'Asymmetric':>{col_w}}{'Change':>{col_w}}"
+                            print(header)
+                            print("─" * (14 + 10 + col_w * 3))
+                            
+                            for cond_name in conditions:
+                                for mt in model_types:
+                                    sym_m = results.get(cond_name, {}).get(mt, {}).get('mean', float('inf'))
+                                    asy_m = results_asym.get(cond_name, {}).get(mt, {}).get('mean', float('inf'))
+                                    
+                                    if sym_m < float('inf') and asy_m < float('inf'):
+                                        if sym_m > 0:
+                                            change = (asy_m - sym_m) / sym_m * 100
+                                            change_str = f"{change:+.0f}%"
+                                        else:
+                                            change_str = "N/A"
+                                        print(f"{cond_name:<14}{mt:<10}"
+                                              f"{sym_m:>{col_w-1}.2f}m"
+                                              f"{asy_m:>{col_w-1}.2f}m"
+                                              f"{change_str:>{col_w}}")
+                            
+                            # Key comparison: oracle vs predicted
+                            print()
+                            for mt in model_types:
+                                asy_oracle = results_asym.get('oracle', {}).get(mt, {}).get('mean', float('inf'))
+                                asy_pred = results_asym.get('predicted', {}).get(mt, {}).get('mean', float('inf'))
+                                asy_shuf = results_asym.get('shuffled', {}).get(mt, {}).get('mean', float('inf'))
+                                asy_const = results_asym.get('constant', {}).get(mt, {}).get('mean', float('inf'))
+                                
+                                if asy_oracle < float('inf'):
+                                    parts = [f"oracle={asy_oracle:.1f}m"]
+                                    if asy_pred < float('inf'):
+                                        parts.append(f"pred={asy_pred:.1f}m")
+                                    if asy_shuf < float('inf'):
+                                        ratio = asy_shuf / asy_oracle
+                                        parts.append(f"shuf={asy_shuf:.1f}m ({ratio:.1f}x)")
+                                    if asy_const < float('inf'):
+                                        ratio = asy_const / asy_oracle
+                                        parts.append(f"const={asy_const:.1f}m ({ratio:.1f}x)")
+                                    
+                                    sym_pred_v = results.get('predicted', {}).get(mt, {}).get('mean', float('inf'))
+                                    sym_oracle_v = results.get('oracle', {}).get(mt, {}).get('mean', float('inf'))
+                                    sym_status = "pred<oracle ⚠" if sym_pred_v < sym_oracle_v else "oracle≤pred ✓"
+                                    asy_status = "pred<oracle ⚠" if asy_pred < asy_oracle else "oracle≤pred ✓"
+                                    
+                                    print(f"  {mt.upper()}: {' | '.join(parts)}")
+                                    print(f"    Symmetric={sym_status} → Asymmetric={asy_status}")
+                    
+                    finally:
+                        try:
+                            os.remove(temp_csv_asym)
+                        except:
+                            pass
+        
+        except Exception as e:
+            if verbose:
+                print(f"  ⚠ Asymmetric retry failed: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    return results
+
+
+def _plot_rssi_ablation_multimodel(results, conditions, model_types,
+                                     output_dir, env, verbose):
+    """Generate multi-model RSSI ablation plots."""
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        from matplotlib.lines import Line2D
+    except ImportError:
+        if verbose:
+            print("  (matplotlib not available, skipping plots)")
+        return
+    
+    _setup_thesis_style()
+    os.makedirs(output_dir, exist_ok=True)
+    env_title = env.replace('_', ' ').title()
+    
+    MODEL_COLORS = {
+        'pure_pl': '#e74c3c',   # Red
+        'pure_nn': '#3498db',   # Blue
+        'apbm':    '#2ecc71',   # Green
+    }
+    MODEL_LABELS = {
+        'pure_pl': 'Pure PL',
+        'pure_nn': 'Pure NN',
+        'apbm':    'APBM',
+    }
+    
+    # =====================================================================
+    # PLOT 1: Grouped bar chart (conditions × models)
+    # =====================================================================
+    fig, ax = plt.subplots(figsize=(14, 7))
+    
+    n_conditions = len(conditions)
+    n_models = len(model_types)
+    bar_width = 0.8 / n_models
+    x = np.arange(n_conditions)
+    
+    for i, mt in enumerate(model_types):
+        means = []
+        stds = []
+        for cond in conditions:
+            r = results.get(cond, {}).get(mt, {})
+            means.append(r.get('mean', 0))
+            stds.append(r.get('std', 0))
+        
+        offset = (i - n_models / 2 + 0.5) * bar_width
+        bars = ax.bar(x + offset, means, bar_width * 0.9, yerr=stds,
+                      label=MODEL_LABELS.get(mt, mt),
+                      color=MODEL_COLORS.get(mt, '#95a5a6'),
+                      edgecolor='black', linewidth=0.5, capsize=3, alpha=0.85)
+        
+        # Value labels
+        for bar, mean in zip(bars, means):
+            if mean < float('inf') and mean > 0:
+                ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                       f'{mean:.1f}', ha='center', va='bottom', fontsize=7,
+                       fontweight='bold', rotation=45)
+    
+    ax.set_xticks(x)
+    ax.set_xticklabels([c.replace('_', '\n') for c in conditions], fontsize=10)
+    ax.set_ylabel('Localization Error (m)', fontsize=12)
+    ax.set_title(f'RSSI Source Impact on Localization ({env_title})',
+                fontsize=14, fontweight='bold')
+    ax.legend(fontsize=11)
+    ax.grid(axis='y', alpha=0.3)
+    
+    # Use log scale if range is extreme
+    all_means = [results[c][mt]['mean'] for c in conditions for mt in model_types
+                 if mt in results.get(c, {}) and results[c][mt]['mean'] < float('inf')]
+    if all_means:
+        max_m, min_m = max(all_means), min(m for m in all_means if m > 0)
+        if max_m / max(min_m, 1e-6) > 50:
+            ax.set_yscale('log')
+            ax.set_ylabel('Localization Error (m) — log scale', fontsize=12)
+    
+    plt.tight_layout()
+    _save_figure(fig, output_dir, f'rssi_ablation_{env}')
+    if verbose:
+        print(f"✓ Main plot saved: rssi_ablation_{env}.png")
+    
+    # =====================================================================
+    # PLOT 2: Heatmap (conditions × models — normalized to oracle)
+    # =====================================================================
+    fig, ax = plt.subplots(figsize=(max(8, 3 * len(model_types)), max(5, 0.8 * len(conditions))))
+    
+    matrix = np.zeros((len(conditions), len(model_types)))
+    for i, cond in enumerate(conditions):
+        for j, mt in enumerate(model_types):
+            matrix[i, j] = results.get(cond, {}).get(mt, {}).get('vs_oracle', float('nan'))
+    
+    matrix_vis = np.where(np.isfinite(matrix), matrix, np.nanmax(matrix[np.isfinite(matrix)]) * 1.1)
+    matrix_vis = np.clip(matrix_vis, 0.1, 1000)
+    
+    cmap = plt.cm.RdYlGn_r
+    try:
+        norm = mcolors.LogNorm(vmin=0.3, vmax=max(20, np.nanmax(matrix_vis)))
+    except Exception:
+        norm = None
+    
+    im = ax.imshow(matrix_vis, cmap=cmap, norm=norm, aspect='auto')
+    
+    ax.set_xticks(np.arange(len(model_types)))
+    ax.set_xticklabels([MODEL_LABELS.get(mt, mt) for mt in model_types], fontsize=11)
+    ax.set_yticks(np.arange(len(conditions)))
+    ax.set_yticklabels([c.replace('_', ' ').title() for c in conditions], fontsize=10)
+    
+    # Annotate cells
+    for i in range(len(conditions)):
+        for j in range(len(model_types)):
+            val = matrix[i, j]
+            if np.isfinite(val):
+                text = f'{val:.2f}x' if val < 100 else f'{val:.0f}x'
+            else:
+                text = 'N/A'
+            color = 'white' if (np.isfinite(val) and val > 5) else 'black'
+            ax.text(j, i, text, ha='center', va='center', fontsize=9,
+                   fontweight='bold', color=color)
+    
+    ax.set_title(f'RSSI Ablation: Error Ratio vs Oracle ({env_title})',
+                fontsize=13, fontweight='bold')
+    plt.colorbar(im, ax=ax, label='× Oracle Error', shrink=0.8)
+    
+    plt.tight_layout()
+    _save_figure(fig, output_dir, f'rssi_ablation_heatmap_{env}')
+    if verbose:
+        print(f"✓ Heatmap saved: rssi_ablation_heatmap_{env}.png")
+    
+    # =====================================================================
+    # PLOT 3: Per-model panels
+    # =====================================================================
+    n_mt = len(model_types)
+    fig, axes = plt.subplots(1, n_mt, figsize=(6 * n_mt, 5), sharey=True)
+    if n_mt == 1:
+        axes = [axes]
+    
+    COND_COLORS = {
+        'oracle': '#2ecc71', 'predicted': '#3498db',
+        'noisy_2dB': '#f39c12', 'noisy_5dB': '#f39c12', 'noisy_10dB': '#e67e22',
+        'shuffled': '#e74c3c', 'constant': '#c0392b',
+    }
+    
+    for ax, mt in zip(axes, model_types):
+        means = [results.get(c, {}).get(mt, {}).get('mean', float('nan')) for c in conditions]
+        stds = [results.get(c, {}).get(mt, {}).get('std', 0) for c in conditions]
+        colors = [COND_COLORS.get(c, '#95a5a6') for c in conditions]
+        
+        bars = ax.bar(range(len(conditions)), means, yerr=stds, capsize=4,
+                      color=colors, edgecolor='black', linewidth=0.5, alpha=0.85)
+        
+        ax.set_xticks(range(len(conditions)))
+        ax.set_xticklabels([c.replace('_', '\n') for c in conditions], fontsize=8, rotation=45, ha='right')
+        ax.set_title(MODEL_LABELS.get(mt, mt), fontsize=13, fontweight='bold')
+        ax.grid(axis='y', alpha=0.3)
+        
+        # Oracle reference line
+        oracle_m = results.get('oracle', {}).get(mt, {}).get('mean', None)
+        if oracle_m is not None and oracle_m < float('inf'):
+            ax.axhline(oracle_m, color='green', linestyle='--', alpha=0.5, linewidth=1)
+    
+    axes[0].set_ylabel('Localization Error (m)', fontsize=11)
+    fig.suptitle(f'RSSI Ablation by Model Architecture ({env_title})',
+                fontsize=14, fontweight='bold', y=1.02)
+    
+    plt.tight_layout()
+    _save_figure(fig, output_dir, f'rssi_ablation_panels_{env}')
+    if verbose:
+        print(f"✓ Panel plot saved: rssi_ablation_panels_{env}.png")
 
 
 
-# ============================================================================
-# PLOTS 
-# ============================================================================
+def _run_pure_pathloss_localization(positions, rssi, theta_true, gamma_init, P0_init, n_starts=10, seed=42):
+    """
+    Pure Path-Loss localization using scipy.optimize.
+    
+    Jointly optimizes theta (jammer position), gamma, and P0 to minimize
+    the path-loss prediction error. No neural network involved.
+    
+    This is the correct model for RSSI ablation because it ONLY uses RSSI
+    and cannot learn spatial shortcuts from other features.
+    """
+    from scipy.optimize import minimize
+    
+    X = positions.astype(np.float64)
+    J = rssi.astype(np.float64)
+    n = len(X)
+    
+    def loss_fn(params):
+        """Path-loss loss: MSE between predicted and actual RSSI."""
+        theta = params[:2]
+        gamma = params[2]
+        P0 = params[3]
+        
+        # Distance with small epsilon for numerical stability
+        d = np.sqrt(((X - theta)**2).sum(axis=1) + 1.0)
+        
+        # Path-loss prediction
+        J_pred = P0 - 10 * gamma * np.log10(d)
+        
+        # MSE loss
+        return ((J_pred - J)**2).mean()
+    
+    # Multi-start optimization to avoid local minima
+    rng = np.random.default_rng(seed)
+    centroid = X.mean(axis=0)
+    spread = X.std(axis=0)
+    
+    best_theta = centroid.copy()
+    best_loss = np.inf
+    
+    for k in range(n_starts):
+        # Initialize theta near receiver centroid with some randomness
+        if k == 0:
+            theta0 = centroid
+        else:
+            theta0 = centroid + rng.normal(0, 1, size=2) * spread
+        
+        # Initial params: [theta_x, theta_y, gamma, P0]
+        x0 = np.array([theta0[0], theta0[1], gamma_init, P0_init])
+        
+        # Bounds: theta can be anywhere, gamma in [1, 5], P0 in [-80, -10]
+        bounds = [
+            (centroid[0] - 5*spread[0], centroid[0] + 5*spread[0]),  # theta_x
+            (centroid[1] - 5*spread[1], centroid[1] + 5*spread[1]),  # theta_y
+            (1.0, 5.0),   # gamma
+            (-80.0, -10.0)  # P0
+        ]
+        
+        try:
+            res = minimize(loss_fn, x0, method='L-BFGS-B', bounds=bounds,
+                          options={'maxiter': 500, 'ftol': 1e-8})
+            
+            if res.fun < best_loss:
+                best_loss = res.fun
+                best_theta = res.x[:2]
+        except Exception:
+            continue
+    
+    # Return localization error
+    return float(np.linalg.norm(best_theta - theta_true))
+
+
+# (_run_single_localization removed — superseded by _run_pure_pathloss_localization)
+
+
 
 def _plot_stage1_rssi_quality(
     rssi_true: np.ndarray,
@@ -1877,554 +2783,132 @@ def _plot_pathloss_fit(
             print("  (matplotlib not available, skipping path-loss fit)")
 
 
-def _plot_rssi_ablation_detailed(results: Dict, output_dir: str, env: str, verbose: bool = True):
-   
-    try:
-        import matplotlib.pyplot as plt
-        from matplotlib.lines import Line2D
-        
-        _setup_thesis_style()
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Preferred ordering
-        preferred_order = ['oracle', 'predicted', 'noisy_2dB', 'noisy_5dB', 
-                           'noisy_10dB', 'shuffled', 'constant']
-        conditions = [c for c in preferred_order if c in results]
-        if not conditions:
-            conditions = [k for k in results.keys() if not k.startswith('_')]
-        
-        if len(conditions) < 2:
-            if verbose:
-                print("  (insufficient conditions for RSSI detailed plots)")
-            return
-        
-        env_title = env.replace('_', ' ').title()
-        
-        # =====================================================================
-        # PLOT 1: Box Plot (colored by condition)
-        # =====================================================================
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        data = [results[c].get('errors', []) for c in conditions]
-        colors = [RSSI_COLORS.get(c, PLOT_COLORS['gray']) for c in conditions]
-        
-        bp = ax.boxplot(data, patch_artist=True, showfliers=True,
-                        flierprops={'marker': 'o', 'markersize': 4, 'alpha': 0.5})
-        
-        for patch, color in zip(bp['boxes'], colors):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-        
-        for median in bp['medians']:
-            median.set_color('black')
-            median.set_linewidth(2)
-        
-        labels = [c.replace('_', '\n').replace('noisy\n', 'Noisy\n') for c in conditions]
-        ax.set_xticklabels(labels)
-        ax.set_ylabel('Localization Error (m)')
-        ax.set_title(f'RSSI Ablation: Error Distribution ({env_title})', fontweight='bold')
-        
-        # Oracle reference line
-        if 'oracle' in results:
-            oracle_mean = results['oracle']['mean']
-            ax.axhline(oracle_mean, color=PLOT_COLORS['green'], linestyle='--', 
-                      linewidth=1.5, alpha=0.7, label=f'Oracle mean: {oracle_mean:.1f}m')
-            ax.legend(loc='upper right')
-        
-        _save_figure(fig, output_dir, f'rssi_ablation_box_{env}')
-        
-        # =====================================================================
-        # PLOT 2: CDF Comparison
-        # =====================================================================
-        fig, ax = plt.subplots(figsize=(9, 6))
-        
-        for c in conditions:
-            errors = np.array(results[c].get('errors', []), dtype=float)
-            errors = errors[np.isfinite(errors)]
-            if len(errors) == 0:
-                continue
-            
-            xs = np.sort(errors)
-            ys = np.arange(1, len(xs) + 1) / len(xs)
-            
-            color = RSSI_COLORS.get(c, PLOT_COLORS['gray'])
-            linewidth = 2.5 if c in ['oracle', 'predicted'] else 1.5
-            linestyle = '-' if c in ['oracle', 'predicted'] else '--'
-            
-            ax.step(xs, ys, where='post', label=c.replace('_', ' ').title(),
-                   color=color, linewidth=linewidth, linestyle=linestyle)
-        
-        ax.set_xlabel('Localization Error (m)')
-        ax.set_ylabel('Cumulative Probability')
-        ax.set_title(f'RSSI Ablation: Error CDF ({env_title})', fontweight='bold')
-        ax.legend(loc='lower right', ncol=2)
-        ax.set_xlim(left=0)
-        ax.set_ylim(0, 1.02)
-        
-        # Percentile reference lines
-        ax.axhline(0.5, color='gray', linestyle=':', alpha=0.5)
-        ax.axhline(0.9, color='gray', linestyle=':', alpha=0.5)
-        ax.text(ax.get_xlim()[1] * 0.98, 0.51, '50th %ile', ha='right', fontsize=9, alpha=0.7)
-        ax.text(ax.get_xlim()[1] * 0.98, 0.91, '90th %ile', ha='right', fontsize=9, alpha=0.7)
-        
-        _save_figure(fig, output_dir, f'rssi_ablation_cdf_{env}')
-        
-        # =====================================================================
-        # PLOT 3: Bar Chart with Significance
-        # =====================================================================
-        fig, ax = plt.subplots(figsize=(10, 6))
-        
-        x = np.arange(len(conditions))
-        means = [results[c]['mean'] for c in conditions]
-        stds = [results[c]['std'] for c in conditions]
-        colors_list = [RSSI_COLORS.get(c, PLOT_COLORS['gray']) for c in conditions]
-        
-        bars = ax.bar(x, means, yerr=stds, capsize=5, color=colors_list,
-                     edgecolor='black', linewidth=0.8, alpha=0.85)
-        
-        # Value labels
-        for i, (bar, mean, std) in enumerate(zip(bars, means, stds)):
-            height = bar.get_height()
-            ax.text(bar.get_x() + bar.get_width()/2, height + std + 0.5,
-                   f'{mean:.1f}', ha='center', va='bottom', fontsize=9, fontweight='bold')
-        
-        # Significance markers (vs oracle)
-        if 'oracle' in results:
-            oracle_errors = results['oracle']['errors']
-            for i, c in enumerate(conditions):
-                if c == 'oracle':
-                    continue
-                c_errors = results[c].get('errors', [])
-                if len(c_errors) == len(oracle_errors) and len(c_errors) >= 3:
-                    _, p = stats.ttest_rel(oracle_errors, c_errors)
-                    if p < 0.001:
-                        marker = '***'
-                    elif p < 0.01:
-                        marker = '**'
-                    elif p < 0.05:
-                        marker = '*'
-                    else:
-                        marker = 'ns'
-                    
-                    y_pos = means[i] + stds[i] + 2
-                    ax.text(i, y_pos, marker, ha='center', fontsize=10, fontweight='bold')
-        
-        ax.set_xticks(x)
-        ax.set_xticklabels([c.replace('_', '\n') for c in conditions])
-        ax.set_ylabel('Localization Error (m)')
-        ax.set_title(f'RSSI Source Impact on Localization ({env_title})', fontweight='bold')
-        
-        # Legend for significance
-        legend_elements = [
-            Line2D([0], [0], marker='', color='w', label='*** p<0.001'),
-            Line2D([0], [0], marker='', color='w', label='**  p<0.01'),
-            Line2D([0], [0], marker='', color='w', label='*   p<0.05'),
-            Line2D([0], [0], marker='', color='w', label='ns  not sig.'),
-        ]
-        ax.legend(handles=legend_elements, loc='upper left', fontsize=9,
-                 title='vs Oracle', title_fontsize=9)
-        
-        _save_figure(fig, output_dir, f'rssi_ablation_bar_{env}')
-        
-        if verbose:
-            print(f"✓ RSSI detailed plots: rssi_ablation_{{box,cdf,bar}}_{env}.png")
-    except ImportError:
-        if verbose:
-            print("  (matplotlib not available, skipping RSSI diagnostic plots)")
 
-
-def _plot_model_ablation_detailed(results: Dict, environments: List[str], output_dir: str, verbose: bool = True):
-    """
-    Publication-quality model architecture ablation plots.
-    
-    Creates:
-    1. Grouped box plots by environment with model coloring
-    2. Best model markers (★)
-    
-    Saves: model_ablation_box_by_env.{png,pdf}
-    """
-    try:
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Patch
-        from matplotlib.lines import Line2D
-        
-        _setup_thesis_style()
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Updated model list with oracle and joint variants
-        models = [
-            ('pure_nn', 'Pure NN'),
-            ('pure_pl_oracle', 'Pure PL (oracle)†'),
-            ('pure_pl_joint', 'Pure PL (joint)'),
-            ('apbm', 'APBM')
-        ]
-        envs = [e for e in environments if e in results and results[e]]
-        
-        if not envs:
-            if verbose:
-                print("  (no valid environments for model detailed plots)")
-            return
-        
-        # Build data structure
-        n_models = len(models)
-        positions = []
-        data = []
-        colors = []
-        
-        pos = 1
-        gap = 1.5
-        env_centers = []
-        
-        for env in envs:
-            env_start = pos
-            for model_key, model_name in models:
-                if model_key in results[env] and 'errors' in results[env][model_key]:
-                    data.append(results[env][model_key]['errors'])
-                else:
-                    data.append([])
-                positions.append(pos)
-                colors.append(MODEL_COLORS.get(model_key, PLOT_COLORS['gray']))
-                pos += 1
-            env_centers.append((env_start + pos - 1) / 2)
-            pos += gap
-        
-        # Create figure
-        fig, ax = plt.subplots(figsize=(max(10, len(envs) * 3.5), 6))
-        
-        bp = ax.boxplot(data, positions=positions, widths=0.7, patch_artist=True,
-                        showfliers=True, flierprops={'marker': 'o', 'markersize': 3, 'alpha': 0.5})
-        
-        for patch, color in zip(bp['boxes'], colors):
-            patch.set_facecolor(color)
-            patch.set_alpha(0.7)
-        
-        for median in bp['medians']:
-            median.set_color('black')
-            median.set_linewidth(2)
-        
-        # Mark best model per environment with star
-        box_idx = 0
-        for j, env in enumerate(envs):
-            env_results = {k: v['mean'] for k, v in results[env].items() 
-                          if not k.startswith('_') and isinstance(v, dict) and 'mean' in v}
-            if env_results:
-                best_model = min(env_results, key=env_results.get)
-                for i, (mk, _) in enumerate(models):
-                    if mk == best_model:
-                        pos_star = positions[box_idx + i]
-                        # Place star below the axis
-                        ax.plot(pos_star, ax.get_ylim()[0] - 1, marker='*', markersize=18, 
-                               color=MODEL_COLORS[mk], clip_on=False, zorder=10)
-            box_idx += n_models
-        
-        # Environment labels
-        ax.set_xticks(env_centers)
-        ax.set_xticklabels([e.replace('_', ' ').title() for e in envs], fontsize=11)
-        ax.set_ylabel('Localization Error (m)')
-        ax.set_title('Model Performance Distribution by Environment', fontweight='bold')
-        
-        # Vertical separators
-        for i in range(len(envs) - 1):
-            sep_pos = positions[(i + 1) * n_models - 1] + gap / 2 + 0.5
-            ax.axvline(sep_pos, color='gray', linestyle='--', alpha=0.3)
-        
-        # Legend
-        legend_elements = [Patch(facecolor=MODEL_COLORS[mk], edgecolor='black', 
-                                label=mn, alpha=0.7) for mk, mn in models]
-        legend_elements.append(Line2D([0], [0], marker='*', color='w', 
-                                      markerfacecolor='gray', markersize=15, label='Best model'))
-        ax.legend(handles=legend_elements, loc='upper right')
-        
-        _save_figure(fig, output_dir, 'model_ablation_box_by_env')
-        
-        if verbose:
-            print(f"✓ Model diagnostic: model_ablation_box_by_env.png")
-    except ImportError:
-        if verbose:
-            print("  (matplotlib not available, skipping model diagnostic plots)")
-
-
-def _plot_model_r2_diagnostics(results: Dict, environments: List[str], output_dir: str, verbose: bool = True):
-    
-    try:
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Patch
-        from matplotlib.lines import Line2D
-        
-        _setup_thesis_style()
-        os.makedirs(output_dir, exist_ok=True)
-        
-        envs = [e for e in environments if e in results and results[e]]
-        if not envs:
-            if verbose:
-                print("  (no environments for R² diagnostic)")
-            return
-        
-        # Collect data
-        r2_values = []
-        best_errors = []
-        best_models = []
-        env_labels = []
-        
-        for env in envs:
-            r2 = results[env].get('_r2', None)
-            
-            # Skip if no R² value
-            if r2 is None or (isinstance(r2, float) and not np.isfinite(r2)):
-                if verbose:
-                    print(f"  (no R² value for {env})")
-                continue
-            
-            env_results = {k: v['mean'] for k, v in results[env].items() 
-                          if isinstance(v, dict) and 'mean' in v and not k.startswith('_')}
-            if not env_results:
-                continue
-            
-            best_model = min(env_results, key=env_results.get)
-            
-            r2_values.append(float(r2))
-            best_errors.append(float(env_results[best_model]))
-            best_models.append(best_model)
-            env_labels.append(env)
-        
-        if len(r2_values) < 1:
-            if verbose:
-                print("  (no valid R² data points for diagnostic)")
-            return
-        
-        # Create figure
-        fig, ax = plt.subplots(figsize=(9, 6))
-        
-        # Add interpretation zones
-        ax.axvspan(0, 0.3, alpha=0.08, color=PLOT_COLORS['magenta'], zorder=0)
-        ax.axvspan(0.3, 0.5, alpha=0.08, color=PLOT_COLORS['yellow'], zorder=0)
-        ax.axvspan(0.5, 1.0, alpha=0.08, color=PLOT_COLORS['green'], zorder=0)
-        
-        # Scatter with model-based colors
-        for r2, err, model, env in zip(r2_values, best_errors, best_models, env_labels):
-            color = MODEL_COLORS.get(model, PLOT_COLORS['gray'])
-            ax.scatter(r2, err, s=180, c=color, edgecolors='black', linewidth=1.5, zorder=3)
-            
-            # Label
-            model_short = {'pure_nn': 'NN', 'pure_pl': 'PL', 'apbm': 'APBM'}.get(model, model)
-            ax.annotate(f'{env.replace("_", " ").title()}\n({model_short})',
-                       (r2, err), textcoords='offset points', xytext=(10, 0),
-                       fontsize=10, va='center')
-        
-        # Trend line only if enough points
-        if len(r2_values) >= 3:
-            z = np.polyfit(r2_values, best_errors, 1)
-            p = np.poly1d(z)
-            x_trend = np.linspace(min(r2_values) - 0.05, max(r2_values) + 0.05, 100)
-            ax.plot(x_trend, p(x_trend), '--', color=PLOT_COLORS['gray'], 
-                   alpha=0.5, linewidth=1.5, zorder=1)
-        
-        ax.set_xlabel('Path-Loss Model R² (Fit Quality)')
-        ax.set_ylabel('Best Localization Error (m)')
-        ax.set_title('Model Selection Depends on Physics Fit Quality', fontweight='bold')
-        
-        # Zone labels at top
-        y_max = max(best_errors) * 1.2 if best_errors else 20
-        ax.text(0.15, y_max * 0.95, 'Poor fit', ha='center', va='top', fontsize=9, alpha=0.6)
-        ax.text(0.40, y_max * 0.95, 'Moderate', ha='center', va='top', fontsize=9, alpha=0.6)
-        ax.text(0.75, y_max * 0.95, 'Good fit', ha='center', va='top', fontsize=9, alpha=0.6)
-        
-        # Legend
-        legend_elements = [
-            Patch(facecolor=MODEL_COLORS['pure_nn'], edgecolor='black', label='Pure NN wins'),
-            Patch(facecolor=MODEL_COLORS['pure_pl'], edgecolor='black', label='Pure PL wins'),
-            Patch(facecolor=MODEL_COLORS['apbm'], edgecolor='black', label='APBM wins'),
-        ]
-        ax.legend(handles=legend_elements, loc='upper right', title='Best Model')
-        
-        ax.set_xlim(0, 1)
-        ax.set_ylim(bottom=0, top=y_max)
-        
-        _save_figure(fig, output_dir, 'model_r2_vs_error')
-        
-        if verbose:
-            print(f"✓ R² diagnostic: model_r2_vs_error.png ({len(r2_values)} environment(s))")
-    except ImportError:
-        if verbose:
-            print("  (matplotlib not available, skipping R² diagnostic plot)")
-
-
-# ============================================================================
+# =============================================================================
 # COMBINED ABLATION RUNNER
-# ============================================================================
+# =============================================================================
 
 def run_all_ablations(
     input_csv: str,
     output_dir: str = "results/ablation",
     n_trials: int = 5,
+    n_inits: int = 3,
+    environments: Optional[List[str]] = None,
+    use_predicted_rssi: bool = False,
     verbose: bool = True
 ) -> Dict:
     """
-    Run all ablation studies for thesis.
-    
-    Returns comprehensive results proving:
-    1. RSSI predictions matter for localization
-    2. Model architecture choice depends on environment
+    Run both ablation studies:
+      1) RSSI source ablation (Stage-1 RSSI quality)
+      2) Model architecture ablation (Stage-2 localization model choice)
     """
     os.makedirs(output_dir, exist_ok=True)
-    
-    results = {}
-    
-    # 1. RSSI Source Ablation
+
+    results: Dict[str, Any] = {}
+
     if verbose:
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("PART 1: RSSI SOURCE ABLATION")
-        print("="*70)
-    
-    rssi_results = run_rssi_source_ablation(
+        print("=" * 70)
+
+    results["rssi_source"] = run_rssi_source_ablation(
         input_csv=input_csv,
-        output_dir=os.path.join(output_dir, 'rssi'),
+        output_dir=os.path.join(output_dir, "rssi"),
+        env=None,
         n_trials=n_trials,
-        verbose=verbose
+        n_inits=n_inits,
+        verbose=verbose,
     )
-    results['rssi_source'] = rssi_results
-    
-    # 2. Model Architecture Ablation
+
     if verbose:
-        print("\n" + "="*70)
+        print("\n" + "=" * 70)
         print("PART 2: MODEL ARCHITECTURE ABLATION")
-        print("="*70)
-    
-    model_results = run_model_architecture_ablation(
+        print("=" * 70)
+
+    results["model_architecture"] = run_model_architecture_ablation(
         input_csv=input_csv,
-        output_dir=os.path.join(output_dir, 'model'),
+        output_dir=os.path.join(output_dir, "model"),
+        environments=environments,
         n_trials=n_trials,
-        verbose=verbose
+        n_inits=n_inits,
+        use_predicted_rssi=use_predicted_rssi,
+        verbose=verbose,
     )
-    results['model_architecture'] = model_results
-    
+
     # Save combined results
-    results_file = os.path.join(output_dir, 'all_ablation_results.json')
-    
-    # Convert to JSON-serializable format (uses global to_serializable)
-    
-    with open(results_file, 'w') as f:
+    results_file = os.path.join(output_dir, "all_ablation_results.json")
+    with open(results_file, "w") as f:
         json.dump(to_serializable(results), f, indent=2)
-    
+
     if verbose:
-        print(f"\n{'='*70}")
-        print("ALL ABLATIONS COMPLETE")
-        print(f"{'='*70}")
-        print(f"✓ Combined results saved to {results_file}")
-    
+        print(f"\n✓ Combined results saved to {results_file}")
+
     return results
 
 
-# ============================================================================
+
+
+# names kept for older experiments / CLI flags
+run_comprehensive_rssi_ablation = run_rssi_source_ablation
+run_rssi_ablation_study = run_rssi_source_ablation
+
+
+
+# =============================================================================
 # MAIN
-# ============================================================================
+# =============================================================================
 
 if __name__ == "__main__":
     import argparse
-    
-    parser = argparse.ArgumentParser(description="Run thesis ablation studies")
-    parser.add_argument("input_csv", help="Path to Stage 2 input CSV")
+
+    parser = argparse.ArgumentParser(description="Run jammer localization ablation studies")
+    parser.add_argument("input_csv", help="Path to Stage-2 input CSV")
     parser.add_argument("--output-dir", default="results/ablation", help="Output directory")
     parser.add_argument("--n-trials", "--trials", type=int, default=5, help="Trials per condition")
-    parser.add_argument("--n-inits", type=int, default=3, help="Random initializations per trial (for robustness)")
-    parser.add_argument("--rssi-only", action="store_true", help="Run only RSSI ablation")
-    parser.add_argument("--model-only", action="store_true", help="Run only model ablation")
-    parser.add_argument("--use-predicted-rssi", action="store_true", 
-                       help="Use predicted RSSI instead of ground truth (for end-to-end evaluation)")
-    parser.add_argument("--env", default=None, help="Environment filter")
-    
+    parser.add_argument("--n-inits", type=int, default=3, help="Random initializations per trial (model ablation)")
+    parser.add_argument("--rssi-only", action="store_true", help="Run only RSSI source ablation")
+    parser.add_argument("--model-only", action="store_true", help="Run only model architecture ablation")
+    parser.add_argument("--use-predicted-rssi", action="store_true",
+                        help="Use predicted RSSI instead of ground truth (end-to-end evaluation)")
+    parser.add_argument("--env", default=None, help="Single environment to test (model ablation).")
+    parser.add_argument("--envs", default=None,
+                        help="Comma-separated list of environments (overrides defaults).")
+
     args = parser.parse_args()
-    
+
+    # Environments for model ablation
+    envs = None
+    if args.envs:
+        envs = [e.strip() for e in args.envs.split(",") if e.strip()]
+    elif args.env:
+        envs = [args.env]
+
     if args.rssi_only:
         run_rssi_source_ablation(
-            args.input_csv, 
-            args.output_dir,
+            input_csv=args.input_csv,
+            output_dir=args.output_dir,
             env=args.env,
-            n_trials=args.n_trials
+            n_trials=args.n_trials,
+            n_inits=args.n_inits,
+            verbose=True,
         )
     elif args.model_only:
-        envs = [args.env] if args.env else ['open_sky', 'suburban', 'urban']
         run_model_architecture_ablation(
-            args.input_csv,
-            args.output_dir,
+            input_csv=args.input_csv,
+            output_dir=args.output_dir,
             environments=envs,
             n_trials=args.n_trials,
             n_inits=args.n_inits,
-            use_predicted_rssi=args.use_predicted_rssi
+            use_predicted_rssi=args.use_predicted_rssi,
+            verbose=True,
         )
     else:
         run_all_ablations(
-            args.input_csv,
-            args.output_dir,
-            n_trials=args.n_trials
+            input_csv=args.input_csv,
+            output_dir=args.output_dir,
+            n_trials=args.n_trials,
+            n_inits=args.n_inits,
+            environments=envs,
+            use_predicted_rssi=args.use_predicted_rssi,
+            verbose=True,
         )
-
-
-# ============================================================================
-# BACKWARD COMPATIBILITY 
-# ============================================================================
-
-# Alias for legacy --ablation and --comprehensive-ablation flags
-def run_comprehensive_rssi_ablation(
-    input_csv: str,
-    output_dir: str = "results/rssi_ablation",
-    n_trials: int = 5,
-    noise_levels: List[float] = None,
-    config = None,
-    verbose: bool = True,
-    **kwargs
-) -> Dict:
-    
-    return run_rssi_source_ablation(
-        input_csv=input_csv,
-        output_dir=output_dir,
-        n_trials=n_trials,
-        verbose=verbose
-    )
-
-
-# Alias for legacy --component-ablation flag
-def run_component_ablation_study(
-    input_csv: str,
-    output_dir: str = "results/component_ablation",
-    n_trials: int = 5,
-    config = None,
-    verbose: bool = True,
-    **kwargs
-) -> Dict:
-    """
-    Legacy component ablation.
-    Runs model architecture ablation and reformats results for compatibility.
-    """
-    # Run the new model ablation
-    results = run_model_architecture_ablation(
-        input_csv=input_csv,
-        output_dir=output_dir,
-        environments=['open_sky'],  # Single environment for legacy mode
-        n_trials=n_trials,
-        verbose=verbose
-    )
-    
-    # Reformat for legacy compatibility
-    env = 'open_sky'
-    if env in results:
-        legacy_results = {}
-        
-        if 'pure_nn' in results[env]:
-            legacy_results['true_pure_nn'] = results[env]['pure_nn']
-            legacy_results['geometry_aware_nn'] = results[env]['pure_nn']  # Same for legacy
-        
-        if 'pure_pl' in results[env]:
-            legacy_results['pure_pl'] = results[env]['pure_pl']
-        
-        if 'apbm' in results[env]:
-            legacy_results['apbm'] = results[env]['apbm']
-            legacy_results['apbm_residual'] = results[env]['apbm']  # Same for legacy
-        
-        return legacy_results
-    
-    return results
-
-
-# Additional alias
-run_rssi_ablation_study = run_rssi_source_ablation

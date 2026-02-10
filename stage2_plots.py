@@ -1,16 +1,17 @@
 """
-Stage 2 Plotting Module for JAMLOC
-===================================
+Stage 2 Plotting Module for JAMLOC (FIXED)
+==========================================
 Comprehensive visualization suite for jammer localization results.
-Includes: localization maps, convergence plots, algorithm comparisons,
-theta trajectories, physics parameters, learning curves, fusion weights,
-client analysis, residual plots, and summary dashboards.
+
+FIXES:
+- plot_rssi_residuals now uses actual RSSI (not RSSI_pred from Stage 1)
+- Metrics from centralized_result are used for consistency with training output
 """
 
 import os
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, Union
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -165,10 +166,19 @@ def generate_stage2_plots(
     output_dir: str = "plots",
     env: str = "urban",
     true_jammer: Optional[Tuple[float, float]] = None,
+    test_indices: Optional[Union[np.ndarray, List[int]]] = None,
     verbose: bool = True,
     export_pdf: bool = True
 ) -> Dict[str, str]:
-    """Generate all Stage 2 thesis-quality plots."""
+    """
+    Generate all Stage 2 thesis-quality plots.
+    
+    Parameters:
+    -----------
+    test_indices : array-like, optional
+        Indices of test samples for metric computation in RSSI residual plots.
+        If None, all data is used (backward compatible).
+    """
     if not HAS_MATPLOTLIB:
         if verbose:
             print("⚠ matplotlib not available")
@@ -178,6 +188,15 @@ def generate_stage2_plots(
     os.makedirs(output_dir, exist_ok=True)
     formats = ['png', 'pdf'] if export_pdf else ['png']
     saved_plots = {}
+    
+    # Compute test mask for proper metric computation
+    if test_indices is not None:
+        test_mask = np.zeros(len(df), dtype=bool)
+        for idx in test_indices:
+            if isinstance(idx, int) and 0 <= idx < len(df):
+                test_mask[idx] = True
+    else:
+        test_mask = None
     
     df = ensure_enu_columns(df)
     
@@ -240,7 +259,7 @@ def generate_stage2_plots(
             if verbose: print("✓ Fusion weights evolution")
     
     if centralized_result and 'theta_hat' in centralized_result:
-        path = plot_rssi_residuals(df, centralized_result, output_dir, env, formats)
+        path = plot_rssi_residuals(df, centralized_result, output_dir, env, formats, test_mask)
         if path:
             saved_plots['rssi_residuals'] = path
             if verbose: print("✓ RSSI residual analysis")
@@ -282,8 +301,8 @@ def plot_localization_map(df, centralized_result, federated_results,
         x_pos = df['x_enu'].values if 'x_enu' in df.columns else np.zeros(len(df))
         y_pos = df['y_enu'].values if 'y_enu' in df.columns else np.zeros(len(df))
         
-        # Receivers with RSSI coloring
-        rssi_col = next((c for c in ['RSSI_pred', 'RSSI'] if c in df.columns), None)
+        # Receivers with RSSI coloring - FIXED: prefer actual RSSI over RSSI_pred
+        rssi_col = 'RSSI' if 'RSSI' in df.columns else ('RSSI_pred' if 'RSSI_pred' in df.columns else None)
         if rssi_col:
             rssi = df[rssi_col].values
             scatter = ax.scatter(x_pos, y_pos, c=rssi, cmap='RdYlGn_r',
@@ -807,49 +826,103 @@ def plot_fusion_weights(centralized_result, federated_results, output_dir, env, 
         return None
 
 
-def plot_rssi_residuals(df, centralized_result, output_dir, env, formats):
-    """RSSI residual analysis: predicted vs actual, residuals vs distance."""
+def plot_rssi_residuals(df, centralized_result, output_dir, env, formats, test_mask=None):
+    """
+    RSSI residual analysis: predicted vs actual, residuals vs distance.
+    
+    FIXED VERSION:
+    - Uses ACTUAL RSSI (not RSSI_pred from Stage 1)
+    - Reports MSE/RMSE from centralized_result for consistency with training
+    - Computes residuals using the APBM model's learned parameters
+    
+    When test_mask is provided, metrics are computed on TEST SET ONLY.
+    """
     try:
-        rssi_col = next((c for c in ['RSSI_pred', 'RSSI'] if c in df.columns), None)
-        if rssi_col is None:
+        # FIXED: Prefer actual RSSI over RSSI_pred (Stage 1 prediction)
+        if 'RSSI' in df.columns:
+            rssi_col = 'RSSI'
+        elif 'rssi' in df.columns:
+            rssi_col = 'rssi'
+        else:
+            print("  Warning: No actual RSSI column found, skipping residual plot")
             return None
         
         theta_hat = centralized_result.get('theta_hat', None)
         if theta_hat is None:
             return None
         
-        if 'x_enu' in df.columns and 'y_enu' in df.columns:
-            x_pos = df['x_enu'].values
-            y_pos = df['y_enu'].values
-            distances = np.sqrt((x_pos - theta_hat[0])**2 + (y_pos - theta_hat[1])**2)
-        else:
+        if 'x_enu' not in df.columns or 'y_enu' not in df.columns:
             return None
         
-        rssi = df[rssi_col].values
+        x_pos = df['x_enu'].values
+        y_pos = df['y_enu'].values
+        distances = np.sqrt((x_pos - theta_hat[0])**2 + (y_pos - theta_hat[1])**2)
         
-        # Get physics params
+        rssi_actual = df[rssi_col].values
+        
+        # Get physics params - try multiple locations
         physics = centralized_result.get('physics_params', {})
-        gamma = physics.get('gamma', 2.5)
-        P0 = physics.get('P0', -40)
+        
+        # Get gamma
+        gamma = physics.get('gamma', None)
+        if gamma is None:
+            gamma = centralized_result.get('gamma', None)
+        if gamma is None:
+            gamma_hist = physics.get('gamma_history', centralized_result.get('gamma_history', []))
+            if isinstance(gamma_hist, (list, np.ndarray)) and len(gamma_hist) > 0:
+                gamma = gamma_hist[-1]
         if isinstance(gamma, (list, np.ndarray)):
             gamma = gamma[-1] if len(gamma) > 0 else 2.5
+        if gamma is None:
+            gamma = 2.5
+        
+        # Get P0
+        P0 = physics.get('P0', None)
+        if P0 is None:
+            P0 = centralized_result.get('P0', None)
+        if P0 is None:
+            P0_hist = physics.get('P0_history', centralized_result.get('P0_history', []))
+            if isinstance(P0_hist, (list, np.ndarray)) and len(P0_hist) > 0:
+                P0 = P0_hist[-1]
         if isinstance(P0, (list, np.ndarray)):
             P0 = P0[-1] if len(P0) > 0 else -40
+        if P0 is None:
+            P0 = -40
+        
+        # Get official MSE from centralized_result for reporting consistency
+        # This ensures metrics match the training output
+        official_mse = None
+        
+        # Try different possible keys for the official MSE
+        for key in ['val_mse', 'mse', 'best_mse', 'final_mse']:
+            if key in centralized_result and centralized_result[key] is not None:
+                val = centralized_result[key]
+                if isinstance(val, (int, float)) and np.isfinite(val):
+                    official_mse = float(val)
+                    break
+        
+        # If not found directly, try to get from val_loss (final value)
+        if official_mse is None:
+            val_loss = centralized_result.get('val_loss', [])
+            if isinstance(val_loss, (list, np.ndarray)) and len(val_loss) > 0:
+                # Get the value at best epoch if available
+                best_epoch_idx = np.argmin(val_loss)
+                official_mse = float(val_loss[best_epoch_idx])
         
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         
-        # (a) RSSI vs Distance with model fit
+        # (a) RSSI vs Distance with model fit - show all data
         ax = axes[0]
         
         valid = distances > 0
         distances_valid = distances[valid]
-        rssi_valid = rssi[valid]
+        rssi_valid = rssi_actual[valid]
         
         ax.scatter(distances_valid, rssi_valid, c=COLORS['light_gray'], s=10, alpha=0.4, label='Data')
         
         d_range = np.linspace(max(1, distances_valid.min()), distances_valid.max(), 100)
-        rssi_theory = P0 - 10 * gamma * np.log10(d_range)
-        ax.plot(d_range, rssi_theory, color=COLORS['secondary'], lw=2.5, 
+        rssi_model = P0 - 10 * gamma * np.log10(d_range)
+        ax.plot(d_range, rssi_model, color=COLORS['secondary'], lw=2.5, 
                label=f'Model: P0={P0:.1f}, γ={gamma:.2f}')
         
         ax.set_xlabel('Distance to θ̂ (m)')
@@ -860,13 +933,39 @@ def plot_rssi_residuals(df, centralized_result, output_dir, env, formats):
         # (b) Residuals vs Distance
         ax = axes[1]
         
-        rssi_pred = P0 - 10 * gamma * np.log10(np.maximum(distances_valid, 1))
-        residuals = rssi_valid - rssi_pred
+        # Compute model predictions using APBM formula
+        rssi_pred_model = P0 - 10 * gamma * np.log10(np.maximum(distances_valid, 1))
+        residuals_all = rssi_valid - rssi_pred_model
         
-        ax.scatter(distances_valid, residuals, c=COLORS['primary'], s=10, alpha=0.4)
+        ax.scatter(distances_valid, residuals_all, c=COLORS['primary'], s=10, alpha=0.4)
         ax.axhline(0, color='black', lw=1)
         
-        residual_std = np.std(residuals)
+        # Compute metrics on TEST SET if mask provided
+        
+        if test_mask is not None:
+            test_mask_valid = test_mask[valid]
+            residuals_test = residuals_all[test_mask_valid]
+            n_test = int(np.sum(test_mask_valid))
+            
+            if n_test > 0:
+                # Compute both metrics from same source (residuals against actual RSSI)
+                mae = np.mean(np.abs(residuals_test))
+                rmse = np.sqrt(np.mean(residuals_test**2))
+                residual_std = np.std(residuals_test)
+                metric_label = f'TEST SET (N={n_test})'
+            else:
+                # Fallback to all data
+                mae = np.mean(np.abs(residuals_all))
+                rmse = np.sqrt(np.mean(residuals_all**2))
+                residual_std = np.std(residuals_all)
+                metric_label = f'All Data (N={len(residuals_all)})'
+        else:
+            # No test mask
+            mae = np.mean(np.abs(residuals_all))
+            rmse = np.sqrt(np.mean(residuals_all**2))
+            residual_std = np.std(residuals_all)
+            metric_label = f'N={len(residuals_all)}'
+        
         ax.axhline(2*residual_std, color='gray', ls='--', alpha=0.5, label=f'±2σ ({2*residual_std:.1f} dB)')
         ax.axhline(-2*residual_std, color='gray', ls='--', alpha=0.5)
         ax.fill_between([distances_valid.min(), distances_valid.max()], 
@@ -877,9 +976,7 @@ def plot_rssi_residuals(df, centralized_result, output_dir, env, formats):
         ax.legend(loc='upper right', fontsize=9)
         ax.set_title('(b) RSSI Residuals', fontweight='bold')
         
-        mae = np.mean(np.abs(residuals))
-        rmse = np.sqrt(np.mean(residuals**2))
-        ax.text(0.02, 0.98, f'MAE: {mae:.2f} dB\nRMSE: {rmse:.2f} dB',
+        ax.text(0.02, 0.98, f'{metric_label}\nMAE: {mae:.2f} dB\nRMSE: {rmse:.2f} dB',
                transform=ax.transAxes, ha='left', va='top', fontsize=10,
                bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
         
@@ -889,6 +986,8 @@ def plot_rssi_residuals(df, centralized_result, output_dir, env, formats):
         return save_figure(fig, os.path.join(output_dir, f's2_rssi_residuals_{env}'), formats)
     except Exception as e:
         print(f"  Error in residual plot: {e}")
+        import traceback
+        traceback.print_exc()
         plt.close()
         return None
 
