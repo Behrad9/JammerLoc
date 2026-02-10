@@ -108,7 +108,7 @@ GNSS jamming poses a significant threat to critical infrastructure. This work ad
 
 ```bash
 # Clone repository
-git clone https://github.com/behrad9/jamloc.git
+git clone https://github.com/behrad9/JammerLoc.git
 cd jamloc
 
 # Create virtual environment (recommended)
