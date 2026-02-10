@@ -29,7 +29,7 @@
 
 ## Overview
 
-**JAMLOC** is a two-stage machine learning framework for localizing GNSS jammers using crowdsourced smartphone data. The system combines physics-informed neural networks with federated learning to enable privacy-preserving, distributed jammer detection and localization.
+**JAMMERLOC** is a two-stage machine learning framework for localizing GNSS jammers using crowdsourced smartphone data. The system combines physics-informed neural networks with federated learning to enable privacy-preserving, distributed jammer detection and localization.
 
 ### Key Features
 
