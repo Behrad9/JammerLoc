@@ -382,8 +382,8 @@ def run_stage2_localization(
 
     if len(_df_ref) > 0:
         # Always compute centroid reference (used by neutral frame and as a fallback)
-        centroid_lat = float(pd.to_numeric(_df_ref["lat"], errors="coerce").median())
-        centroid_lon = float(pd.to_numeric(_df_ref["lon"], errors="coerce").median())
+        centroid_lat = float(pd.to_numeric(_df_ref["lat"], errors="coerce").mean())
+        centroid_lon = float(pd.to_numeric(_df_ref["lon"], errors="coerce").mean())
 
         # Coordinate-frame mode
         frame = str(getattr(config, "coordinate_frame", "neutral") or "neutral").lower()
@@ -812,14 +812,14 @@ def augment_stage2_dataset(
 
     R = config.R_earth
     
-    # FIXED: Set lat0/lon0 from dataframe medians if None
+    # FIXED: Set lat0/lon0 from dataframe means if None
     lat0 = config.lat0
     lon0 = config.lon0
     if lat0 is None or lon0 is None:
-        lat0 = float(df['lat'].median()) if 'lat' in df.columns else 45.0
-        lon0 = float(df['lon'].median()) if 'lon' in df.columns else 7.6
+        lat0 = float(df['lat'].mean()) if 'lat' in df.columns else 45.0
+        lon0 = float(df['lon'].mean()) if 'lon' in df.columns else 7.6
         if verbose:
-            print(f"  lat0/lon0 not set, using data median: ({lat0:.4f}, {lon0:.4f})")
+            print(f"  lat0/lon0 not set, using data mean: ({lat0:.4f}, {lon0:.4f})")
 
     lat_synth = lat0 + np.degrees(y_offset / R)
     lon_synth = lon0 + np.degrees(x_offset / (R * np.cos(np.radians(lat0))))

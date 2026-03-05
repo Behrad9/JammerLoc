@@ -344,9 +344,9 @@ def load_data(
         lon0_rad = np.deg2rad(float(lon0))
     else:
         if lat0 is None:
-            lat0 = float(df["lat"].median())
+            lat0 = float(df["lat"].mean())
         if lon0 is None:
-            lon0 = float(df["lon"].median())
+            lon0 = float(df["lon"].mean())
 
         lat0_rad = np.deg2rad(float(lat0))
         lon0_rad = np.deg2rad(float(lon0))
