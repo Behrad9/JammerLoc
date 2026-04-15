@@ -1,229 +1,91 @@
-# JAMMERLOC: Crowdsourced GNSS Jammer Localization using Machine Learning and Federated Learning
+# JAMMERLOC: Crowdsourced GNSS Jammer Localization
 
 [![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-red.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-> **Master Thesis** - Politecnico di Torino, 2026  
-> **Author**: Behrad Shayegan  
-> **Supervisors**: [Prof.ANDREA NARDIN, Dr.IMAN EBRAHIMI MEHR]
+> **Master's Thesis** — Politecnico di Torino, 2026
+> **Author**: Behrad Shayegan
+> **Supervisors**: Prof. Andrea Nardin, Dr. Iman Ebrahimi Mehr
 
----
-
-##  Table of Contents
-
-- [Overview](#overview)
-- [Pipeline Architecture](#pipeline-architecture)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Usage](#usage)
-- [Project Structure](#project-structure)
-- [Federated Learning Algorithms](#federated-learning-algorithms)
-- [Configuration](#configuration)
-- [Results](#results)
-- [Ablation Studies](#ablation-studies)
-- [Citation](#citation)
-- [References](#references)
+A two-stage physics-informed machine learning framework for localizing GNSS jammers using crowdsourced smartphone data, with privacy-preserving federated learning.
 
 ---
 
 ## Overview
 
-**JAMMERLOC** is a two-stage machine learning framework for localizing GNSS jammers using crowdsourced smartphone data. The system combines physics-informed neural networks with federated learning to enable privacy-preserving, distributed jammer detection and localization.
+GNSS jamming threatens critical PNT infrastructure. This framework addresses the problem using only smartphone observables (AGC and C/N₀), without requiring dedicated monitoring hardware or 3D building maps.
 
-### Key Features
+**Stage 1 (ExactHybrid)** — estimates jammer RSSI from raw AGC and C/N₀ using a regime-adaptive fusion gate with learned per-device-band calibration parameters.
 
-- **Two-Stage Pipeline**: RSSI estimation from raw observables → Jammer localization
-- **Physics-Informed Models**: Augmented Physics-Based Model (APBM) combining path loss physics with neural networks
-- **Federated Learning**: Privacy-preserving distributed training with FedAvg, FedProx, and SCAFFOLD
-- **Multi-Environment Support**: Optimized for Open Sky, Suburban, Urban, and Lab environments
-- **Comprehensive Ablation Studies**: Validates contribution of each component
-
-### Problem Statement
-
-GNSS jamming poses a significant threat to critical infrastructure. This work addresses:
-1. **Stage 1**: How to estimate jammer signal strength (RSSI) from smartphone observables (AGC, C/N₀)
-2. **Stage 2**: How to localize the jammer position using crowdsourced RSSI measurements with federated learning
+**Stage 2 (APBM + FL)** — localizes the jammer via inverse optimization of a physics-informed hybrid model combining log-distance path-loss with a neural correction branch, trained in a federated manner.
 
 ---
 
-## Pipeline Architecture
+## Pipeline
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              FULL PIPELINE                                  │
-└─────────────────────────────────────────────────────────────────────────────┘
-
-     Raw GNSS Data                    Stage 1 Output                Final Output
-    ┌───────────────┐               ┌───────────────┐              ┌───────────┐
-    │ • AGC         │               │ • RSSI_pred   │              │ • θ_E     │
-    │ • CN0         │ ──────────►   │ • jammed_pred │ ──────────►  │ • θ_N     │
-    │ • Position    │   Stage 1     │ • Position    │   Stage 2    │ (meters)  │
-    │ • Device/Band │               │               │              │           │
-    └───────────────┘               └───────────────┘              └───────────┘
-                                    
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 1: RSSI Estimation (ExactHybrid Model)                                │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Input: ΔAGC, ΔCN0, device_idx, band_idx                                   │
-│                                                                             │
-│   CN0 Channel:  J_cn0 = θ_{d,b} + s · log₁₀(expm1(c · ΔCN0))               │
-│   AGC Channel:  J_agc = α_{d,b} · ΔAGC + β_{d,b}                            │
-│   Fusion Gate:  w = σ(g_a + g_b · ΔCN0 + g_c · ΔAGC)                        │
-│                                                                             │
-│   Output: Ĵ = w · J_cn0 + (1-w) · J_agc                                     │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                                      ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│ STAGE 2: Jammer Localization (APBM + Federated Learning)                    │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│   Input: x_enu, y_enu, J_hat (= RSSI_pred from Stage 1)                     │
-│                                                                             │
-│   Physics Path:  f_PL = P₀ - 10γ · log₁₀(||pos - θ||)                       │
-│   Neural Path:   f_NN = MLP(position, features)                             │
-│   APBM Fusion:   RSSI = w_PL · f_PL + w_NN · f_NN                            │
-│                                                                             │
-│   Learnable: θ = (θ_E, θ_N), P₀, γ, NN weights, fusion weights              │
-│                                                                             │
-│   Output: θ̂ = Estimated jammer position in ENU coordinates                 │
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+AGC, C/N₀          Stage 1              Stage 2
+Device, Band  ──►  ExactHybrid  ──►  APBM + FL  ──►  θ̂ = (θ_E, θ_N)
+Position            RSSI_pred          Localization      (metres, ENU)
 ```
+
+**Stage 1 — ExactHybrid Model:**
+```
+ΔCN0 = CN0_base − CN0_obs
+ΔAGC = σ_{d,b} · (AGC_base − AGC_obs)       # per-device sign correction
+
+J_cn0 = θ_{d,b} + s · log₁₀(expm1(c · ΔCN0))   # physics-based C/N₀ inversion
+J_agc = α_{d,b} · ΔAGC + β_{d,b}                 # linear AGC mapping
+
+w = σ(g_a + g_b · ΔCN0 + g_c · ΔAGC)            # learned fusion gate
+Ĵ = w · J_cn0 + (1−w) · J_agc                    # calibrated RSSI (dBm)
+```
+All calibration parameters (θ_{d,b}, s, α_{d,b}, β_{d,b}, g_a, g_b, g_c) are learned end-to-end from data.
+
+**Stage 2 — APBM:**
+```
+θ* = argmin_{θ,P₀,γ,φ} Σᵢ L(Ĵᵢ, w_PL·f_PL(xᵢ;θ,P₀,γ) + w_NN·f_NN(xᵢ;φ))
+
+f_PL = P₀ − 10γ·log₁₀(‖xᵢ − θ‖ + ε)       # log-distance path-loss
+f_NN = MLP([x_enu, y_enu, BD, LSV])          # neural correction branch
+[w_PL, w_NN] = softmax([ℓ₁, ℓ₂])            # learned blending weights
+```
+θ is initialized at the receiver data centroid and optimized via Adam + L-BFGS polish (centralized) or Hybrid SCAFFOLD (federated).
 
 ---
 
 ## Installation
 
-### Requirements
-
-- Python 3.9+
-- PyTorch 2.0+
-- CUDA (optional, for GPU acceleration)
-
-### Setup
-
 ```bash
-# Clone repository
 git clone https://github.com/behrad9/JammerLoc.git
 cd jamloc
-
-# Create virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
-
-# Install dependencies
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Dependencies
-
-```
-torch>=2.0.0
-numpy>=1.21.0
-pandas>=1.3.0
-scikit-learn>=1.0.0
-matplotlib>=3.5.0
-pyyaml>=6.0
-tqdm>=4.62.0
-```
+**Requirements:** Python 3.9+, PyTorch 2.0+, numpy, pandas, scikit-learn, matplotlib
 
 ---
 
 ## Quick Start
 
 ```bash
-# Run full pipeline (Stage 1 + Stage 2)
+# Full two-stage pipeline
 python main.py --full-pipeline --input combined_data.csv --env urban
 
-# Run Stage 1 only (RSSI estimation)
-python main.py --stage1-only --input combined_data.csv
-
-# Run Stage 2 only (localization from RSSI predictions)
-python main.py --stage2-only --input stage2_input.csv
-
-# Run with federated learning
-python main.py --stage2-only --stage2_input.csv --algo fedavg fedprox scaffold
-```
-
----
-
-## Usage
-
-### Command Line Interface
-
-```bash
-python main.py [MODE] --input FILE [OPTIONS]
-```
-
-### Pipeline Modes
-
-| Mode | Description |
-|------|-------------|
-| `--full-pipeline` | Run complete pipeline: Stage 1 (RSSI) + Stage 2 (Localization) |
-| `--stage1-only` | Run Stage 1 only: RSSI estimation from AGC/CN0 |
-| `--stage2-only` | Run Stage 2 only: Localization from RSSI predictions |
-| `--rssi-ablation` | RSSI source ablation study |
-| `--model-ablation` | Model architecture ablation study |
-| `--all-ablation` | Run all thesis ablation studies |
-
-### Common Options
-
-```bash
-# Data options
---input, -i FILE          # Input CSV file (required)
---output-dir, -o DIR      # Output directory
-
-# Environment
---env ENV                 # Filter by environment: open_sky, suburban, urban, lab_wired
-
-# Training mode
---centralized-only        # Run centralized training only
---fl-only                 # Run federated learning only
-
-# FL settings
---algo ALGO [ALGO ...]    # FL algorithms: fedavg, fedprox, scaffold
---clients N               # Number of FL clients (default: 5)
---rounds N                # Number of FL rounds (default: 100)
---local-epochs N          # Local epochs per round (default: 5)
---partition STRATEGY      # Partitioning: random, geographic, device, distance
-
-# Hyperparameters
---epochs N                # Training epochs
---batch-size N            # Batch size
---lr RATE                 # Learning rate
-
-# Output
---no-plots                # Disable plot generation
---save-model              # Save model checkpoint
--v, --verbose             # Verbose output
--q, --quiet               # Minimal output
-```
-
-### Examples
-
-```bash
-# Full pipeline with specific environment
-python main.py --full-pipeline --input combined_data.csv --env urban -v
+# Stage 1 only
+python main.py --stage1-only --input raw_data.csv
 
 # Stage 2 with all FL algorithms
 python main.py --stage2-only --input rssi_pred.csv --algo fedavg fedprox scaffold
 
-# Centralized training only with custom hyperparameters
-python main.py --stage2-only --input data.csv --centralized-only --epochs 300 --lr 0.001
+# FL with specific partition strategy
+python main.py --stage2-only --input rssi_pred.csv --fl-only --partition distance
 
-# FL with distance-based partitioning
-python main.py --stage2-only --input data.csv --fl-only --partition distance --clients 5
-
-# RSSI ablation study
-python main.py --rssi-ablation --input rssi_pred.csv --env urban --n-trials 10
-
-# Model ablation across environments
-python main.py --model-ablation --input data.csv --environments open_sky suburban urban
+# Ablation studies
+python main.py --rssi-ablation --input rssi_pred.csv --env urban --n-trials 5
+python main.py --model-ablation --input rssi_pred.csv
 ```
 
 ---
@@ -232,342 +94,137 @@ python main.py --model-ablation --input data.csv --environments open_sky suburba
 
 ```
 jamloc/
-├── main.py                 # CLI entry point
-├── pipeline.py             # End-to-end pipeline orchestration
-├── config.py               # Configuration and hyperparameters
-│
-├── Stage 1: RSSI Estimation
-│   ├── rssi_model.py       # ExactHybrid model architecture
-│   ├── rssi_trainer.py     # Training and inference
-│   └── stage1_plots.py     # Visualization
-│
-├── Stage 2: Localization
-│   ├── model.py            # APBM neural network
-│   ├── trainer.py          # Centralized training
-│   ├── data_loader.py      # Data loading and preprocessing
-│   └── stage2_plots.py     # Visualization
-│
-├── Federated Learning
-│   ├── server.py           # FL server orchestration
-│   ├── client.py           # FL client training
-│   └── model_wrapper.py    # Model utilities for FL
-│
-├── Analysis
-│   ├── ablation.py         # Ablation study implementations
-│   └── utils.py            # Helper functions
-│
-├── requirements.txt        # Python dependencies
-└── README.md               # This file
+├── main.py           # CLI entry point
+├── pipeline.py       # End-to-end pipeline orchestration
+├── config.py         # Hyperparameters and environment profiles
+├── rssi_model.py     # Stage 1: ExactHybrid model
+├── rssi_trainer.py   # Stage 1: training, calibration, detection
+├── model.py          # Stage 2: APBM (Net_augmented)
+├── trainer.py        # Stage 2: centralized training + L-BFGS
+├── data_loader.py    # ENU conversion, partitioning strategies
+├── server.py         # FL server: aggregation, SCAFFOLD control variates
+├── client.py         # FL client: local training, hybrid optimizer
+├── ablation.py       # RSSI source and model architecture ablation
+├── stage1_plots.py   # Stage 1 visualizations
+├── stage2_plots.py   # Stage 2 visualizations
+└── utils.py          # Helper functions
 ```
-
-### Key Files
-
-| File | Description |
-|------|-------------|
-| `main.py` | Command-line interface and experiment routing |
-| `pipeline.py` | Two-stage pipeline orchestration |
-| `config.py` | Hyperparameters, environment profiles, FL settings |
-| `rssi_model.py` | **Stage 1**: ExactHybrid model (CN0 + AGC fusion) |
-| `rssi_trainer.py` | **Stage 1**: Training loop, calibration, detection |
-| `model.py` | **Stage 2**: APBM (physics path + neural path) |
-| `trainer.py` | **Stage 2**: Centralized training with early stopping |
-| `data_loader.py` | Data preprocessing, ENU conversion, partitioning |
-| `server.py` | FL server: aggregation, SCAFFOLD control variates |
-| `client.py` | FL client: local training, gradient correction |
-| `ablation.py` | RSSI source and model architecture ablation |
 
 ---
 
-## Federated Learning Algorithms
+## Federated Learning
 
-### Overview
+Three algorithms are supported, with a **Hybrid SCAFFOLD** as the primary contribution:
 
-The framework implements three FL algorithms optimized for non-IID data:
+| Algorithm | Mechanism | Best For |
+|-----------|-----------|----------|
+| FedAvg | Weighted averaging | IID / well-behaved propagation |
+| FedProx | Proximal regularization (µ=0.01) | Systematic device bias |
+| **SCAFFOLD** | Variance reduction via control variates | High non-IID heterogeneity |
 
-| Algorithm | Description | Best For |
-|-----------|-------------|----------|
-| **FedAvg** | Baseline weighted averaging | IID data, simple baseline |
-| **FedProx** | Proximal regularization term | Moderate heterogeneity |
-| **SCAFFOLD** | Variance reduction via control variates | High heterogeneity (recommended) |
+**Hybrid SCAFFOLD** applies Adam to physics parameters (θ, P₀, γ) and SGD + control variates to NN weights and fusion logits. Control variates are excluded from physics parameters because their different optimization dynamics make uniform variance correction inappropriate.
 
-### FedAvg [10]
-
-Standard federated averaging:
-```
-w_{t+1} = Σ (n_k / n) · w_k^{(t)}
-```
-
-### FedProx [11]
-
-Adds proximal term to handle client drift:
-```
-min L(w) + (μ/2) ||w - w_t||²
-```
-- `μ = 0.01` (default proximal strength)
-
-### SCAFFOLD [12]
-
-Variance reduction using control variates:
-```
-g̃ = g - c_i + c    (corrected gradient)
-c_{new} = c_i - c + (1/Kη)(w_t - w_{t+K})    (Option II update)
-```
-
-**Implementation Details:**
-- Hybrid optimizer: Adam for physics params (θ, P₀, γ), SGD for NN params
-- Control variates cover NN + fusion weights (excludes physics params)
-- Vanilla SGD (momentum=0) for proper variance reduction
-
----
-
-## Configuration
-
-### Environment Profiles
-
-The system automatically tunes hyperparameters based on environment:
-
-| Parameter | Open Sky | Suburban | Urban | Lab Wired |
-|-----------|----------|----------|-------|-----------|
-| γ (path loss) | 2.0 | 2.5 | 2.7-3.5 | 2.0 |
-| P₀ (ref power) | -30 dBm | -32 dBm | -35 dBm | -30 dBm |
-| FL rounds | 100 | 120 | 150 | 100 |
-| Physics bias | High | Medium | Low | High |
-
-### Key Configuration Options
-
-Edit `config.py` or use CLI flags:
-
-```python
-# Stage 2 Model
-input_dim = 4                    # [x_enu, y_enu, BD, LSV]
-hidden_layers = [64, 32, 1]      # MLP architecture
-gamma_init = 2.5                 # Initial path loss exponent
-P0_init = -32.0                  # Initial reference power
-
-# Federated Learning
-num_clients = 5                  # Number of FL clients
-global_rounds = 100              # Communication rounds
-local_epochs = 5                 # Local training epochs
-partition_strategy = "distance"  # Data partitioning method
-theta_aggregation = "geometric_median"  # Robust aggregation
-
-# SCAFFOLD-specific
-scaffold_theta_lr_mult = 5.0     # Higher LR for physics params
-scaffold_nn_lr_mult = 1.0        # Base LR for NN params
-scaffold_sgd_momentum = 0.0      # Vanilla SGD for variance reduction
-```
+**Five partitioning strategies:** random (IID baseline), signal-strength, distance-based, geographic, device-based.
 
 ---
 
 ## Results
 
-### Localization Performance by Environment
+### Stage 1 — RSSI Estimation (combined dataset)
 
-| Environment | Centralized | FedAvg | FedProx | SCAFFOLD |
-|-------------|-------------|--------|---------|----------|
-| **Urban** | 0.79 m | 1.12 m | 1.05 m | **0.26 m** |
-| **Lab Wired** | 4.51 m | 5.23 m | 4.98 m | **4.79 m** |
-| **Suburban** | 2.14 m | 1.82 m | 1.65 m | **1.41 m** |
-| **Open Sky** | 1.06 m | 1.26 m | 1.18 m | 1.32 m |
+| Environment | MAE (dB) | R² |
+|-------------|----------|----|
+| Lab Wired | 0.98 | 0.948 |
+| Open Sky | 2.76 | 0.981 |
+| Suburban | 3.29 | 0.957 |
+| Urban | 4.77 | 0.641 |
 
-### Key Findings
+### Stage 2 — Localization Error ‖θ̂ − θ_true‖₂ (m)
 
-1. **SCAFFOLD excels in heterogeneous environments** (Urban, Suburban)
-   - Variance reduction handles non-IID data distribution
-   - Up to 4x improvement over FedAvg in Urban
+**Centralized baselines:**
 
-2. **Simple physics sufficient for Open Sky**
-   - γ ≈ 2.0 (free-space path loss)
-   - NN component provides minimal benefit
+| Environment | Error (m) | γ̂ |
+|-------------|-----------|-----|
+| Urban | **0.75** | 4.24 |
+| Open Sky | 0.91 | 1.92 |
+| Suburban | 2.17 | 3.01 |
+| Lab Wired (real) | 6.17 | 4.10 |
 
-3. **APBM critical for Urban**
-   - NN captures multipath and NLOS effects
-   - 30-50% improvement over pure physics model
+**Best federated results:**
 
----
+| Environment | Centralized | Best FL | Algorithm | Partition | Δ |
+|-------------|-------------|---------|-----------|-----------|---|
+| Lab Wired | 6.17 m | **0.35 m** | SCAFFOLD | Signal-str. | +94% |
+| Suburban | 2.17 m | **1.41 m** | FedAvg | Geographic | +35% |
+| Urban | 0.75 m | 1.02 m | SCAFFOLD | Geographic | −36% |
+| Open Sky | 0.91 m | 1.26 m | FedProx | Device | −38% |
 
-## Ablation Studies
+SCAFFOLD wins in 11/20 configurations (55%), FedAvg in 5/20 (25%), FedProx in 4/20 (20%).
 
-The ablation studies validate two key aspects of the pipeline:
-1. **RSSI Source Ablation**: Does RSSI spatial information matter for localization?
-2. **Model Architecture Ablation**: Does the hybrid APBM outperform pure approaches?
-
-### RSSI Source Ablation
-
-**Objective**: Isolate the effect of RSSI quality on localization accuracy.
-
-**Methodology**: Uses **Pure Path-Loss model only** (no neural network). This is critical because APBM's neural network can learn spatial patterns from position features that partially compensate for degraded RSSI, defeating the purpose of isolating RSSI effects.
-
-```bash
-python ablation.py path/to/stage2_input.csv --rssi-only --env urban --trials 5
-```
-
-**RSSI Conditions Tested**:
-| Condition | Description |
-|-----------|-------------|
-| Oracle | Ground truth RSSI |
-| Predicted | Stage 1 RSSI_pred |
-| Noisy (2/5/10 dB) | Oracle + Gaussian noise |
-| Shuffled | Random permutation (destroys spatial correlation) |
-| Constant | Mean RSSI (no spatial information) |
-
-**Results (Urban Environment)**:
-
-| RSSI Source | Localization Error | vs Oracle | Status |
-|-------------|-------------------|-----------|--------|
-| Oracle | 0.65 m | 1.00x | ← Best possible |
-| Predicted | 0.31 m | 0.47x | ✓ Stage 1 denoises! |
-| Noisy 2dB | 0.64 m | 0.98x | Robust |
-| Noisy 5dB | 0.63 m | 0.98x | Robust |
-| Noisy 10dB | 0.76 m | 1.17x | Slight degradation |
-| Shuffled | 607.63 m | **941x** | ← RSSI essential! |
-| Constant | 620.62 m | **961x** | ← RSSI essential! |
-
-**Key Findings**:
-
-1. **RSSI spatial information is ESSENTIAL**: Shuffled/Constant conditions cause 100-1000× degradation
-2. **Stage 1 can outperform Oracle**: Predicted (0.31m) < Oracle (0.65m) in Urban because Stage 1 acts as a **denoising filter**, removing device calibration biases and multipath noise
-3. **Robust to moderate noise**: Up to 10dB noise causes only ~17% degradation
-4. **Thesis claim validated**: Stage 1 RSSI estimation preserves (and sometimes improves) spatial information
+**Key finding:** Localization accuracy depends on receiver geometry and RSSI spatial gradient — not on RSSI prediction error alone. Urban achieves 0.75 m despite the worst Stage 1 MAE (4.77 dB) because its dense radial receiver distribution creates strong geometric constraints.
 
 ### Model Architecture Ablation
 
-**Objective**: Compare model architectures to validate the hybrid APBM design.
+| Environment | Pure NN | Pure PL | APBM |
+|-------------|---------|---------|------|
+| Urban | 58.43 m | 11.51 m | **0.77 m** |
+| Suburban | 7.36 m | 5.59 m | **2.43 m** |
+| Open Sky | 6.46 m | 5.19 m | **0.99 m** |
+| Lab Wired | **1.40 m** | 3.52 m | 11.41 m† |
 
-**Methodology**: Uses the **full training pipeline** (`train_centralized()` from `trainer.py`) with identical hyperparameters, initialization, and data loading for fair comparison.
+† Lab Wired exception: wired propagation violates path-loss assumptions — physics prior becomes harmful. Pure NN wins here, which validates rather than contradicts the hybrid design.
 
-```bash
-python ablation.py path/to/stage2_input.csv --model-only --env urban
-```
+---
 
-**Models Compared**:
-| Model | Description |
-|-------|-------------|
-| Pure NN | Neural network only (no physics) |
-| Pure PL | Path-loss physics only (no neural network) |
-| APBM | Augmented Physics-Based Model (physics + NN hybrid) |
+## Configuration
 
-**Results**:
+Key hyperparameters (see `config.py` for full list):
 
-| Environment | Pure NN | Pure PL | APBM | Winner | APBM vs PL |
-|-------------|---------|---------|------|--------|------------|
-| **Urban** | 58.43 m | 11.51 m | **0.77 m** | APBM | 93% better |
-| **Suburban** | 7.36 m | 5.59 m | **2.43 m** | APBM | 57% better |
-| **Open Sky** | 6.46 m | 5.19 m | **0.99 m** | APBM | 81% better |
-| **Lab Wired** | **1.40 m** | 3.52 m | 11.41 m | Pure NN | Exception! |
+```python
+# Stage 2 Model
+hidden_layers = [512, 256, 128, 64, 1]   # MLP architecture
+activation     = "leaky_relu"
+physics_bias   = 2.0                      # initial w_PL/w_NN logit ratio
 
-**Key Findings**:
+# Training
+lr_theta  = 0.015    # position learning rate
+lr_P0     = 0.005
+lr_gamma  = 0.005
+lr_nn     = 0.001
+warmup_epochs = 30   # physics-only warmup before NN is released
 
-1. **Pure NN fails catastrophically in wireless environments** (6-58m errors): Cannot learn inverse path-loss relationship from limited data without physics inductive bias
-
-2. **APBM achieves 57-93% improvement over Pure PL**: Neural network branch successfully captures multipath, shadowing, and environmental effects that the path-loss model cannot represent
-
-3. **Lab Wired Exception validates the approach**: 
-   - Pure NN wins (1.40m vs APBM 11.41m) because wired signals through cables/attenuators **don't follow wireless propagation physics**
-   - The path-loss prior becomes a **harmful constraint** when assumptions are violated
-   - This is **not a bug but a feature**: physics-informed learning should help when assumptions hold and correctly fail when violated
-
-4. **R² predicts APBM benefit**: Environments with higher path-loss R² (Urban: 0.81) show greater APBM advantage
-
-### Ablation Summary
-
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                        ABLATION STUDY CONCLUSIONS                        │
-├─────────────────────────────────────────────────────────────────────────┤
-│                                                                         │
-│  RSSI SOURCE ABLATION (Pure PL model):                                  │
-│  • Shuffled/Constant → 100-1000× worse than Oracle                      │
-│  • Proves: RSSI spatial information is ESSENTIAL                        │
-│  • Stage 1 predictions preserve (sometimes improve) spatial info        │
-│                                                                         │
-│  MODEL ARCHITECTURE ABLATION (Predicted RSSI):                          │
-│  • Pure NN fails: 6-58m in wireless environments                        │
-│  • APBM wins: 57-93% improvement over Pure PL in 3/4 environments       │
-│  • Lab Wired exception: Physics prior hurts when assumptions violated   │
-│                                                                         │
-│  DEPLOYMENT GUIDANCE:                                                   │
-│  • Use APBM for wireless propagation environments                       │
-│  • Consider Pure NN for controlled/wired scenarios                      │
-│  • Stage 1 RSSI estimation is critical for pipeline success             │
-│                                                                         │
-└─────────────────────────────────────────────────────────────────────────┘
+# FL
+num_clients    = 5
+global_rounds  = 100
+local_epochs   = 3
+theta_aggregation = "geometric_median"   # robust aggregation
 ```
 
 ---
 
 ## Citation
 
-If you use this code in your research, please cite:
-
 ```bibtex
-@mastersthesis{shayegan2026jamloc,
-  author  = {Shayegan, Behrad},
-  title   = {Crowdsourced GNSS Jammer Localization using Machine Learning and Federated Learning},
-  school  = {Politecnico di Torino},
-  year    = {2026},
-  type    = {Master's Thesis}
+@mastersthesis{shayegan2026jammerloc,
+  author = {Shayegan, Behrad},
+  title  = {Crowdsourced GNSS Jammer Localization Using Physics-Informed
+             Models and Federated Learning},
+  school = {Politecnico di Torino},
+  year   = {2026}
 }
 ```
-
----
-
 ## References
 
-### Stage 1: RSSI Estimation
+This work builds on and extends the following prior code and papers:
 
-[1] Lee, D.-K., Spens, N., Gattis, B., & Akos, D. (2021). AGC on Android Devices for GNSS.
+- **Original APBM implementation**: Nardin, A., Imbiriba, T., & Closas, P. (2023).
+  *Jamming Source Localization Using Augmented Physics-based Model.* ICASSP 2023.
+  Code: [github.com/andreanardin/GNSSjamLoc](https://github.com/andreanardin/GNSSjamLoc)
 
-[2] Levigne, N. S. (2019). Automatic Gain Control Measurements as a GPS L1 Interference Detection Metric.(AGC behavior; motivation for ΔAGC as a monotone proxy).
-
-[3] Ghizzo, E., Djelloul, E. M., Lesouple, J., Milner, C., & Macabiau, C. (2025). Assessing jamming and spoofing impacts on GNSS receivers: Automatic gain control (AGC). Signal Processing, 228. https://doi.org/10.1016/j.sigpro.2024.109762
-
-[4] Zahidul, M., Bhuiyan, H., Kuusniemi, H., Söderholm, S., & Airos, E. (2014). The Impact of Interference on GNSS Receiver Observables-A Running Digital Sum Based Simple Jammer Detector. https://www.researchgate.net/publication/265726039 
-
-[5] K. Olsson et al., “Participatory Sensing for Localization of a GNSS Jammer,” (system model and ΔC/N₀ physics; use of deltas and median aggregation). 
-
-[6] J. Han et al., “Crowdsourced Smartphone-Based Machine Learning for GNSS Jammer Detection and Localization,” SSRN, 2024 (evidence for hybrid ΔAGC+ΔC/N₀, device variability, and ML fusion ideas).
-
-[7] F. Dovis, Satellite Navigation Course Slides (GNSS fundamentals; C/N₀ definition and tracking context).
-
-
-
----
-
-### Stage 2: Jammer Localization & Federated Learning
-
-[1] Jaramillo-Civill, M., Wu, P., Nardin, A., & Closas, P. (2025). *Jammer Source Localization with Federated Learning*. Tales Imbiriba.
-
-[2] Vasudevan, M., & Yuksel, M. (2024). *Machine Learning for Radio Propagation Modeling: A Comprehensive Survey*.
-
-[3] Chao Han et al. Crowdsourced Smartphone-Based Machine Learning for
-GNSS Jammer Detection and Localization. Working paper. SSRN, 2025. url:
-https://ssrn.com/abstract=5119211.
-
-[4] Nardin, A., Imbiriba, T., & Closas, P. (2023). *Crowdsourced Jammer Localization Using APBMs: Performance Analysis Considering Observations Disruption*. 2023 IEEE/ION Position, Location and Navigation Symposium (PLANS), 511–519. https://doi.org/10.1109/PLANS53410.2023.10140023
-
-[5] Borio, D., Gioia, C., Štern, A., Dimc, F., & Baldini, G. (2016). *Jammer localization: From crowdsourcing to synthetic detection*. 29th International Technical Meeting of the Satellite Division of the Institute of Navigation (ION GNSS), 5, 3107–3116. https://doi.org/10.33012/2016.14689
-
-[6] Rappaport, T. S. (2024). *Wireless Communications: Principles and Practice* (3rd ed.). Pearson.
-
-[7] Herzalla, D., Lunardi, W. T., & Andreoni, M. (2025). *Graph Neural Networks for Jamming Source Localization*. http://arxiv.org/abs/2506.03196
-
-[8] Yan, Z., & Ruotsalainen, L. (2025). *GNSS jammer localization in urban areas based on prediction/optimization and ray-tracing*. GPS Solutions, 29(1). https://doi.org/10.1007/s10291-024-01787-4
-
-[9] Ba, J. L., Kiros, J. R., & Hinton, G. E. (2016). *Layer Normalization*. http://arxiv.org/abs/1607.06450
-
-[10] Sun, T., Li, D., & Wang, B. (2021). *Decentralized Federated Averaging*. http://arxiv.org/abs/2104.11375
-
-[11] Li, T., Sahu, A. K., Zaheer, M., Sanjabi, M., Talwalkar, A., & Smith, V. (2020). *Federated Optimization in Heterogeneous Networks*. http://arxiv.org/abs/1812.06127
-
-[12] Karimireddy, S. P., Kale, S., Mohri, M., Reddi, S. J., Stich, S. U., & Suresh, A. T. (2021). *SCAFFOLD: Stochastic Controlled Averaging for Federated Learning*. http://arxiv.org/abs/1910.06378
-
-[13] Pillutla, K., Kakade, S. M., & Harchaoui, Z. (2022). *Robust Aggregation for Federated Learning*. IEEE Transactions on Signal Processing. https://doi.org/10.1109/TSP.2022.3153135
-
+- **Federated extension**: Jaramillo-Civill, M., Wu, P., Nardin, A., Imbiriba, T., & Closas, P. (2025).
+  *Jammer Source Localization with Federated Learning.* IEEE/ION PLANS 2025.
 ---
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
+MIT License — see [LICENSE](LICENSE) for details.
