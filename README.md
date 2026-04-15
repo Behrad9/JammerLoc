@@ -221,8 +221,9 @@ This work builds on and extends the following prior code and papers:
   *Jamming Source Localization Using Augmented Physics-based Model.* ICASSP 2023.
   Code: [github.com/andreanardin/GNSSjamLoc](https://github.com/andreanardin/GNSSjamLoc)
 
-- **Federated extension**: Jaramillo-Civill, M., Wu, P., Nardin, A., Imbiriba, T., & Closas, P. (2025).
+- **Federated APBM extension**: Jaramillo-Civill, M., Wu, P., Nardin, A., Imbiriba, T., & Closas, P. (2025).
   *Jammer Source Localization with Federated Learning.* IEEE/ION PLANS 2025.
+  Code: [github.com/marionajaramillo2001/jammerLocalization](https://github.com/marionajaramillo2001/jammerLocalization)
 ---
 
 ## License
